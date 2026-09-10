@@ -131,13 +131,18 @@ test("times out an unresponsive request after five seconds", {
         );
       }),
   );
+  const keepAlive = setTimeout(() => {}, 6_000);
   const startedAt = Date.now();
 
-  assert.deepEqual(await acquire(credential), {
-    kind: "temporary-failure",
-    retryAtMs: undefined,
-  });
-  assert.ok(Date.now() - startedAt >= 4_900);
+  try {
+    assert.deepEqual(await acquire(credential), {
+      kind: "temporary-failure",
+      retryAtMs: undefined,
+    });
+    assert.ok(Date.now() - startedAt >= 4_900);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 test("marks a response larger than one MiB as malformed before parsing", async () => {
