@@ -1,0 +1,228 @@
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+
+import {
+  type CodexCredential,
+  CodexUsageRequestError,
+  parseCodexRateLimitHeaders,
+  type WeeklyQuotaUsage,
+} from "./codex-usage.ts";
+import { presentQuotaStatus, type QuotaStatus } from "./presentation.ts";
+
+const STATUS_KEY = "pi-usage";
+
+export interface UsageDependencies {
+  readonly now: () => number;
+  readonly random: () => number;
+  readonly readUsage: (
+    credential: CodexCredential,
+    signal?: AbortSignal,
+  ) => Promise<WeeklyQuotaUsage>;
+  readonly startPolling: (refresh: () => void) => () => void;
+}
+
+function credentialFromContext(
+  auth: Awaited<
+    ReturnType<ExtensionContext["modelRegistry"]["getProviderAuth"]>
+  >,
+): CodexCredential | undefined {
+  const accessToken = auth?.auth.apiKey;
+  const headers = auth?.auth.headers;
+  const accountIdEntry = headers
+    ? Object.entries(headers).find(
+        ([name]) => name.toLowerCase() === "chatgpt-account-id",
+      )
+    : undefined;
+  const accountId = accountIdEntry?.[1];
+
+  if (typeof accessToken !== "string" || typeof accountId !== "string") {
+    return undefined;
+  }
+  return { accessToken, accountId };
+}
+
+export function registerUsage(
+  pi: ExtensionAPI,
+  dependencies: UsageDependencies,
+): void {
+  let stopPolling: (() => void) | undefined;
+  let activeController: AbortController | undefined;
+  let shuttingDown = false;
+  let credentialAvailable = false;
+  let nextAttemptAt = 0;
+  let consecutiveFailures = 0;
+  let currentAccountId: string | undefined;
+  let lastGood:
+    | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
+    | undefined;
+  const publish = (ctx: ExtensionContext, status: QuotaStatus): void => {
+    const presentation = presentQuotaStatus(status);
+    ctx.ui.setStatus(
+      STATUS_KEY,
+      ctx.ui.theme.fg(presentation.color, presentation.text),
+    );
+  };
+
+  let inFlight: Promise<void> | undefined;
+  const performRefresh = async (
+    ctx: ExtensionContext,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    try {
+      const auth = await ctx.modelRegistry.getProviderAuth("openai-codex");
+      const credential = credentialFromContext(auth);
+      if (credential === undefined) {
+        credentialAvailable = false;
+        currentAccountId = undefined;
+        lastGood = undefined;
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+
+      credentialAvailable = true;
+      if (currentAccountId !== credential.accountId) {
+        currentAccountId = credential.accountId;
+        lastGood = undefined;
+        nextAttemptAt = 0;
+        consecutiveFailures = 0;
+      }
+      let usage: WeeklyQuotaUsage;
+      try {
+        usage = await dependencies.readUsage(credential, signal);
+      } catch (error) {
+        if (
+          !(error instanceof CodexUsageRequestError) ||
+          (error.status !== 401 && error.status !== 403)
+        ) {
+          throw error;
+        }
+        const refreshedAuth =
+          await ctx.modelRegistry.getProviderAuth("openai-codex");
+        const refreshedCredential = credentialFromContext(refreshedAuth);
+        if (refreshedCredential === undefined) throw error;
+        if (currentAccountId !== refreshedCredential.accountId) {
+          currentAccountId = refreshedCredential.accountId;
+          lastGood = undefined;
+        }
+        usage = await dependencies.readUsage(refreshedCredential, signal);
+      }
+      if (shuttingDown) return;
+      nextAttemptAt = 0;
+      consecutiveFailures = 0;
+      lastGood = { usage, capturedAt: dependencies.now() };
+      publish(ctx, {
+        kind: "available",
+        usedPercent: usage.usedPercent,
+        stale: false,
+      });
+    } catch (error) {
+      if (shuttingDown) return;
+      const now = dependencies.now();
+      consecutiveFailures += 1;
+      if (error instanceof CodexUsageRequestError && error.status === 429) {
+        const seconds = Number(error.retryAfter);
+        const retryAt = Number.isFinite(seconds)
+          ? now + Math.max(0, seconds) * 1_000
+          : Date.parse(error.retryAfter ?? "");
+        if (Number.isFinite(retryAt)) nextAttemptAt = retryAt;
+      }
+      if (nextAttemptAt <= now) {
+        const baseDelay = Math.min(
+          60_000,
+          1_000 * 2 ** (consecutiveFailures - 1),
+        );
+        const jitter = 0.5 + dependencies.random();
+        nextAttemptAt = now + baseDelay * jitter;
+      }
+      if (
+        lastGood === undefined ||
+        now - lastGood.capturedAt > 10 * 60 * 1_000 ||
+        now >= lastGood.usage.resetsAt * 1_000
+      ) {
+        publish(ctx, { kind: "unavailable" });
+        return;
+      }
+      publish(ctx, {
+        kind: "available",
+        usedPercent: lastGood.usage.usedPercent,
+        stale: true,
+      });
+    }
+  };
+  const refresh = (ctx: ExtensionContext): Promise<void> => {
+    if (inFlight !== undefined) return inFlight;
+    if (dependencies.now() < nextAttemptAt) return Promise.resolve();
+
+    const controller = new AbortController();
+    activeController = controller;
+    const current = performRefresh(ctx, controller.signal).finally(() => {
+      if (inFlight === current) {
+        inFlight = undefined;
+        activeController = undefined;
+      }
+    });
+    inFlight = current;
+    return current;
+  };
+
+  const updatePolling = (ctx: ExtensionContext): void => {
+    if (!credentialAvailable) {
+      stopPolling?.();
+      stopPolling = undefined;
+      return;
+    }
+    stopPolling ??= dependencies.startPolling(() => {
+      void refresh(ctx).then(() => updatePolling(ctx));
+    });
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    shuttingDown = false;
+    publish(ctx, { kind: "loading" });
+    await refresh(ctx);
+    updatePolling(ctx);
+  });
+
+  pi.on("after_provider_response", (event, ctx) => {
+    if (ctx.mode !== "tui" || !credentialAvailable) return;
+    const usage = parseCodexRateLimitHeaders(event.headers);
+    if (usage === undefined) return;
+
+    lastGood = { usage, capturedAt: dependencies.now() };
+    publish(ctx, {
+      kind: "available",
+      usedPercent: usage.usedPercent,
+      stale: false,
+    });
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    if (
+      lastGood !== undefined &&
+      dependencies.now() - lastGood.capturedAt < 30_000
+    ) {
+      return;
+    }
+    await refresh(ctx);
+    updatePolling(ctx);
+  });
+
+  pi.on("model_select", async (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    await refresh(ctx);
+    updatePolling(ctx);
+  });
+
+  pi.on("session_shutdown", () => {
+    shuttingDown = true;
+    activeController?.abort();
+    stopPolling?.();
+    stopPolling = undefined;
+    currentAccountId = undefined;
+    lastGood = undefined;
+  });
+}

@@ -1,0 +1,53 @@
+{
+  "name": "@yasuhito/pi-usage",
+  "version": "0.1.0",
+  "description": "A Pi extension that displays Codex weekly quota usage",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "usage"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "Yasuhito Takamiya",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.85.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.11",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yasuhito/pi-usage.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yasuhito/pi-usage/issues"
+  },
+  "homepage": "https://github.com/yasuhito/pi-usage#readme",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "check:package": "npm pack --dry-run",
+    "check": "npm run lint && npm run typecheck && npm test && npm run check:package"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
+}
