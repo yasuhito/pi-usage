@@ -2,22 +2,15 @@ import {
   type CodexCredential,
   CodexUsageFormatError,
   CodexUsageRequestError,
-  parseCodexRateLimitHeaders,
   type WeeklyQuotaUsage,
 } from "./codex-usage.ts";
+import { createPassiveWeeklyQuotaObserver } from "./passive-weekly-quota-observation.ts";
 import type { QuotaStatus } from "./presentation.ts";
 
 const STALE_AFTER_MS = 10 * 60 * 1_000;
 const REFRESH_DEBOUNCE_MS = 30_000;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
-const CODEX_RATE_LIMIT_HEADER_NAMES = new Set(
-  ["primary", "secondary"].flatMap((position) => [
-    `x-codex-${position}-used-percent`,
-    `x-codex-${position}-window-minutes`,
-    `x-codex-${position}-reset-at`,
-  ]),
-);
 
 export type CodexCredentialResolution =
   | { readonly kind: "missing" }
@@ -58,7 +51,8 @@ export function createWeeklyQuotaUsageLifecycle(
   let nextAttemptAt = 0;
   let consecutiveFailures = 0;
   let currentAccountId: string | undefined;
-  let observedRateLimitHeaders: Record<string, string> = {};
+  let accountResolutionsInFlight = 0;
+  const passiveObserver = createPassiveWeeklyQuotaObserver();
   let lastObservedUsage:
     | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
     | undefined;
@@ -70,11 +64,12 @@ export function createWeeklyQuotaUsageLifecycle(
   const clearObservedUsage = (): void => {
     clearStaleExpiration();
     lastObservedUsage = undefined;
+    passiveObserver.setBaseline(undefined);
   };
   const selectAccount = (accountId: string): void => {
     if (currentAccountId === accountId) return;
     currentAccountId = accountId;
-    observedRateLimitHeaders = {};
+    passiveObserver.reset();
     clearObservedUsage();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
@@ -82,13 +77,13 @@ export function createWeeklyQuotaUsageLifecycle(
   const clearForMissingCredential = (): void => {
     credentialAvailable = false;
     currentAccountId = undefined;
-    observedRateLimitHeaders = {};
+    passiveObserver.reset();
     clearObservedUsage();
     dependencies.publish(undefined);
   };
   const recordFreshUsage = (usage: WeeklyQuotaUsage): void => {
     clearStaleExpiration();
-    observedRateLimitHeaders = {};
+    passiveObserver.setBaseline(usage);
     lastObservedUsage = { usage, capturedAt: dependencies.now() };
     dependencies.publish({
       kind: "available",
@@ -138,6 +133,7 @@ export function createWeeklyQuotaUsageLifecycle(
       if (resolution.kind === "invalid") {
         credentialAvailable = true;
         currentAccountId = undefined;
+        passiveObserver.reset();
         clearObservedUsage();
         dependencies.publish({ kind: "unavailable" });
         return;
@@ -168,7 +164,10 @@ export function createWeeklyQuotaUsageLifecycle(
           clearForMissingCredential();
           return;
         }
-        if (refreshedResolution.kind === "invalid") throw error;
+        if (refreshedResolution.kind === "invalid") {
+          passiveObserver.reset();
+          throw error;
+        }
         selectAccount(refreshedResolution.credential.accountId);
         usage = await dependencies.readWeeklyQuotaUsage(
           refreshedResolution.credential,
@@ -190,6 +189,7 @@ export function createWeeklyQuotaUsageLifecycle(
           error.status === 429 ||
           error.status >= 500);
       if (!temporaryFailure) {
+        if (error instanceof CodexUsageFormatError) passiveObserver.reset();
         clearObservedUsage();
         nextAttemptAt = 0;
         consecutiveFailures = 0;
@@ -261,19 +261,9 @@ export function createWeeklyQuotaUsageLifecycle(
       await refreshAndUpdatePolling();
     },
     observeCodexResponse: (headers) => {
-      if (!credentialAvailable) return;
-      let contributedRateLimitField = false;
-      for (const [name, value] of Object.entries(headers)) {
-        const normalizedName = name.toLowerCase();
-        if (
-          CODEX_RATE_LIMIT_HEADER_NAMES.has(normalizedName) &&
-          typeof value === "string"
-        ) {
-          observedRateLimitHeaders[normalizedName] = value;
-          contributedRateLimitField = true;
-        }
-      }
-      if (!contributedRateLimitField) {
+      if (!credentialAvailable || accountResolutionsInFlight > 0) return;
+      const result = passiveObserver.observe(headers);
+      if (result.kind === "unrecognized") {
         if (
           lastObservedUsage === undefined ||
           dependencies.now() - lastObservedUsage.capturedAt >=
@@ -283,25 +273,12 @@ export function createWeeklyQuotaUsageLifecycle(
         }
         return;
       }
-
-      let usage: WeeklyQuotaUsage | undefined;
-      try {
-        usage = parseCodexRateLimitHeaders(
-          observedRateLimitHeaders,
-          lastObservedUsage?.usage,
-        );
-      } catch (error) {
-        if (error instanceof CodexUsageFormatError) {
-          observedRateLimitHeaders = {};
-          clearObservedUsage();
-          dependencies.publish({ kind: "unavailable" });
-          return;
-        }
-        throw error;
+      if (result.kind === "malformed") {
+        clearObservedUsage();
+        dependencies.publish({ kind: "unavailable" });
+        return;
       }
-      if (usage === undefined) return;
-
-      recordFreshUsage(usage);
+      if (result.kind === "observed") recordFreshUsage(result.usage);
     },
     refreshAfterActivity: async () => {
       if (
@@ -312,7 +289,14 @@ export function createWeeklyQuotaUsageLifecycle(
       }
       await refreshAndUpdatePolling();
     },
-    refreshForAccountChange: () => refreshAndUpdatePolling(true),
+    refreshForAccountChange: async () => {
+      accountResolutionsInFlight += 1;
+      try {
+        await refreshAndUpdatePolling(true);
+      } finally {
+        accountResolutionsInFlight -= 1;
+      }
+    },
     stop: () => {
       shuttingDown = true;
       activeController?.abort();
@@ -320,7 +304,7 @@ export function createWeeklyQuotaUsageLifecycle(
       stopPolling = undefined;
       credentialAvailable = false;
       currentAccountId = undefined;
-      observedRateLimitHeaders = {};
+      passiveObserver.reset();
       clearObservedUsage();
     },
   };

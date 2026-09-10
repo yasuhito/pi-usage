@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   type CodexCredential,
+  CodexUsageFormatError,
   CodexUsageRequestError,
 } from "../src/codex-usage.ts";
 import type { QuotaStatus } from "../src/presentation.ts";
@@ -220,6 +221,21 @@ test("stop cancels scheduled stale expiration", async () => {
   assert.equal(fixture.statuses.length, statusCount);
 });
 
+test("a dedicated quota observation becomes the baseline for passive observation", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-secondary-used-percent": "82",
+  });
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    kind: "available",
+    usedPercent: 82,
+    stale: false,
+  });
+});
+
 test("fresh headers cancel scheduled stale expiration", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
@@ -241,27 +257,6 @@ test("fresh headers cancel scheduled stale expiration", async () => {
   });
 });
 
-test("headers replace usage without replaying on an empty response", async () => {
-  const fixture = lifecycleFixture();
-  await fixture.lifecycle.start();
-
-  fixture.lifecycle.observeCodexResponse({
-    "X-Codex-Secondary-Used-Percent": "82",
-    "x-codex-secondary-window-minutes": "10080",
-    "x-codex-secondary-reset-at": "4000",
-  });
-  const statusCount = fixture.statuses.length;
-
-  fixture.lifecycle.observeCodexResponse({});
-
-  assert.deepEqual(fixture.statuses.at(-1), {
-    kind: "available",
-    usedPercent: 82,
-    stale: false,
-  });
-  assert.equal(fixture.statuses.length, statusCount);
-});
-
 test("an empty response refreshes an old observation", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
@@ -271,26 +266,6 @@ test("an empty response refreshes an old observation", async () => {
   await immediate();
 
   assert.equal(fixture.observedCredentials.length, 2);
-});
-
-test("sparse headers accumulate across responses", async () => {
-  const fixture = lifecycleFixture();
-  fixture.setReadsFail(true);
-  await fixture.lifecycle.start();
-
-  fixture.lifecycle.observeCodexResponse({
-    "x-codex-secondary-window-minutes": "10080",
-  });
-  fixture.lifecycle.observeCodexResponse({
-    "x-codex-secondary-used-percent": "74",
-    "x-codex-secondary-reset-at": "4000",
-  });
-
-  assert.deepEqual(fixture.statuses.at(-1), {
-    kind: "available",
-    usedPercent: 74,
-    stale: false,
-  });
 });
 
 test("malformed recognized headers publish unavailable", async () => {
@@ -467,6 +442,42 @@ test("logout discovered during authentication retry clears usage and polling", a
   assert.equal(fixture.statuses.at(-1), undefined);
 });
 
+test("malformed dedicated observation discards partial passive fields", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-window-minutes": "10080",
+  });
+  fixture.setReadError(new CodexUsageFormatError("malformed"));
+  await fixture.lifecycle.refreshForAccountChange();
+  const statusCount = fixture.statuses.length;
+
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-used-percent": "74",
+    "x-codex-primary-reset-at": "4000",
+  });
+
+  assert.equal(fixture.statuses.length, statusCount);
+});
+
+test("invalid credentials discard partial passive fields", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-window-minutes": "10080",
+  });
+  fixture.setResolution({ kind: "invalid" });
+  await fixture.lifecycle.refreshForAccountChange();
+  const statusCount = fixture.statuses.length;
+
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-used-percent": "74",
+    "x-codex-primary-reset-at": "4000",
+  });
+
+  assert.equal(fixture.statuses.length, statusCount);
+});
+
 test("permanent request failure discards old usage", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
@@ -487,4 +498,50 @@ test("account change discards previous-account usage before refresh", async () =
 
   assert.deepEqual(fixture.observedCredentials.at(-1), credential("account-2"));
   assert.deepEqual(fixture.statuses.at(-1), { kind: "unavailable" });
+});
+
+test("account resolution isolates passive observations", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-window-minutes": "10080",
+  });
+  fixture.setAccountId("account-2");
+  let releaseResolution: (() => void) | undefined;
+  fixture.setResolutionGate(
+    new Promise<void>((resolve) => {
+      releaseResolution = resolve;
+    }),
+  );
+  const refreshing = fixture.lifecycle.refreshForAccountChange();
+  await immediate();
+  const statusCount = fixture.statuses.length;
+
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-used-percent": "74",
+    "x-codex-primary-reset-at": "4000",
+  });
+
+  assert.equal(fixture.statuses.length, statusCount);
+  releaseResolution?.();
+  await refreshing;
+});
+
+test("account change discards partial passive observation fields", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-window-minutes": "10080",
+  });
+  fixture.setAccountId("account-2");
+  fixture.setReadsFail(true);
+  await fixture.lifecycle.refreshForAccountChange();
+  const statusCount = fixture.statuses.length;
+
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-used-percent": "74",
+    "x-codex-primary-reset-at": "4000",
+  });
+
+  assert.equal(fixture.statuses.length, statusCount);
 });

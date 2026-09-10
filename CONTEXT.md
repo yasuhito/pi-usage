@@ -19,3 +19,7 @@ _Avoid_: Cached usage, current usage
 **Weekly quota usage lifecycle**:
 The progression of weekly quota usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end.
 _Avoid_: Usage cache lifecycle
+
+**Passive weekly quota observation**:
+A weekly quota usage observation obtained from information accompanying normal provider activity rather than from a dedicated quota request.
+_Avoid_: Header usage, passive quota update

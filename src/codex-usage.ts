@@ -1,5 +1,9 @@
+import {
+  parseFiniteNumber,
+  weeklyQuotaUsageFromProviderValues,
+} from "./codex-weekly-quota-values.ts";
+
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
-const WEEK_SECONDS = 7 * 24 * 60 * 60;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export class CodexUsageRequestError extends Error {
@@ -34,98 +38,8 @@ export interface WeeklyQuotaUsage {
   readonly windowPosition: RateLimitWindowPosition;
 }
 
-function numberHeader(value: string | undefined): number | undefined {
-  if (value === undefined || value.trim() === "") return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function createWeeklyQuotaUsage(
-  position: RateLimitWindowPosition,
-  durationSeconds: unknown,
-  usedPercent: unknown,
-  resetsAtSeconds: unknown,
-): WeeklyQuotaUsage | undefined {
-  if (durationSeconds !== WEEK_SECONDS) return undefined;
-  if (
-    typeof usedPercent !== "number" ||
-    !Number.isFinite(usedPercent) ||
-    typeof resetsAtSeconds !== "number" ||
-    !Number.isFinite(resetsAtSeconds) ||
-    resetsAtSeconds <= 0
-  ) {
-    throw new CodexUsageFormatError("Codex weekly quota values are malformed");
-  }
-  return {
-    usedPercent,
-    resetsAtMs: resetsAtSeconds * 1_000,
-    windowPosition: position,
-  };
-}
-
-export function parseCodexRateLimitHeaders(
-  headers: Readonly<Record<string, string>>,
-  previous?: WeeklyQuotaUsage,
-): WeeklyQuotaUsage | undefined {
-  for (const position of ["primary", "secondary"] as const) {
-    const prefix = `x-codex-${position}`;
-    const rawDuration = headers[`${prefix}-window-minutes`];
-    const rawUsedPercent = headers[`${prefix}-used-percent`];
-    const rawResetsAt = headers[`${prefix}-reset-at`];
-    if (
-      rawDuration === undefined &&
-      rawUsedPercent === undefined &&
-      rawResetsAt === undefined
-    ) {
-      continue;
-    }
-
-    const priorWindow =
-      previous?.windowPosition === position ? previous : undefined;
-    const durationMinutes =
-      rawDuration === undefined
-        ? priorWindow === undefined
-          ? undefined
-          : 10_080
-        : numberHeader(rawDuration);
-    const usedPercent =
-      rawUsedPercent === undefined
-        ? priorWindow?.usedPercent
-        : numberHeader(rawUsedPercent);
-    const resetsAtSeconds =
-      rawResetsAt === undefined
-        ? priorWindow === undefined
-          ? undefined
-          : priorWindow.resetsAtMs / 1_000
-        : numberHeader(rawResetsAt);
-    if (
-      (rawDuration !== undefined && durationMinutes === undefined) ||
-      (rawUsedPercent !== undefined && usedPercent === undefined) ||
-      (rawResetsAt !== undefined && resetsAtSeconds === undefined)
-    ) {
-      throw new CodexUsageFormatError("Codex rate-limit headers are malformed");
-    }
-    if (
-      durationMinutes === undefined ||
-      usedPercent === undefined ||
-      resetsAtSeconds === undefined
-    ) {
-      continue;
-    }
-
-    const usage = createWeeklyQuotaUsage(
-      position,
-      durationMinutes * 60,
-      usedPercent,
-      resetsAtSeconds,
-    );
-    if (usage !== undefined) return usage;
-  }
-  return undefined;
-}
-
 async function readBoundedBody(response: Response): Promise<string> {
-  const declaredSize = numberHeader(
+  const declaredSize = parseFiniteNumber(
     response.headers.get("content-length") ?? undefined,
   );
   if (declaredSize !== undefined && declaredSize > MAX_RESPONSE_BYTES) {
@@ -166,15 +80,19 @@ function weeklyUsageFromBody(body: unknown): WeeklyQuotaUsage {
   for (const name of ["primary_window", "secondary_window"] as const) {
     const window = Reflect.get(rateLimit, name);
     if (typeof window !== "object" || window === null) continue;
-    if (Reflect.get(window, "limit_window_seconds") !== WEEK_SECONDS) continue;
 
-    const usage = createWeeklyQuotaUsage(
+    const result = weeklyQuotaUsageFromProviderValues(
       name === "primary_window" ? "primary" : "secondary",
       Reflect.get(window, "limit_window_seconds"),
       Reflect.get(window, "used_percent"),
       Reflect.get(window, "reset_at"),
     );
-    if (usage !== undefined) return usage;
+    if (result.kind === "malformed") {
+      throw new CodexUsageFormatError(
+        "Codex weekly quota values are malformed",
+      );
+    }
+    if (result.kind === "observed") return result.usage;
   }
 
   throw new CodexUsageFormatError("Codex weekly quota is unavailable");

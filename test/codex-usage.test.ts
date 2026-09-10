@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   CodexUsageRequestError,
-  parseCodexRateLimitHeaders,
   readCodexWeeklyQuotaUsage,
 } from "../src/codex-usage.ts";
 
@@ -147,51 +146,6 @@ test("sends credentials only to the fixed endpoint without following redirects",
       },
       hasSignal: true,
     },
-  );
-});
-
-test("reads a weekly window found in secondary-position Codex headers", () => {
-  assert.deepEqual(
-    parseCodexRateLimitHeaders({
-      "x-codex-secondary-used-percent": "72.5",
-      "x-codex-secondary-window-minutes": "10080",
-      "x-codex-secondary-reset-at": "4000",
-    }),
-    {
-      usedPercent: 72.5,
-      resetsAtMs: 4_000_000,
-      windowPosition: "secondary",
-    },
-  );
-});
-
-test("sparse Codex headers merge into the last weekly quota observation", () => {
-  assert.deepEqual(
-    parseCodexRateLimitHeaders(
-      { "x-codex-secondary-used-percent": "74" },
-      {
-        usedPercent: 63,
-        resetsAtMs: 4_000_000,
-        windowPosition: "secondary",
-      },
-    ),
-    {
-      usedPercent: 74,
-      resetsAtMs: 4_000_000,
-      windowPosition: "secondary",
-    },
-  );
-});
-
-test("rejects blank required Codex response-header values", () => {
-  assert.throws(
-    () =>
-      parseCodexRateLimitHeaders({
-        "x-codex-primary-used-percent": " ",
-        "x-codex-primary-window-minutes": "10080",
-        "x-codex-primary-reset-at": " ",
-      }),
-    /Codex rate-limit headers are malformed/,
   );
 });
 
