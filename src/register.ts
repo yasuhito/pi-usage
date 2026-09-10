@@ -17,6 +17,13 @@ const STALE_AFTER_MS = 10 * 60 * 1_000;
 const REFRESH_DEBOUNCE_MS = 30_000;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
+const CODEX_RATE_LIMIT_HEADER_NAMES = new Set(
+  ["primary", "secondary"].flatMap((position) => [
+    `x-codex-${position}-used-percent`,
+    `x-codex-${position}-window-minutes`,
+    `x-codex-${position}-reset-at`,
+  ]),
+);
 
 export interface WeeklyQuotaUsageDependencies {
   readonly now: () => number;
@@ -88,6 +95,7 @@ export function registerWeeklyQuotaUsage(
   let nextAttemptAt = 0;
   let consecutiveFailures = 0;
   let currentAccountId: string | undefined;
+  let observedRateLimitHeaders: Record<string, string> = {};
   let lastObservedUsage:
     | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
     | undefined;
@@ -102,6 +110,7 @@ export function registerWeeklyQuotaUsage(
   const selectAccount = (accountId: string): void => {
     if (currentAccountId === accountId) return;
     currentAccountId = accountId;
+    observedRateLimitHeaders = {};
     clearObservedUsage();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
@@ -144,12 +153,14 @@ export function registerWeeklyQuotaUsage(
   const performRefresh = async (
     ctx: ExtensionContext,
     signal: AbortSignal,
+    ignoreBackoff: boolean,
   ): Promise<void> => {
     try {
       const auth = await ctx.modelRegistry.getProviderAuth("openai-codex");
       if (auth === undefined) {
         credentialAvailable = false;
         currentAccountId = undefined;
+        observedRateLimitHeaders = {};
         clearObservedUsage();
         ctx.ui.setStatus(STATUS_KEY, undefined);
         return;
@@ -165,6 +176,10 @@ export function registerWeeklyQuotaUsage(
 
       credentialAvailable = true;
       selectAccount(credential.accountId);
+      if (!ignoreBackoff && dependencies.now() < nextAttemptAt) {
+        publishStaleUsage(ctx);
+        return;
+      }
       let usage: WeeklyQuotaUsage;
       try {
         usage = await dependencies.readWeeklyQuotaUsage(credential, signal);
@@ -177,6 +192,14 @@ export function registerWeeklyQuotaUsage(
         }
         const refreshedAuth =
           await ctx.modelRegistry.getProviderAuth("openai-codex");
+        if (refreshedAuth === undefined) {
+          credentialAvailable = false;
+          currentAccountId = undefined;
+          observedRateLimitHeaders = {};
+          clearObservedUsage();
+          ctx.ui.setStatus(STATUS_KEY, undefined);
+          return;
+        }
         const refreshedCredential = credentialFromContext(refreshedAuth);
         if (refreshedCredential === undefined) throw error;
         selectAccount(refreshedCredential.accountId);
@@ -242,14 +265,13 @@ export function registerWeeklyQuotaUsage(
       activeController?.abort();
       return inFlight.then(() => refresh(ctx, true));
     }
-    if (!ignoreBackoff && dependencies.now() < nextAttemptAt) {
-      publishStaleUsage(ctx);
-      return Promise.resolve();
-    }
-
     const controller = new AbortController();
     activeController = controller;
-    const current = performRefresh(ctx, controller.signal).finally(() => {
+    const current = performRefresh(
+      ctx,
+      controller.signal,
+      ignoreBackoff,
+    ).finally(() => {
       if (inFlight === current) {
         inFlight = undefined;
         activeController = undefined;
@@ -260,7 +282,7 @@ export function registerWeeklyQuotaUsage(
   };
 
   const updatePolling = (ctx: ExtensionContext): void => {
-    if (!credentialAvailable) {
+    if (shuttingDown || !credentialAvailable) {
       stopPolling?.();
       stopPolling = undefined;
       return;
@@ -286,10 +308,19 @@ export function registerWeeklyQuotaUsage(
 
   pi.on("after_provider_response", (event, ctx) => {
     if (ctx.mode !== "tui" || !credentialAvailable) return;
+    for (const [name, value] of Object.entries(event.headers)) {
+      const normalizedName = name.toLowerCase();
+      if (
+        CODEX_RATE_LIMIT_HEADER_NAMES.has(normalizedName) &&
+        typeof value === "string"
+      ) {
+        observedRateLimitHeaders[normalizedName] = value;
+      }
+    }
     let usage: WeeklyQuotaUsage | undefined;
     try {
       usage = parseCodexRateLimitHeaders(
-        event.headers,
+        observedRateLimitHeaders,
         lastObservedUsage?.usage,
       );
     } catch (error) {
@@ -342,7 +373,9 @@ export function registerWeeklyQuotaUsage(
     activeController?.abort();
     stopPolling?.();
     stopPolling = undefined;
+    credentialAvailable = false;
     currentAccountId = undefined;
+    observedRateLimitHeaders = {};
     clearObservedUsage();
   });
 }

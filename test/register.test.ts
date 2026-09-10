@@ -45,6 +45,7 @@ function registerFixture() {
   let scheduledExpiration: (() => void) | undefined;
   let scheduledExpirationDelay: number | undefined;
   let readsFail = false;
+  let disableAuthAfterUsageReads: number | undefined;
   let readError: Error | undefined;
   let readGate: Promise<void> | undefined;
   let now = 1_000_000;
@@ -62,6 +63,9 @@ function registerFixture() {
     readWeeklyQuotaUsage: async (credential, signal) => {
       observedCredentials.push(credential);
       observedSignals.push(signal);
+      if (observedCredentials.length === disableAuthAfterUsageReads) {
+        authEnabled = false;
+      }
       await readGate;
       if (readError !== undefined) throw readError;
       if (readsFail) throw new Error("network unavailable");
@@ -121,6 +125,9 @@ function registerFixture() {
     scheduledExpirationDelay: () => scheduledExpirationDelay,
     setAccountId: (value: string) => {
       accountId = value;
+    },
+    setDisableAuthAfterUsageReads: (value: number | undefined) => {
+      disableAuthAfterUsageReads = value;
     },
     setAuthEnabled: (value: boolean) => {
       authEnabled = value;
@@ -324,7 +331,13 @@ test("a forced refresh queued behind a request cannot start after shutdown", asy
   release?.();
   await Promise.all([starting, queued]);
 
-  assert.equal(fixture.observedCredentials.length, 1);
+  assert.deepEqual(
+    {
+      pollingStarted: fixture.pollingStarted(),
+      usageReads: fixture.observedCredentials.length,
+    },
+    { pollingStarted: 0, usageReads: 1 },
+  );
 });
 
 test("Retry-After suppresses refreshes until the provider permits them", async () => {
@@ -401,6 +414,26 @@ test("authentication failures resolve Pi auth again and retry once", async () =>
   );
 });
 
+test("logout discovered during auth retry clears status and polling", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setReadError(new CodexUsageRequestError(401, undefined));
+  fixture.setDisableAuthAfterUsageReads(2);
+
+  await emit(fixture, "model_select");
+
+  assert.deepEqual(
+    {
+      pollingStopped: fixture.pollingStopped(),
+      status: fixture.statuses.at(-1),
+    },
+    {
+      pollingStopped: 1,
+      status: { key: "pi-usage", text: undefined },
+    },
+  );
+});
+
 test("a stale observation schedules removal at its earliest deadline", async () => {
   const fixture = registerFixture();
   await emit(fixture, "session_start");
@@ -414,6 +447,27 @@ test("a stale observation schedules removal at its earliest deadline", async () 
   assert.deepEqual(fixture.statuses.at(-1), {
     key: "pi-usage",
     text: "Codex wk unavailable",
+  });
+});
+
+test("sparse Codex headers accumulate across provider responses", async () => {
+  const fixture = registerFixture();
+  fixture.setReadsFail(true);
+  await emit(fixture, "session_start");
+
+  await emit(fixture, "after_provider_response", {
+    headers: { "x-codex-secondary-window-minutes": "10080" },
+  });
+  await emit(fixture, "after_provider_response", {
+    headers: {
+      "x-codex-secondary-used-percent": "74",
+      "x-codex-secondary-reset-at": "4000",
+    },
+  });
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk ━━━━━━━─── 74%",
   });
 });
 
