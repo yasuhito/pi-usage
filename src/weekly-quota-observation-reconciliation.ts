@@ -1,4 +1,5 @@
 import type {
+  DedicatedWeeklyQuotaAcquisitionResult,
   RateLimitWindowPosition,
   WeeklyQuotaUsage,
 } from "./codex-usage.ts";
@@ -24,12 +25,36 @@ export type PassiveWeeklyQuotaObservationResult =
   | { readonly kind: "observed"; readonly usage: WeeklyQuotaUsage }
   | { readonly kind: "malformed" };
 
-export interface PassiveWeeklyQuotaObserver {
-  readonly observe: (
+export type WeeklyQuotaObservationDiscardReason =
+  | "account-change"
+  | "missing-credential"
+  | "invalid-credential"
+  | "stale-usage-expired"
+  | "session-end";
+
+export interface WeeklyQuotaObservationReconciliation {
+  /**
+   * Accumulates recognized sparse fields in call order. An observed result
+   * becomes the baseline and clears accumulated fields; malformed recognized
+   * fields discard both.
+   */
+  readonly observePassive: (
     fields: Readonly<Record<string, unknown>>,
   ) => PassiveWeeklyQuotaObservationResult;
-  readonly setBaseline: (usage: WeeklyQuotaUsage | undefined) => void;
-  readonly reset: () => void;
+  /**
+   * Reconciles the final acquisition result after any authentication retry.
+   * Temporary failure preserves all state. Permanent unavailability and final
+   * authentication rejection clear only the baseline. An observed result
+   * replaces the baseline and accumulated fields; malformed data discards both.
+   */
+  readonly reconcileDedicated: (
+    result: DedicatedWeeklyQuotaAcquisitionResult,
+  ) => DedicatedWeeklyQuotaAcquisitionResult;
+  /**
+   * Stale usage expiration clears only the baseline. Every other reason
+   * discards the baseline and accumulated fields.
+   */
+  readonly discard: (reason: WeeklyQuotaObservationDiscardReason) => void;
 }
 
 function usageForPosition(
@@ -91,23 +116,23 @@ function usageForPosition(
   return result.kind === "observed" ? result.usage : undefined;
 }
 
-export function createPassiveWeeklyQuotaObserver(): PassiveWeeklyQuotaObserver {
+export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObservationReconciliation {
   let accumulatedFields: Record<string, string> = {};
   let baseline: WeeklyQuotaUsage | undefined;
 
-  const reset = (): void => {
+  const discardAll = (): void => {
     accumulatedFields = {};
     baseline = undefined;
   };
 
   return {
-    observe: (fields) => {
+    observePassive: (fields) => {
       let contributed = false;
       for (const [name, value] of Object.entries(fields)) {
         const normalizedName = name.toLowerCase();
         if (!RATE_LIMIT_FIELD_NAMES.has(normalizedName)) continue;
         if (typeof value !== "string") {
-          reset();
+          discardAll();
           return { kind: "malformed" };
         }
         accumulatedFields[normalizedName] = value;
@@ -118,7 +143,7 @@ export function createPassiveWeeklyQuotaObserver(): PassiveWeeklyQuotaObserver {
       for (const position of WINDOW_POSITIONS) {
         const usage = usageForPosition(accumulatedFields, baseline, position);
         if (usage === "malformed") {
-          reset();
+          discardAll();
           return { kind: "malformed" };
         }
         if (usage !== undefined) {
@@ -129,10 +154,26 @@ export function createPassiveWeeklyQuotaObserver(): PassiveWeeklyQuotaObserver {
       }
       return { kind: "incomplete" };
     },
-    setBaseline: (usage) => {
-      baseline = usage;
-      if (usage !== undefined) accumulatedFields = {};
+    reconcileDedicated: (result) => {
+      if (result.kind === "observed") {
+        accumulatedFields = {};
+        baseline = result.usage;
+      } else if (result.kind === "malformed-observation") {
+        discardAll();
+      } else if (
+        result.kind === "authentication-rejected" ||
+        result.kind === "permanently-unavailable"
+      ) {
+        baseline = undefined;
+      }
+      return result;
     },
-    reset,
+    discard: (reason) => {
+      if (reason === "stale-usage-expired") {
+        baseline = undefined;
+        return;
+      }
+      discardAll();
+    },
   };
 }

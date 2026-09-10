@@ -27,3 +27,7 @@ _Avoid_: Header usage, passive quota update
 **Dedicated weekly quota acquisition**:
 Weekly quota usage acquisition performed through an explicit provider quota request rather than information accompanying normal provider activity.
 _Avoid_: Active observation, quota fetch
+
+**Weekly quota observation reconciliation**:
+The process of combining dedicated and passive observations into coherent weekly quota usage while preserving or discarding incomplete observation evidence as account and acquisition outcomes require.
+_Avoid_: Usage merging, observation cache

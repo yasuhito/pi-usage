@@ -3,8 +3,8 @@ import type {
   CodexCredential,
   WeeklyQuotaUsage,
 } from "./codex-usage.ts";
-import { createPassiveWeeklyQuotaObserver } from "./passive-weekly-quota-observation.ts";
 import type { QuotaStatus } from "./presentation.ts";
+import { createWeeklyQuotaObservationReconciliation } from "./weekly-quota-observation-reconciliation.ts";
 
 const STALE_AFTER_MS = 10 * 60 * 1_000;
 const REFRESH_DEBOUNCE_MS = 30_000;
@@ -48,7 +48,8 @@ export function createWeeklyQuotaUsageLifecycle(
   let consecutiveFailures = 0;
   let currentAccountId: string | undefined;
   let accountResolutionsInFlight = 0;
-  const passiveObserver = createPassiveWeeklyQuotaObserver();
+  const observationReconciliation =
+    createWeeklyQuotaObservationReconciliation();
   let lastObservedUsage:
     | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
     | undefined;
@@ -60,12 +61,11 @@ export function createWeeklyQuotaUsageLifecycle(
   const clearObservedUsage = (): void => {
     clearStaleExpiration();
     lastObservedUsage = undefined;
-    passiveObserver.setBaseline(undefined);
   };
   const selectAccount = (accountId: string): void => {
     if (currentAccountId === accountId) return;
     currentAccountId = accountId;
-    passiveObserver.reset();
+    observationReconciliation.discard("account-change");
     clearObservedUsage();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
@@ -73,14 +73,14 @@ export function createWeeklyQuotaUsageLifecycle(
   const clearForMissingCredential = (): void => {
     credentialAvailable = false;
     currentAccountId = undefined;
-    passiveObserver.reset();
+    observationReconciliation.discard("missing-credential");
     clearObservedUsage();
     dependencies.publish(undefined);
   };
   const clearForInvalidCredential = (): void => {
     credentialAvailable = true;
     currentAccountId = undefined;
-    passiveObserver.reset();
+    observationReconciliation.discard("invalid-credential");
     clearObservedUsage();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
@@ -104,7 +104,6 @@ export function createWeeklyQuotaUsageLifecycle(
   };
   const recordFreshUsage = (usage: WeeklyQuotaUsage): void => {
     clearStaleExpiration();
-    passiveObserver.setBaseline(usage);
     lastObservedUsage = { usage, capturedAt: dependencies.now() };
     dependencies.publish({
       kind: "available",
@@ -119,7 +118,8 @@ export function createWeeklyQuotaUsageLifecycle(
       now - lastObservedUsage.capturedAt >= STALE_AFTER_MS ||
       now >= lastObservedUsage.usage.resetsAtMs
     ) {
-      clearStaleExpiration();
+      clearObservedUsage();
+      observationReconciliation.discard("stale-usage-expired");
       dependencies.publish({ kind: "unavailable" });
       return;
     }
@@ -188,6 +188,7 @@ export function createWeeklyQuotaUsageLifecycle(
       }
       if (shuttingDown || signal.aborted) return;
 
+      result = observationReconciliation.reconcileDedicated(result);
       if (result.kind === "observed") {
         nextAttemptAt = 0;
         consecutiveFailures = 0;
@@ -198,7 +199,6 @@ export function createWeeklyQuotaUsageLifecycle(
         recordTemporaryFailure(result.retryAtMs);
         return;
       }
-      if (result.kind === "malformed-observation") passiveObserver.reset();
       clearObservedUsage();
       nextAttemptAt = 0;
       consecutiveFailures = 0;
@@ -254,7 +254,7 @@ export function createWeeklyQuotaUsageLifecycle(
     },
     observeCodexResponse: (headers) => {
       if (!credentialAvailable || accountResolutionsInFlight > 0) return;
-      const result = passiveObserver.observe(headers);
+      const result = observationReconciliation.observePassive(headers);
       if (result.kind === "unrecognized") {
         if (
           lastObservedUsage === undefined ||
@@ -296,7 +296,7 @@ export function createWeeklyQuotaUsageLifecycle(
       stopPolling = undefined;
       credentialAvailable = false;
       currentAccountId = undefined;
-      passiveObserver.reset();
+      observationReconciliation.discard("session-end");
       clearObservedUsage();
     },
   };
