@@ -5,25 +5,7 @@ import {
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
-
-export class CodexUsageRequestError extends Error {
-  readonly status: number;
-  readonly retryAfter: string | undefined;
-
-  constructor(status: number, retryAfter: string | undefined) {
-    super(`Codex usage request failed with status ${status}`);
-    this.name = "CodexUsageRequestError";
-    this.status = status;
-    this.retryAfter = retryAfter;
-  }
-}
-
-export class CodexUsageFormatError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CodexUsageFormatError";
-  }
-}
+const REQUEST_TIMEOUT_MS = 5_000;
 
 export interface CodexCredential {
   readonly accessToken: string;
@@ -38,12 +20,34 @@ export interface WeeklyQuotaUsage {
   readonly windowPosition: RateLimitWindowPosition;
 }
 
-async function readBoundedBody(response: Response): Promise<string> {
+export type DedicatedWeeklyQuotaAcquisitionResult =
+  | { readonly kind: "observed"; readonly usage: WeeklyQuotaUsage }
+  | { readonly kind: "authentication-rejected" }
+  | {
+      readonly kind: "temporary-failure";
+      readonly retryAtMs: number | undefined;
+    }
+  | { readonly kind: "permanently-unavailable" }
+  | { readonly kind: "malformed-observation" };
+
+export type AcquireDedicatedWeeklyQuotaUsage = (
+  credential: CodexCredential,
+  signal?: AbortSignal,
+) => Promise<DedicatedWeeklyQuotaAcquisitionResult>;
+
+export interface DedicatedWeeklyQuotaAcquisitionDependencies {
+  readonly fetch: typeof fetch;
+  readonly now: () => number;
+}
+
+async function readBoundedBody(
+  response: Response,
+): Promise<string | undefined> {
   const declaredSize = parseFiniteNumber(
     response.headers.get("content-length") ?? undefined,
   );
   if (declaredSize !== undefined && declaredSize > MAX_RESPONSE_BYTES) {
-    throw new CodexUsageFormatError("Codex usage response is too large");
+    return undefined;
   }
   if (response.body === null) return "";
 
@@ -57,8 +61,8 @@ async function readBoundedBody(response: Response): Promise<string> {
       if (done) break;
       size += value.byteLength;
       if (size > MAX_RESPONSE_BYTES) {
-        await reader.cancel();
-        throw new CodexUsageFormatError("Codex usage response is too large");
+        await reader.cancel().catch(() => undefined);
+        return undefined;
       }
       text += decoder.decode(value, { stream: true });
     }
@@ -68,13 +72,15 @@ async function readBoundedBody(response: Response): Promise<string> {
   }
 }
 
-function weeklyUsageFromBody(body: unknown): WeeklyQuotaUsage {
+function weeklyQuotaObservationFromBody(
+  body: unknown,
+): DedicatedWeeklyQuotaAcquisitionResult {
   const rateLimit =
     typeof body === "object" && body !== null
       ? Reflect.get(body, "rate_limit")
       : undefined;
   if (typeof rateLimit !== "object" || rateLimit === null) {
-    throw new CodexUsageFormatError("Codex weekly quota is unavailable");
+    return { kind: "malformed-observation" };
   }
 
   for (const name of ["primary_window", "secondary_window"] as const) {
@@ -88,46 +94,94 @@ function weeklyUsageFromBody(body: unknown): WeeklyQuotaUsage {
       Reflect.get(window, "reset_at"),
     );
     if (result.kind === "malformed") {
-      throw new CodexUsageFormatError(
-        "Codex weekly quota values are malformed",
-      );
+      return { kind: "malformed-observation" };
     }
-    if (result.kind === "observed") return result.usage;
+    if (result.kind === "observed") {
+      return { kind: "observed", usage: result.usage };
+    }
   }
 
-  throw new CodexUsageFormatError("Codex weekly quota is unavailable");
+  return { kind: "malformed-observation" };
 }
 
-export async function readCodexWeeklyQuotaUsage(
-  credential: CodexCredential,
-  transport: typeof fetch = fetch,
-  signal?: AbortSignal,
-): Promise<WeeklyQuotaUsage> {
-  const response = await transport(CODEX_USAGE_URL, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${credential.accessToken}`,
-      "ChatGPT-Account-Id": credential.accountId,
-    },
-    redirect: "manual",
-    signal:
-      signal === undefined
-        ? AbortSignal.timeout(5_000)
-        : AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
-  });
-  if (!response.ok) {
-    throw new CodexUsageRequestError(
-      response.status,
-      response.headers.get("retry-after") ?? undefined,
-    );
+function retryAtMs(response: Response, now: number): number | undefined {
+  const rawValue = response.headers.get("retry-after");
+  if (rawValue === null) return undefined;
+
+  if (/^\d+$/.test(rawValue)) {
+    const retryAt = now + Number(rawValue) * 1_000;
+    return Number.isFinite(retryAt) ? retryAt : undefined;
   }
 
-  const responseText = await readBoundedBody(response);
-  let body: unknown;
-  try {
-    body = JSON.parse(responseText);
-  } catch {
-    throw new CodexUsageFormatError("Codex usage response is invalid JSON");
-  }
-  return weeklyUsageFromBody(body);
+  const retryAt = Date.parse(rawValue);
+  return Number.isFinite(retryAt) &&
+    new Date(retryAt).toUTCString() === rawValue
+    ? retryAt
+    : undefined;
+}
+
+export function createAcquireDedicatedWeeklyQuotaUsage(
+  dependencies: DedicatedWeeklyQuotaAcquisitionDependencies,
+): AcquireDedicatedWeeklyQuotaUsage {
+  return async (credential, signal) => {
+    if (signal?.aborted) {
+      throw signal.reason;
+    }
+
+    try {
+      const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      const requestSignal =
+        signal === undefined
+          ? timeoutSignal
+          : AbortSignal.any([signal, timeoutSignal]);
+      const response = await dependencies.fetch(CODEX_USAGE_URL, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${credential.accessToken}`,
+          "ChatGPT-Account-Id": credential.accountId,
+        },
+        redirect: "manual",
+        signal: requestSignal,
+      });
+      if (signal?.aborted) throw signal.reason;
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          return { kind: "authentication-rejected" };
+        }
+        if (
+          response.status === 408 ||
+          response.status === 425 ||
+          response.status === 429 ||
+          response.status >= 500
+        ) {
+          return {
+            kind: "temporary-failure",
+            retryAtMs:
+              response.status === 429
+                ? retryAtMs(response, dependencies.now())
+                : undefined,
+          };
+        }
+        return { kind: "permanently-unavailable" };
+      }
+
+      const responseText = await readBoundedBody(response);
+      if (signal?.aborted) throw signal.reason;
+      if (responseText === undefined) {
+        return { kind: "malformed-observation" };
+      }
+
+      let body: unknown;
+      try {
+        body = JSON.parse(responseText);
+      } catch {
+        return { kind: "malformed-observation" };
+      }
+      return weeklyQuotaObservationFromBody(body);
+    } catch {
+      if (signal?.aborted) throw signal.reason;
+      return { kind: "temporary-failure", retryAtMs: undefined };
+    }
+  };
 }

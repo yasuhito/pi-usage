@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  type CodexCredential,
-  CodexUsageFormatError,
-  CodexUsageRequestError,
+import type {
+  CodexCredential,
+  DedicatedWeeklyQuotaAcquisitionResult,
 } from "../src/codex-usage.ts";
 import type { QuotaStatus } from "../src/presentation.ts";
 import {
@@ -24,9 +23,16 @@ function lifecycleFixture() {
   };
   let resolutionReads = 0;
   let resolutionGate: Promise<void> | undefined;
-  let readError: Error | undefined;
-  let readGate: Promise<void> | undefined;
-  let readsFail = false;
+  let acquisitionError: Error | undefined;
+  let acquisitionGate: Promise<void> | undefined;
+  let acquisitionResult: DedicatedWeeklyQuotaAcquisitionResult = {
+    kind: "observed",
+    usage: {
+      usedPercent: 63.4,
+      resetsAtMs: 2_000_000,
+      windowPosition: "secondary",
+    },
+  };
   let disableAuthAfterUsageReads: number | undefined;
   let scheduled: { callback: () => void; delay: number } | undefined;
   let pollingRefresh: (() => void) | undefined;
@@ -53,20 +59,15 @@ function lifecycleFixture() {
       await resolutionGate;
       return resolution;
     },
-    readWeeklyQuotaUsage: async (value, signal) => {
+    acquireDedicatedWeeklyQuotaUsage: async (value, signal) => {
       observedCredentials.push(value);
       observedSignals.push(signal);
       if (observedCredentials.length === disableAuthAfterUsageReads) {
         resolution = { kind: "missing" };
       }
-      await readGate;
-      if (readError !== undefined) throw readError;
-      if (readsFail) throw new Error("network unavailable");
-      return {
-        usedPercent: 63.4,
-        resetsAtMs: 2_000_000,
-        windowPosition: "secondary",
-      };
+      await acquisitionGate;
+      if (acquisitionError !== undefined) throw acquisitionError;
+      return acquisitionResult;
     },
     publish: (status) => statuses.push(status),
     startPolling: (refresh) => {
@@ -107,14 +108,17 @@ function lifecycleFixture() {
     setAccountId: (accountId: string) => {
       resolution = { kind: "available", credential: credential(accountId) };
     },
-    setReadError: (value: Error | undefined) => {
-      readError = value;
+    setAcquisitionError: (value: Error | undefined) => {
+      acquisitionError = value;
     },
-    setReadsFail: (value: boolean) => {
-      readsFail = value;
+    setAcquisitionResult: (value: DedicatedWeeklyQuotaAcquisitionResult) => {
+      acquisitionResult = value;
     },
-    setReadGate: (value: Promise<void> | undefined) => {
-      readGate = value;
+    setTemporaryFailure: (retryAtMs?: number) => {
+      acquisitionResult = { kind: "temporary-failure", retryAtMs };
+    },
+    setAcquisitionGate: (value: Promise<void> | undefined) => {
+      acquisitionGate = value;
     },
     setDisableAuthAfterUsageReads: (value: number | undefined) => {
       disableAuthAfterUsageReads = value;
@@ -184,7 +188,7 @@ test("fresh activity is debounced and polling can refresh old usage", async () =
 test("temporary failure publishes stale usage, then unavailable when expired", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
 
   await fixture.lifecycle.refreshForAccountChange();
   assert.deepEqual(fixture.statuses.at(-1), {
@@ -201,7 +205,7 @@ test("temporary failure publishes stale usage, then unavailable when expired", a
 test("stale usage is scheduled for its earliest expiration", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
 
   await fixture.lifecycle.refreshForAccountChange();
 
@@ -211,7 +215,7 @@ test("stale usage is scheduled for its earliest expiration", async () => {
 test("stop cancels scheduled stale expiration", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
   await fixture.lifecycle.refreshForAccountChange();
   const statusCount = fixture.statuses.length;
 
@@ -239,7 +243,7 @@ test("a dedicated quota observation becomes the baseline for passive observation
 test("fresh headers cancel scheduled stale expiration", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
   await fixture.lifecycle.refreshForAccountChange();
 
   fixture.lifecycle.observeCodexResponse({
@@ -287,7 +291,7 @@ test("overlapping activity refreshes share one request", async () => {
   fixture.setNow(1_031_000);
 
   let release: (() => void) | undefined;
-  fixture.setReadGate(
+  fixture.setAcquisitionGate(
     new Promise<void>((resolve) => {
       release = resolve;
     }),
@@ -327,7 +331,7 @@ test("stop prevents a pending credential resolution from publishing", async () =
 test("stop aborts an in-flight request", async () => {
   const fixture = lifecycleFixture();
   let release: (() => void) | undefined;
-  fixture.setReadGate(
+  fixture.setAcquisitionGate(
     new Promise<void>((resolve) => {
       release = resolve;
     }),
@@ -345,7 +349,7 @@ test("stop aborts an in-flight request", async () => {
 test("a forced refresh queued behind a request cannot run after stop", async () => {
   const fixture = lifecycleFixture();
   let release: (() => void) | undefined;
-  fixture.setReadGate(
+  fixture.setAcquisitionGate(
     new Promise<void>((resolve) => {
       release = resolve;
     }),
@@ -362,10 +366,10 @@ test("a forced refresh queued behind a request cannot run after stop", async () 
   assert.equal(fixture.pollingStarted(), 0);
 });
 
-test("Retry-After suppresses requests until its deadline", async () => {
+test("a provider retry deadline suppresses acquisition", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadError(new CodexUsageRequestError(429, "120"));
+  fixture.setTemporaryFailure(1_151_000);
   fixture.setNow(1_031_000);
 
   await fixture.lifecycle.refreshAfterActivity();
@@ -378,10 +382,10 @@ test("Retry-After suppresses requests until its deadline", async () => {
   assert.equal(fixture.observedCredentials.length, 3);
 });
 
-test("stale usage expires while Retry-After suppresses requests", async () => {
+test("stale usage expires while a provider retry deadline suppresses acquisition", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadError(new CodexUsageRequestError(429, "1200"));
+  fixture.setTemporaryFailure(2_200_000);
 
   await fixture.lifecycle.refreshForAccountChange();
   fixture.setNow(2_000_001);
@@ -393,7 +397,7 @@ test("stale usage expires while Retry-After suppresses requests", async () => {
 test("temporary failures use exponential backoff", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
   fixture.setNow(1_031_000);
 
   await fixture.lifecycle.refreshForAccountChange();
@@ -406,10 +410,27 @@ test("temporary failures use exponential backoff", async () => {
   assert.equal(fixture.observedCredentials.length, 3);
 });
 
+test("unexpected acquisition rejection uses temporary backoff", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+  fixture.setAcquisitionError(new Error("unexpected defect"));
+  fixture.setNow(1_031_000);
+
+  await fixture.lifecycle.refreshForAccountChange();
+  await fixture.lifecycle.refreshAfterActivity();
+
+  assert.equal(fixture.observedCredentials.length, 2);
+  assert.deepEqual(fixture.statuses.at(-1), {
+    kind: "available",
+    usedPercent: 63.4,
+    stale: true,
+  });
+});
+
 test("account refresh bypasses old-account backoff", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadError(new CodexUsageRequestError(429, "120"));
+  fixture.setTemporaryFailure(1_120_000);
 
   await fixture.lifecycle.refreshForAccountChange();
   fixture.setAccountId("account-2");
@@ -421,7 +442,7 @@ test("account refresh bypasses old-account backoff", async () => {
 test("authentication failure resolves credentials and retries once", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadError(new CodexUsageRequestError(401, undefined));
+  fixture.setAcquisitionResult({ kind: "authentication-rejected" });
 
   await fixture.lifecycle.refreshForAccountChange();
 
@@ -433,7 +454,7 @@ test("authentication failure resolves credentials and retries once", async () =>
 test("logout discovered during authentication retry clears usage and polling", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadError(new CodexUsageRequestError(401, undefined));
+  fixture.setAcquisitionResult({ kind: "authentication-rejected" });
   fixture.setDisableAuthAfterUsageReads(2);
 
   await fixture.lifecycle.refreshForAccountChange();
@@ -448,7 +469,7 @@ test("malformed dedicated observation discards partial passive fields", async ()
   fixture.lifecycle.observeCodexResponse({
     "x-codex-primary-window-minutes": "10080",
   });
-  fixture.setReadError(new CodexUsageFormatError("malformed"));
+  fixture.setAcquisitionResult({ kind: "malformed-observation" });
   await fixture.lifecycle.refreshForAccountChange();
   const statusCount = fixture.statuses.length;
 
@@ -478,21 +499,44 @@ test("invalid credentials discard partial passive fields", async () => {
   assert.equal(fixture.statuses.length, statusCount);
 });
 
-test("permanent request failure discards old usage", async () => {
+test("permanent acquisition unavailability discards old usage", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
-  fixture.setReadError(new CodexUsageRequestError(400, undefined));
+  fixture.setAcquisitionResult({ kind: "permanently-unavailable" });
 
   await fixture.lifecycle.refreshForAccountChange();
 
   assert.deepEqual(fixture.statuses.at(-1), { kind: "unavailable" });
 });
 
+test("permanent acquisition unavailability preserves partial passive fields", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.lifecycle.start();
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-window-minutes": "10080",
+  });
+  fixture.setAcquisitionResult({ kind: "permanently-unavailable" });
+  await fixture.lifecycle.refreshForAccountChange();
+  const statusCount = fixture.statuses.length;
+
+  fixture.lifecycle.observeCodexResponse({
+    "x-codex-primary-used-percent": "74",
+    "x-codex-primary-reset-at": "4000",
+  });
+
+  assert.equal(fixture.statuses.length, statusCount + 1);
+  assert.deepEqual(fixture.statuses.at(-1), {
+    kind: "available",
+    usedPercent: 74,
+    stale: false,
+  });
+});
+
 test("account change discards previous-account usage before refresh", async () => {
   const fixture = lifecycleFixture();
   await fixture.lifecycle.start();
   fixture.setAccountId("account-2");
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
 
   await fixture.lifecycle.refreshForAccountChange();
 
@@ -534,7 +578,7 @@ test("account change discards partial passive observation fields", async () => {
     "x-codex-primary-window-minutes": "10080",
   });
   fixture.setAccountId("account-2");
-  fixture.setReadsFail(true);
+  fixture.setTemporaryFailure();
   await fixture.lifecycle.refreshForAccountChange();
   const statusCount = fixture.statuses.length;
 

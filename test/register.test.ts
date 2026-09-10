@@ -44,12 +44,15 @@ function registerFixture() {
     now: () => 1_000_000,
     random: () => 0.5,
     schedule: () => () => {},
-    readWeeklyQuotaUsage: async (credential) => {
+    acquireDedicatedWeeklyQuotaUsage: async (credential) => {
       observedCredentials.push(credential);
       return {
-        usedPercent: 63.4,
-        resetsAtMs: 2_000_000,
-        windowPosition: "secondary",
+        kind: "observed",
+        usage: {
+          usedPercent: 63.4,
+          resetsAtMs: 2_000_000,
+          windowPosition: "secondary",
+        },
       };
     },
     startPolling: () => {

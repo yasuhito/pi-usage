@@ -1,8 +1,7 @@
-import {
-  type CodexCredential,
-  CodexUsageFormatError,
-  CodexUsageRequestError,
-  type WeeklyQuotaUsage,
+import type {
+  AcquireDedicatedWeeklyQuotaUsage,
+  CodexCredential,
+  WeeklyQuotaUsage,
 } from "./codex-usage.ts";
 import { createPassiveWeeklyQuotaObserver } from "./passive-weekly-quota-observation.ts";
 import type { QuotaStatus } from "./presentation.ts";
@@ -22,10 +21,7 @@ export interface WeeklyQuotaUsageLifecycleDependencies {
   readonly random: () => number;
   readonly schedule: (callback: () => void, delay: number) => () => void;
   readonly resolveCredential: () => Promise<CodexCredentialResolution>;
-  readonly readWeeklyQuotaUsage: (
-    credential: CodexCredential,
-    signal?: AbortSignal,
-  ) => Promise<WeeklyQuotaUsage>;
+  readonly acquireDedicatedWeeklyQuotaUsage: AcquireDedicatedWeeklyQuotaUsage;
   readonly publish: (status: QuotaStatus | undefined) => void;
   readonly startPolling: (refresh: () => void) => () => void;
 }
@@ -81,6 +77,31 @@ export function createWeeklyQuotaUsageLifecycle(
     clearObservedUsage();
     dependencies.publish(undefined);
   };
+  const clearForInvalidCredential = (): void => {
+    credentialAvailable = true;
+    currentAccountId = undefined;
+    passiveObserver.reset();
+    clearObservedUsage();
+    nextAttemptAt = 0;
+    consecutiveFailures = 0;
+    dependencies.publish({ kind: "unavailable" });
+  };
+  const applyCredentialResolution = (
+    resolution: CodexCredentialResolution,
+  ): CodexCredential | undefined => {
+    if (resolution.kind === "missing") {
+      clearForMissingCredential();
+      return undefined;
+    }
+    if (resolution.kind === "invalid") {
+      clearForInvalidCredential();
+      return undefined;
+    }
+
+    credentialAvailable = true;
+    selectAccount(resolution.credential.accountId);
+    return resolution.credential;
+  };
   const recordFreshUsage = (usage: WeeklyQuotaUsage): void => {
     clearStaleExpiration();
     passiveObserver.setBaseline(usage);
@@ -118,6 +139,23 @@ export function createWeeklyQuotaUsageLifecycle(
     }, deadline - now);
   };
 
+  const recordTemporaryFailure = (retryAtMs: number | undefined): void => {
+    const now = dependencies.now();
+    consecutiveFailures += 1;
+    if (retryAtMs !== undefined && Number.isFinite(retryAtMs)) {
+      nextAttemptAt = retryAtMs;
+    }
+    if (nextAttemptAt <= now) {
+      const baseDelay = Math.min(
+        MAX_BACKOFF_MS,
+        INITIAL_BACKOFF_MS * 2 ** (consecutiveFailures - 1),
+      );
+      const jitter = 0.5 + dependencies.random();
+      nextAttemptAt = now + baseDelay * jitter;
+    }
+    publishStaleUsage();
+  };
+
   let inFlight: Promise<void> | undefined;
   const performRefresh = async (
     signal: AbortSignal,
@@ -126,94 +164,48 @@ export function createWeeklyQuotaUsageLifecycle(
     try {
       const resolution = await dependencies.resolveCredential();
       if (shuttingDown) return;
-      if (resolution.kind === "missing") {
-        clearForMissingCredential();
-        return;
-      }
-      if (resolution.kind === "invalid") {
-        credentialAvailable = true;
-        currentAccountId = undefined;
-        passiveObserver.reset();
-        clearObservedUsage();
-        dependencies.publish({ kind: "unavailable" });
-        return;
-      }
+      const credential = applyCredentialResolution(resolution);
+      if (credential === undefined) return;
 
-      credentialAvailable = true;
-      selectAccount(resolution.credential.accountId);
       if (!ignoreBackoff && dependencies.now() < nextAttemptAt) {
         publishStaleUsage();
         return;
       }
-      let usage: WeeklyQuotaUsage;
-      try {
-        usage = await dependencies.readWeeklyQuotaUsage(
-          resolution.credential,
-          signal,
-        );
-      } catch (error) {
-        if (
-          !(error instanceof CodexUsageRequestError) ||
-          (error.status !== 401 && error.status !== 403)
-        ) {
-          throw error;
-        }
+      let result = await dependencies.acquireDedicatedWeeklyQuotaUsage(
+        credential,
+        signal,
+      );
+      if (result.kind === "authentication-rejected") {
         const refreshedResolution = await dependencies.resolveCredential();
         if (shuttingDown) return;
-        if (refreshedResolution.kind === "missing") {
-          clearForMissingCredential();
-          return;
-        }
-        if (refreshedResolution.kind === "invalid") {
-          passiveObserver.reset();
-          throw error;
-        }
-        selectAccount(refreshedResolution.credential.accountId);
-        usage = await dependencies.readWeeklyQuotaUsage(
-          refreshedResolution.credential,
+        const refreshedCredential =
+          applyCredentialResolution(refreshedResolution);
+        if (refreshedCredential === undefined) return;
+        result = await dependencies.acquireDedicatedWeeklyQuotaUsage(
+          refreshedCredential,
           signal,
         );
       }
-      if (shuttingDown) return;
-      nextAttemptAt = 0;
-      consecutiveFailures = 0;
-      recordFreshUsage(usage);
-    } catch (error) {
-      if (shuttingDown) return;
-      const now = dependencies.now();
-      const temporaryFailure =
-        !(error instanceof CodexUsageFormatError) &&
-        (!(error instanceof CodexUsageRequestError) ||
-          error.status === 408 ||
-          error.status === 425 ||
-          error.status === 429 ||
-          error.status >= 500);
-      if (!temporaryFailure) {
-        if (error instanceof CodexUsageFormatError) passiveObserver.reset();
-        clearObservedUsage();
+      if (shuttingDown || signal.aborted) return;
+
+      if (result.kind === "observed") {
         nextAttemptAt = 0;
         consecutiveFailures = 0;
-        dependencies.publish({ kind: "unavailable" });
+        recordFreshUsage(result.usage);
         return;
       }
-
-      consecutiveFailures += 1;
-      if (error instanceof CodexUsageRequestError && error.status === 429) {
-        const seconds = Number(error.retryAfter);
-        const retryAt = Number.isFinite(seconds)
-          ? now + Math.max(0, seconds) * 1_000
-          : Date.parse(error.retryAfter ?? "");
-        if (Number.isFinite(retryAt)) nextAttemptAt = retryAt;
+      if (result.kind === "temporary-failure") {
+        recordTemporaryFailure(result.retryAtMs);
+        return;
       }
-      if (nextAttemptAt <= now) {
-        const baseDelay = Math.min(
-          MAX_BACKOFF_MS,
-          INITIAL_BACKOFF_MS * 2 ** (consecutiveFailures - 1),
-        );
-        const jitter = 0.5 + dependencies.random();
-        nextAttemptAt = now + baseDelay * jitter;
-      }
-      publishStaleUsage();
+      if (result.kind === "malformed-observation") passiveObserver.reset();
+      clearObservedUsage();
+      nextAttemptAt = 0;
+      consecutiveFailures = 0;
+      dependencies.publish({ kind: "unavailable" });
+    } catch {
+      if (shuttingDown || signal.aborted) return;
+      recordTemporaryFailure(undefined);
     }
   };
 

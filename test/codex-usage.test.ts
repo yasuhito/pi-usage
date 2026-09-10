@@ -1,84 +1,156 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  CodexUsageRequestError,
-  readCodexWeeklyQuotaUsage,
-} from "../src/codex-usage.ts";
+import { createAcquireDedicatedWeeklyQuotaUsage } from "../src/codex-usage.ts";
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
+const credential = { accessToken: "secret", accountId: "account-1" };
 
-test("reads the seven-day window from the base Codex rate limit", async () => {
-  const fetchStub: typeof fetch = async () =>
-    new Response(
-      JSON.stringify({
-        rate_limit: {
-          primary_window: {
-            used_percent: 12,
-            limit_window_seconds: 18_000,
-            reset_at: 2_000,
-          },
-          secondary_window: {
-            used_percent: 63.4,
-            limit_window_seconds: WEEK_SECONDS,
-            reset_at: 3_000,
-          },
+function acquisition(fetchStub: typeof fetch, now = 1_000_000) {
+  return createAcquireDedicatedWeeklyQuotaUsage({
+    fetch: fetchStub,
+    now: () => now,
+  });
+}
+
+function usageResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      rate_limit: {
+        primary_window: {
+          used_percent: 12,
+          limit_window_seconds: 18_000,
+          reset_at: 2_000,
         },
-      }),
-      { status: 200 },
-    );
+        secondary_window: {
+          used_percent: 63.4,
+          limit_window_seconds: WEEK_SECONDS,
+          reset_at: 3_000,
+        },
+      },
+    }),
+  );
+}
 
-  assert.deepEqual(
-    await readCodexWeeklyQuotaUsage(
-      { accessToken: "secret", accountId: "account-1" },
-      fetchStub,
-    ),
-    {
+test("observes the seven-day window from the base Codex rate limit", async () => {
+  const acquire = acquisition(async () => usageResponse());
+
+  assert.deepEqual(await acquire(credential), {
+    kind: "observed",
+    usage: {
       usedPercent: 63.4,
       resetsAtMs: 3_000_000,
       windowPosition: "secondary",
     },
-  );
+  });
 });
 
-test("rejects an unsuccessful usage response even when its body looks valid", async () => {
-  const fetchStub: typeof fetch = async () =>
-    new Response(
-      JSON.stringify({
-        rate_limit: {
-          primary_window: {
-            used_percent: 10,
-            limit_window_seconds: WEEK_SECONDS,
-            reset_at: 3_000,
-          },
-        },
+test("maps unsuccessful responses to lifecycle meanings without reading their bodies", async () => {
+  const cases = [
+    [401, { kind: "authentication-rejected" }],
+    [403, { kind: "authentication-rejected" }],
+    [400, { kind: "permanently-unavailable" }],
+    [302, { kind: "permanently-unavailable" }],
+    [408, { kind: "temporary-failure", retryAtMs: undefined }],
+    [425, { kind: "temporary-failure", retryAtMs: undefined }],
+    [500, { kind: "temporary-failure", retryAtMs: undefined }],
+  ] as const;
+
+  for (const [status, expected] of cases) {
+    const acquire = acquisition(
+      async () => new Response("sensitive invalid JSON", { status }),
+    );
+    assert.deepEqual(await acquire(credential), expected);
+  }
+});
+
+test("normalizes numeric and dated Retry-After values", async () => {
+  const numeric = acquisition(
+    async () =>
+      new Response(null, {
+        status: 429,
+        headers: { "retry-after": "120" },
       }),
-      { status: 500 },
+  );
+  const dated = acquisition(
+    async () =>
+      new Response(null, {
+        status: 429,
+        headers: { "retry-after": new Date(1_200_000).toUTCString() },
+      }),
+  );
+  const invalid = acquisition(
+    async () =>
+      new Response(null, {
+        status: 429,
+        headers: { "retry-after": "later" },
+      }),
+  );
+
+  assert.deepEqual(await numeric(credential), {
+    kind: "temporary-failure",
+    retryAtMs: 1_120_000,
+  });
+  assert.deepEqual(await dated(credential), {
+    kind: "temporary-failure",
+    retryAtMs: 1_200_000,
+  });
+  assert.deepEqual(await invalid(credential), {
+    kind: "temporary-failure",
+    retryAtMs: undefined,
+  });
+});
+
+test("ignores invalid Retry-After delay syntax", async () => {
+  for (const retryAfter of ["1.5", "-10", "+5", "0x10"]) {
+    const acquire = acquisition(
+      async () =>
+        new Response(null, {
+          status: 429,
+          headers: { "retry-after": retryAfter },
+        }),
     );
 
-  await assert.rejects(
-    readCodexWeeklyQuotaUsage(
-      { accessToken: "secret", accountId: "account-1" },
-      fetchStub,
-    ),
-    /Codex usage request failed with status 500/,
-  );
+    assert.deepEqual(await acquire(credential), {
+      kind: "temporary-failure",
+      retryAtMs: undefined,
+    });
+  }
 });
 
-test("rejects a usage response larger than one MiB before parsing it", async () => {
-  const fetchStub: typeof fetch = async () =>
-    new Response("{}", {
-      status: 200,
-      headers: { "content-length": String(1024 * 1024 + 1) },
-    });
-
-  await assert.rejects(
-    readCodexWeeklyQuotaUsage(
-      { accessToken: "secret", accountId: "account-1" },
-      fetchStub,
-    ),
-    /Codex usage response is too large/,
+test("times out an unresponsive request after five seconds", {
+  timeout: 6_000,
+}, async () => {
+  const acquire = acquisition(
+    (_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(init.signal?.reason),
+          { once: true },
+        );
+      }),
   );
+  const startedAt = Date.now();
+
+  assert.deepEqual(await acquire(credential), {
+    kind: "temporary-failure",
+    retryAtMs: undefined,
+  });
+  assert.ok(Date.now() - startedAt >= 4_900);
+});
+
+test("marks a response larger than one MiB as malformed before parsing", async () => {
+  const acquire = acquisition(
+    async () =>
+      new Response("{}", {
+        headers: { "content-length": String(1024 * 1024 + 1) },
+      }),
+  );
+
+  assert.deepEqual(await acquire(credential), {
+    kind: "malformed-observation",
+  });
 });
 
 test("cancels a streaming response as soon as it exceeds one MiB", async () => {
@@ -91,15 +163,11 @@ test("cancels a streaming response as soon as it exceeds one MiB", async () => {
       cancelled = true;
     },
   });
-  const fetchStub: typeof fetch = async () => new Response(body);
+  const acquire = acquisition(async () => new Response(body));
 
-  await assert.rejects(
-    readCodexWeeklyQuotaUsage(
-      { accessToken: "secret", accountId: "account-1" },
-      fetchStub,
-    ),
-    /Codex usage response is too large/,
-  );
+  assert.deepEqual(await acquire(credential), {
+    kind: "malformed-observation",
+  });
   assert.equal(cancelled, true);
 });
 
@@ -108,25 +176,12 @@ test("sends credentials only to the fixed endpoint without following redirects",
     input: string | URL | Request | undefined;
     init: RequestInit | undefined;
   } = { input: undefined, init: undefined };
-  const fetchStub: typeof fetch = async (input, init) => {
+  const acquire = acquisition(async (input, init) => {
     request = { input, init };
-    return new Response(
-      JSON.stringify({
-        rate_limit: {
-          primary_window: {
-            used_percent: 20,
-            limit_window_seconds: WEEK_SECONDS,
-            reset_at: 3_000,
-          },
-        },
-      }),
-    );
-  };
+    return usageResponse();
+  });
 
-  await readCodexWeeklyQuotaUsage(
-    { accessToken: "secret", accountId: "account-1" },
-    fetchStub,
-  );
+  await acquire(credential);
 
   assert.deepEqual(
     {
@@ -149,49 +204,41 @@ test("sends credentials only to the fixed endpoint without following redirects",
   );
 });
 
-test("combines caller cancellation with the five-second request timeout", async () => {
+test("preserves caller cancellation without issuing a request", async () => {
   const controller = new AbortController();
-  controller.abort();
-  let requestWasAborted = false;
-  const fetchStub: typeof fetch = async (_input, init) => {
-    requestWasAborted = init?.signal?.aborted ?? false;
-    return new Response(
-      JSON.stringify({
-        rate_limit: {
-          primary_window: {
-            used_percent: 20,
-            limit_window_seconds: WEEK_SECONDS,
-            reset_at: 3_000,
-          },
-        },
-      }),
-    );
-  };
+  const cancellation = new Error("cancelled");
+  controller.abort(cancellation);
+  let requested = false;
+  const acquire = acquisition(async () => {
+    requested = true;
+    return usageResponse();
+  });
 
-  await readCodexWeeklyQuotaUsage(
-    { accessToken: "secret", accountId: "account-1" },
-    fetchStub,
-    controller.signal,
-  );
-
-  assert.equal(requestWasAborted, true);
+  await assert.rejects(acquire(credential, controller.signal), cancellation);
+  assert.equal(requested, false);
 });
 
-test("a rate-limited response exposes Retry-After without reading its body", async () => {
-  const fetchStub: typeof fetch = async () =>
-    new Response("sensitive error body", {
-      status: 429,
-      headers: { "retry-after": "120" },
-    });
+test("maps transport failures to temporary failure", async () => {
+  const acquire = acquisition(async () => {
+    throw new Error("network unavailable");
+  });
 
-  await assert.rejects(
-    readCodexWeeklyQuotaUsage(
-      { accessToken: "secret", accountId: "account-1" },
-      fetchStub,
-    ),
-    (error: unknown) =>
-      error instanceof CodexUsageRequestError &&
-      error.status === 429 &&
-      error.retryAfter === "120",
+  assert.deepEqual(await acquire(credential), {
+    kind: "temporary-failure",
+    retryAtMs: undefined,
+  });
+});
+
+test("maps invalid or missing weekly quota data to malformed observation", async () => {
+  const invalidJson = acquisition(async () => new Response("{"));
+  const missingWeeklyWindow = acquisition(
+    async () => new Response(JSON.stringify({ rate_limit: {} })),
   );
+
+  assert.deepEqual(await invalidJson(credential), {
+    kind: "malformed-observation",
+  });
+  assert.deepEqual(await missingWeeklyWindow(credential), {
+    kind: "malformed-observation",
+  });
 });

@@ -3,7 +3,10 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import type { CodexCredential, WeeklyQuotaUsage } from "./codex-usage.ts";
+import type {
+  AcquireDedicatedWeeklyQuotaUsage,
+  CodexCredential,
+} from "./codex-usage.ts";
 import { presentQuotaStatus } from "./presentation.ts";
 import {
   type CodexCredentialResolution,
@@ -17,10 +20,7 @@ export interface WeeklyQuotaUsageDependencies {
   readonly now: () => number;
   readonly random: () => number;
   readonly schedule: (callback: () => void, delay: number) => () => void;
-  readonly readWeeklyQuotaUsage: (
-    credential: CodexCredential,
-    signal?: AbortSignal,
-  ) => Promise<WeeklyQuotaUsage>;
+  readonly acquireDedicatedWeeklyQuotaUsage: AcquireDedicatedWeeklyQuotaUsage;
   readonly startPolling: (refresh: () => void) => () => void;
 }
 

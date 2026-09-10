@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { readCodexWeeklyQuotaUsage } from "./src/codex-usage.ts";
+import { createAcquireDedicatedWeeklyQuotaUsage } from "./src/codex-usage.ts";
 import { registerWeeklyQuotaUsage } from "./src/register.ts";
 
 export default function piUsage(pi: ExtensionAPI): void {
@@ -12,8 +12,10 @@ export default function piUsage(pi: ExtensionAPI): void {
       timer.unref();
       return () => clearTimeout(timer);
     },
-    readWeeklyQuotaUsage: (credential, signal) =>
-      readCodexWeeklyQuotaUsage(credential, fetch, signal),
+    acquireDedicatedWeeklyQuotaUsage: createAcquireDedicatedWeeklyQuotaUsage({
+      fetch,
+      now: Date.now,
+    }),
     startPolling: (refresh) => {
       const timer = setInterval(refresh, 60_000);
       timer.unref();
