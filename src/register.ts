@@ -17,6 +17,7 @@ const STATUS_KEY = "pi-usage";
 export interface UsageDependencies {
   readonly now: () => number;
   readonly random: () => number;
+  readonly schedule: (callback: () => void, delay: number) => () => void;
   readonly readUsage: (
     credential: CodexCredential,
     signal?: AbortSignal,
@@ -49,6 +50,7 @@ export function registerUsage(
   dependencies: UsageDependencies,
 ): void {
   let stopPolling: (() => void) | undefined;
+  let cancelStaleExpiration: (() => void) | undefined;
   let activeController: AbortController | undefined;
   let shuttingDown = false;
   let credentialAvailable = false;
@@ -58,10 +60,18 @@ export function registerUsage(
   let lastObservedUsage:
     | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
     | undefined;
+  const clearStaleExpiration = (): void => {
+    cancelStaleExpiration?.();
+    cancelStaleExpiration = undefined;
+  };
+  const clearObservedUsage = (): void => {
+    clearStaleExpiration();
+    lastObservedUsage = undefined;
+  };
   const selectAccount = (accountId: string): void => {
     if (currentAccountId === accountId) return;
     currentAccountId = accountId;
-    lastObservedUsage = undefined;
+    clearObservedUsage();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
   };
@@ -76,9 +86,10 @@ export function registerUsage(
     const now = dependencies.now();
     if (
       lastObservedUsage === undefined ||
-      now - lastObservedUsage.capturedAt > 10 * 60 * 1_000 ||
+      now - lastObservedUsage.capturedAt >= 10 * 60 * 1_000 ||
       now >= lastObservedUsage.usage.resetsAtMs
     ) {
+      clearStaleExpiration();
       publish(ctx, { kind: "unavailable" });
       return;
     }
@@ -87,6 +98,15 @@ export function registerUsage(
       usedPercent: lastObservedUsage.usage.usedPercent,
       stale: true,
     });
+    const deadline = Math.min(
+      lastObservedUsage.capturedAt + 10 * 60 * 1_000,
+      lastObservedUsage.usage.resetsAtMs,
+    );
+    clearStaleExpiration();
+    cancelStaleExpiration = dependencies.schedule(() => {
+      cancelStaleExpiration = undefined;
+      publishStaleUsage(ctx);
+    }, deadline - now);
   };
 
   let inFlight: Promise<void> | undefined;
@@ -100,7 +120,7 @@ export function registerUsage(
       if (credential === undefined) {
         credentialAvailable = false;
         currentAccountId = undefined;
-        lastObservedUsage = undefined;
+        clearObservedUsage();
         ctx.ui.setStatus(STATUS_KEY, undefined);
         return;
       }
@@ -127,6 +147,7 @@ export function registerUsage(
       if (shuttingDown) return;
       nextAttemptAt = 0;
       consecutiveFailures = 0;
+      clearStaleExpiration();
       lastObservedUsage = { usage, capturedAt: dependencies.now() };
       publish(ctx, {
         kind: "available",
@@ -136,6 +157,21 @@ export function registerUsage(
     } catch (error) {
       if (shuttingDown) return;
       const now = dependencies.now();
+      const temporaryFailure =
+        !(error instanceof CodexUsageFormatError) &&
+        (!(error instanceof CodexUsageRequestError) ||
+          error.status === 408 ||
+          error.status === 425 ||
+          error.status === 429 ||
+          error.status >= 500);
+      if (!temporaryFailure) {
+        clearObservedUsage();
+        nextAttemptAt = 0;
+        consecutiveFailures = 0;
+        publish(ctx, { kind: "unavailable" });
+        return;
+      }
+
       consecutiveFailures += 1;
       if (error instanceof CodexUsageRequestError && error.status === 429) {
         const seconds = Number(error.retryAfter);
@@ -152,17 +188,19 @@ export function registerUsage(
         const jitter = 0.5 + dependencies.random();
         nextAttemptAt = now + baseDelay * jitter;
       }
-      if (error instanceof CodexUsageFormatError) {
-        lastObservedUsage = undefined;
-        publish(ctx, { kind: "unavailable" });
-        return;
-      }
       publishStaleUsage(ctx);
     }
   };
-  const refresh = (ctx: ExtensionContext): Promise<void> => {
-    if (inFlight !== undefined) return inFlight;
-    if (dependencies.now() < nextAttemptAt) {
+  const refresh = (
+    ctx: ExtensionContext,
+    ignoreBackoff = false,
+  ): Promise<void> => {
+    if (inFlight !== undefined) {
+      if (!ignoreBackoff) return inFlight;
+      activeController?.abort();
+      return inFlight.then(() => refresh(ctx, true));
+    }
+    if (!ignoreBackoff && dependencies.now() < nextAttemptAt) {
       publishStaleUsage(ctx);
       return Promise.resolve();
     }
@@ -186,21 +224,37 @@ export function registerUsage(
       return;
     }
     stopPolling ??= dependencies.startPolling(() => {
-      void refresh(ctx).then(() => updatePolling(ctx));
+      void refreshAndUpdatePolling(ctx);
     });
+  };
+  const refreshAndUpdatePolling = async (
+    ctx: ExtensionContext,
+    ignoreBackoff = false,
+  ): Promise<void> => {
+    await refresh(ctx, ignoreBackoff);
+    updatePolling(ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     shuttingDown = false;
     publish(ctx, { kind: "loading" });
-    await refresh(ctx);
-    updatePolling(ctx);
+    await refreshAndUpdatePolling(ctx);
   });
 
   pi.on("after_provider_response", (event, ctx) => {
     if (ctx.mode !== "tui" || !credentialAvailable) return;
-    const usage = parseCodexRateLimitHeaders(event.headers);
+    let usage: WeeklyQuotaUsage | undefined;
+    try {
+      usage = parseCodexRateLimitHeaders(event.headers);
+    } catch (error) {
+      if (error instanceof CodexUsageFormatError) {
+        clearObservedUsage();
+        publish(ctx, { kind: "unavailable" });
+        return;
+      }
+      throw error;
+    }
     if (usage === undefined) {
       if (
         ctx.model?.provider === "openai-codex" &&
@@ -212,6 +266,7 @@ export function registerUsage(
       return;
     }
 
+    clearStaleExpiration();
     lastObservedUsage = { usage, capturedAt: dependencies.now() };
     publish(ctx, {
       kind: "available",
@@ -228,14 +283,12 @@ export function registerUsage(
     ) {
       return;
     }
-    await refresh(ctx);
-    updatePolling(ctx);
+    await refreshAndUpdatePolling(ctx);
   });
 
   pi.on("model_select", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
-    await refresh(ctx);
-    updatePolling(ctx);
+    await refreshAndUpdatePolling(ctx, true);
   });
 
   pi.on("session_shutdown", () => {
@@ -244,6 +297,6 @@ export function registerUsage(
     stopPolling?.();
     stopPolling = undefined;
     currentAccountId = undefined;
-    lastObservedUsage = undefined;
+    clearObservedUsage();
   });
 }

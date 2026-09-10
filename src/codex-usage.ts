@@ -42,18 +42,33 @@ export function parseCodexRateLimitHeaders(
 ): WeeklyQuotaUsage | undefined {
   for (const position of ["primary", "secondary"] as const) {
     const prefix = `x-codex-${position}`;
-    const durationMinutes = numberHeader(headers[`${prefix}-window-minutes`]);
+    const rawDuration = headers[`${prefix}-window-minutes`];
+    const rawUsedPercent = headers[`${prefix}-used-percent`];
+    const rawResetsAt = headers[`${prefix}-reset-at`];
+    if (
+      rawDuration === undefined &&
+      rawUsedPercent === undefined &&
+      rawResetsAt === undefined
+    ) {
+      continue;
+    }
+
+    const durationMinutes = numberHeader(rawDuration);
+    if (durationMinutes === undefined) {
+      throw new CodexUsageFormatError("Codex rate-limit headers are malformed");
+    }
     if (durationMinutes !== 10_080) continue;
 
-    const usedPercent = numberHeader(headers[`${prefix}-used-percent`]);
-    const resetsAtSeconds = numberHeader(headers[`${prefix}-reset-at`]);
+    const usedPercent = numberHeader(rawUsedPercent);
+    const resetsAtSeconds = numberHeader(rawResetsAt);
     if (
-      usedPercent !== undefined &&
-      resetsAtSeconds !== undefined &&
-      resetsAtSeconds > 0
+      usedPercent === undefined ||
+      resetsAtSeconds === undefined ||
+      resetsAtSeconds <= 0
     ) {
-      return { usedPercent, resetsAtMs: resetsAtSeconds * 1_000 };
+      throw new CodexUsageFormatError("Codex rate-limit headers are malformed");
     }
+    return { usedPercent, resetsAtMs: resetsAtSeconds * 1_000 };
   }
   return undefined;
 }

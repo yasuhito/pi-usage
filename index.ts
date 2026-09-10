@@ -7,6 +7,11 @@ export default function piUsage(pi: ExtensionAPI): void {
   registerUsage(pi, {
     now: Date.now,
     random: Math.random,
+    schedule: (callback, delay) => {
+      const timer = setTimeout(callback, delay);
+      timer.unref();
+      return () => clearTimeout(timer);
+    },
     readUsage: (credential, signal) =>
       readCodexWeeklyUsage(credential, fetch, signal),
     startPolling: (refresh) => {

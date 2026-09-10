@@ -33,6 +33,8 @@ function registerFixture() {
   let authReads = 0;
   let pollingStarted = 0;
   let pollingStopped = 0;
+  let scheduledExpiration: (() => void) | undefined;
+  let scheduledExpirationDelay: number | undefined;
   let readsFail = false;
   let readError: Error | undefined;
   let readGate: Promise<void> | undefined;
@@ -41,6 +43,13 @@ function registerFixture() {
   registerUsage(pi, {
     now: () => now,
     random: () => 0.5,
+    schedule: (callback, delay) => {
+      scheduledExpiration = callback;
+      scheduledExpirationDelay = delay;
+      return () => {
+        scheduledExpiration = undefined;
+      };
+    },
     readUsage: async (credential, signal) => {
       observedCredentials.push(credential);
       observedSignals.push(signal);
@@ -96,6 +105,8 @@ function registerFixture() {
     observedSignals,
     pollingStarted: () => pollingStarted,
     pollingStopped: () => pollingStopped,
+    runScheduledExpiration: () => scheduledExpiration?.(),
+    scheduledExpirationDelay: () => scheduledExpirationDelay,
     setAccountId: (value: string) => {
       accountId = value;
     },
@@ -277,11 +288,12 @@ test("Retry-After suppresses refreshes until the provider permits them", async (
   const fixture = registerFixture();
   await emit(fixture, "session_start");
   fixture.setReadError(new CodexUsageRequestError(429, "120"));
+  fixture.setNow(1_031_000);
 
   await emit(fixture, "agent_settled");
-  await emit(fixture, "model_select");
-  fixture.setNow(1_120_001);
-  await emit(fixture, "model_select");
+  await emit(fixture, "agent_settled");
+  fixture.setNow(1_151_001);
+  await emit(fixture, "agent_settled");
 
   assert.equal(fixture.observedCredentials.length, 3);
 });
@@ -293,7 +305,7 @@ test("stale usage expires even while Retry-After suppresses requests", async () 
   await emit(fixture, "model_select");
   fixture.setNow(2_000_001);
 
-  await emit(fixture, "model_select");
+  await emit(fixture, "agent_settled");
 
   assert.deepEqual(fixture.statuses.at(-1), {
     key: "pi-usage",
@@ -301,15 +313,31 @@ test("stale usage expires even while Retry-After suppresses requests", async () 
   });
 });
 
+test("model selection bypasses old-account backoff to resolve current auth", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setReadError(new CodexUsageRequestError(429, "120"));
+  await emit(fixture, "model_select");
+  fixture.setAccountId("account-2");
+
+  await emit(fixture, "model_select");
+
+  assert.deepEqual(fixture.observedCredentials.at(-1), {
+    accessToken: "secret",
+    accountId: "account-2",
+  });
+});
+
 test("temporary failures apply exponential backoff before another refresh", async () => {
   const fixture = registerFixture();
   await emit(fixture, "session_start");
   fixture.setReadsFail(true);
+  fixture.setNow(1_031_000);
 
+  await emit(fixture, "model_select");
   await emit(fixture, "agent_settled");
-  await emit(fixture, "model_select");
-  fixture.setNow(1_001_001);
-  await emit(fixture, "model_select");
+  fixture.setNow(1_032_001);
+  await emit(fixture, "agent_settled");
 
   assert.equal(fixture.observedCredentials.length, 3);
 });
@@ -328,6 +356,53 @@ test("authentication failures resolve Pi auth again and retry once", async () =>
     },
     { authReads: 3, usageReads: 3 },
   );
+});
+
+test("a stale observation schedules removal at its earliest deadline", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setReadsFail(true);
+
+  await emit(fixture, "model_select");
+
+  assert.equal(fixture.scheduledExpirationDelay(), 600_000);
+  fixture.setNow(1_600_000);
+  fixture.runScheduledExpiration();
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk unavailable",
+  });
+});
+
+test("malformed recognized Codex headers make usage unavailable", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+
+  await emit(fixture, "after_provider_response", {
+    headers: {
+      "x-codex-secondary-used-percent": " ",
+      "x-codex-secondary-window-minutes": "10080",
+      "x-codex-secondary-reset-at": "4000",
+    },
+  });
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk unavailable",
+  });
+});
+
+test("permanent request failures do not present old usage as stale", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setReadError(new CodexUsageRequestError(400, undefined));
+
+  await emit(fixture, "model_select");
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk unavailable",
+  });
 });
 
 test("an account change discards the previous account usage before refreshing", async () => {

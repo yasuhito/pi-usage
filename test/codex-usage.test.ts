@@ -158,13 +158,14 @@ test("reads a weekly window found in secondary-position Codex headers", () => {
 });
 
 test("rejects blank required Codex response-header values", () => {
-  assert.equal(
-    parseCodexRateLimitHeaders({
-      "x-codex-primary-used-percent": " ",
-      "x-codex-primary-window-minutes": "10080",
-      "x-codex-primary-reset-at": " ",
-    }),
-    undefined,
+  assert.throws(
+    () =>
+      parseCodexRateLimitHeaders({
+        "x-codex-primary-used-percent": " ",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-at": " ",
+      }),
+    /Codex rate-limit headers are malformed/,
   );
 });
 
