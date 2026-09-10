@@ -212,6 +212,7 @@ export function registerWeeklyQuotaUsage(
       nextAttemptAt = 0;
       consecutiveFailures = 0;
       clearStaleExpiration();
+      observedRateLimitHeaders = {};
       lastObservedUsage = { usage, capturedAt: dependencies.now() };
       publish(ctx, {
         kind: "available",
@@ -307,7 +308,14 @@ export function registerWeeklyQuotaUsage(
   });
 
   pi.on("after_provider_response", (event, ctx) => {
-    if (ctx.mode !== "tui" || !credentialAvailable) return;
+    if (
+      ctx.mode !== "tui" ||
+      !credentialAvailable ||
+      ctx.model?.provider !== "openai-codex"
+    ) {
+      return;
+    }
+    let contributedRateLimitField = false;
     for (const [name, value] of Object.entries(event.headers)) {
       const normalizedName = name.toLowerCase();
       if (
@@ -315,8 +323,19 @@ export function registerWeeklyQuotaUsage(
         typeof value === "string"
       ) {
         observedRateLimitHeaders[normalizedName] = value;
+        contributedRateLimitField = true;
       }
     }
+    if (!contributedRateLimitField) {
+      if (
+        lastObservedUsage === undefined ||
+        dependencies.now() - lastObservedUsage.capturedAt >= REFRESH_DEBOUNCE_MS
+      ) {
+        void refresh(ctx);
+      }
+      return;
+    }
+
     let usage: WeeklyQuotaUsage | undefined;
     try {
       usage = parseCodexRateLimitHeaders(
@@ -325,24 +344,16 @@ export function registerWeeklyQuotaUsage(
       );
     } catch (error) {
       if (error instanceof CodexUsageFormatError) {
+        observedRateLimitHeaders = {};
         clearObservedUsage();
         publish(ctx, { kind: "unavailable" });
         return;
       }
       throw error;
     }
-    if (usage === undefined) {
-      if (
-        ctx.model?.provider === "openai-codex" &&
-        (lastObservedUsage === undefined ||
-          dependencies.now() - lastObservedUsage.capturedAt >=
-            REFRESH_DEBOUNCE_MS)
-      ) {
-        void refresh(ctx);
-      }
-      return;
-    }
+    if (usage === undefined) return;
 
+    observedRateLimitHeaders = {};
     clearStaleExpiration();
     lastObservedUsage = { usage, capturedAt: dependencies.now() };
     publish(ctx, {

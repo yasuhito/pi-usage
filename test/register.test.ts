@@ -49,6 +49,7 @@ function registerFixture() {
   let readError: Error | undefined;
   let readGate: Promise<void> | undefined;
   let now = 1_000_000;
+  let modelProvider = "openai-codex";
 
   registerWeeklyQuotaUsage(pi, {
     now: () => now,
@@ -87,7 +88,9 @@ function registerFixture() {
   const colors: string[] = [];
   const ctx = {
     mode: "tui",
-    model: { provider: "openai-codex" },
+    get model() {
+      return { provider: modelProvider };
+    },
     modelRegistry: {
       getProviderAuth: async () => {
         authReads += 1;
@@ -131,6 +134,9 @@ function registerFixture() {
     },
     setAuthEnabled: (value: boolean) => {
       authEnabled = value;
+    },
+    setModelProvider: (value: string) => {
+      modelProvider = value;
     },
     setNow: (value: number) => {
       now = value;
@@ -263,6 +269,42 @@ test("Codex response headers opportunistically replace the displayed usage", asy
     text: "Codex wk ━━━━━━━━── 82%",
   });
   assert.equal(fixture.colors.at(-1), "warning");
+});
+
+test("an empty later response cannot replay accumulated headers as fresh", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  await emit(fixture, "after_provider_response", {
+    headers: {
+      "x-codex-secondary-used-percent": "82",
+      "x-codex-secondary-window-minutes": "10080",
+      "x-codex-secondary-reset-at": "4000",
+    },
+  });
+  const statusCount = fixture.statuses.length;
+
+  await emit(fixture, "after_provider_response", { headers: {} });
+
+  assert.equal(fixture.statuses.length, statusCount);
+});
+
+test("response headers from another active provider cannot replace Codex usage", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setModelProvider("anthropic");
+
+  await emit(fixture, "after_provider_response", {
+    headers: {
+      "x-codex-secondary-used-percent": "99",
+      "x-codex-secondary-window-minutes": "10080",
+      "x-codex-secondary-reset-at": "4000",
+    },
+  });
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk ━━━━━━──── 63%",
+  });
 });
 
 test("a Codex response without usage headers refreshes an old observation", async () => {
