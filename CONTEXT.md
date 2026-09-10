@@ -15,3 +15,7 @@ _Avoid_: Secondary window
 **Stale usage**:
 The last successfully observed weekly quota usage when a newer observation temporarily cannot be obtained. It remains presentable for at most ten minutes and never beyond its reported reset time.
 _Avoid_: Cached usage, current usage
+
+**Weekly quota usage lifecycle**:
+The progression of weekly quota usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end.
+_Avoid_: Usage cache lifecycle
