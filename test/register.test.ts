@@ -12,6 +12,15 @@ import {
 } from "../src/codex-usage.ts";
 import { registerWeeklyQuotaUsage } from "../src/register.ts";
 
+function accessTokenFor(accountId: string): string {
+  const payload = Buffer.from(
+    JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+    }),
+  ).toString("base64url");
+  return `header.${payload}.signature`;
+}
+
 type ExtensionHandler = (
   event: unknown,
   ctx: ExtensionContext,
@@ -81,8 +90,7 @@ function registerFixture() {
         if (!authEnabled) return undefined;
         return {
           auth: {
-            apiKey: "secret",
-            headers: { "chatgpt-account-id": accountId },
+            apiKey: accessTokenFor(accountId),
           },
           source: "OAuth",
         };
@@ -153,7 +161,7 @@ test("session start shows loading then the active Codex account weekly usage", a
     { key: "pi-usage", text: "Codex wk ━━━━━━──── 63%" },
   ]);
   assert.deepEqual(fixture.observedCredentials, [
-    { accessToken: "secret", accountId: "account-1" },
+    { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
   ]);
   assert.equal(fixture.colors.at(-1), "dim");
 });
@@ -300,6 +308,25 @@ test("session shutdown aborts an in-flight usage request", async () => {
   await starting;
 });
 
+test("a forced refresh queued behind a request cannot start after shutdown", async () => {
+  const fixture = registerFixture();
+  let release: (() => void) | undefined;
+  fixture.setReadGate(
+    new Promise<void>((resolve) => {
+      release = resolve;
+    }),
+  );
+
+  const starting = emit(fixture, "session_start");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const queued = emit(fixture, "model_select");
+  await emit(fixture, "session_shutdown");
+  release?.();
+  await Promise.all([starting, queued]);
+
+  assert.equal(fixture.observedCredentials.length, 1);
+});
+
 test("Retry-After suppresses refreshes until the provider permits them", async () => {
   const fixture = registerFixture();
   await emit(fixture, "session_start");
@@ -339,7 +366,7 @@ test("model selection bypasses old-account backoff to resolve current auth", asy
   await emit(fixture, "model_select");
 
   assert.deepEqual(fixture.observedCredentials.at(-1), {
-    accessToken: "secret",
+    accessToken: accessTokenFor("account-2"),
     accountId: "account-2",
   });
 });

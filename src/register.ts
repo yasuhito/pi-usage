@@ -29,6 +29,29 @@ export interface WeeklyQuotaUsageDependencies {
   readonly startPolling: (refresh: () => void) => () => void;
 }
 
+function accountIdFromAccessToken(accessToken: string): string | undefined {
+  const payload = accessToken.split(".")[1];
+  if (payload === undefined) return undefined;
+  try {
+    const claims: unknown = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8"),
+    );
+    const openAiAuth =
+      typeof claims === "object" && claims !== null
+        ? Reflect.get(claims, "https://api.openai.com/auth")
+        : undefined;
+    const accountId =
+      typeof openAiAuth === "object" && openAiAuth !== null
+        ? Reflect.get(openAiAuth, "chatgpt_account_id")
+        : undefined;
+    return typeof accountId === "string" && accountId.trim() !== ""
+      ? accountId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function credentialFromContext(
   auth: Awaited<
     ReturnType<ExtensionContext["modelRegistry"]["getProviderAuth"]>
@@ -41,16 +64,15 @@ function credentialFromContext(
         ([name]) => name.toLowerCase() === "chatgpt-account-id",
       )
     : undefined;
-  const accountId = accountIdEntry?.[1];
-
-  if (
-    typeof accessToken !== "string" ||
-    accessToken.trim() === "" ||
-    typeof accountId !== "string" ||
-    accountId.trim() === ""
-  ) {
+  if (typeof accessToken !== "string" || accessToken.trim() === "") {
     return undefined;
   }
+  const headerAccountId = accountIdEntry?.[1];
+  const accountId =
+    typeof headerAccountId === "string" && headerAccountId.trim() !== ""
+      ? headerAccountId
+      : accountIdFromAccessToken(accessToken);
+  if (accountId === undefined) return undefined;
   return { accessToken, accountId };
 }
 
@@ -214,6 +236,7 @@ export function registerWeeklyQuotaUsage(
     ctx: ExtensionContext,
     ignoreBackoff = false,
   ): Promise<void> => {
+    if (shuttingDown) return Promise.resolve();
     if (inFlight !== undefined) {
       if (!ignoreBackoff) return inFlight;
       activeController?.abort();
