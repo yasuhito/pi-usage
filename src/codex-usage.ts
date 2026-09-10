@@ -26,9 +26,12 @@ export interface CodexCredential {
   readonly accountId: string;
 }
 
+export type RateLimitWindowPosition = "primary" | "secondary";
+
 export interface WeeklyQuotaUsage {
   readonly usedPercent: number;
   readonly resetsAtMs: number;
+  readonly windowPosition: RateLimitWindowPosition;
 }
 
 function numberHeader(value: string | undefined): number | undefined {
@@ -37,8 +40,32 @@ function numberHeader(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function createWeeklyQuotaUsage(
+  position: RateLimitWindowPosition,
+  durationSeconds: unknown,
+  usedPercent: unknown,
+  resetsAtSeconds: unknown,
+): WeeklyQuotaUsage | undefined {
+  if (durationSeconds !== WEEK_SECONDS) return undefined;
+  if (
+    typeof usedPercent !== "number" ||
+    !Number.isFinite(usedPercent) ||
+    typeof resetsAtSeconds !== "number" ||
+    !Number.isFinite(resetsAtSeconds) ||
+    resetsAtSeconds <= 0
+  ) {
+    throw new CodexUsageFormatError("Codex weekly quota values are malformed");
+  }
+  return {
+    usedPercent,
+    resetsAtMs: resetsAtSeconds * 1_000,
+    windowPosition: position,
+  };
+}
+
 export function parseCodexRateLimitHeaders(
   headers: Readonly<Record<string, string>>,
+  previous?: WeeklyQuotaUsage,
 ): WeeklyQuotaUsage | undefined {
   for (const position of ["primary", "secondary"] as const) {
     const prefix = `x-codex-${position}`;
@@ -53,22 +80,46 @@ export function parseCodexRateLimitHeaders(
       continue;
     }
 
-    const durationMinutes = numberHeader(rawDuration);
-    if (durationMinutes === undefined) {
-      throw new CodexUsageFormatError("Codex rate-limit headers are malformed");
-    }
-    if (durationMinutes !== 10_080) continue;
-
-    const usedPercent = numberHeader(rawUsedPercent);
-    const resetsAtSeconds = numberHeader(rawResetsAt);
+    const priorWindow =
+      previous?.windowPosition === position ? previous : undefined;
+    const durationMinutes =
+      rawDuration === undefined
+        ? priorWindow === undefined
+          ? undefined
+          : 10_080
+        : numberHeader(rawDuration);
+    const usedPercent =
+      rawUsedPercent === undefined
+        ? priorWindow?.usedPercent
+        : numberHeader(rawUsedPercent);
+    const resetsAtSeconds =
+      rawResetsAt === undefined
+        ? priorWindow === undefined
+          ? undefined
+          : priorWindow.resetsAtMs / 1_000
+        : numberHeader(rawResetsAt);
     if (
-      usedPercent === undefined ||
-      resetsAtSeconds === undefined ||
-      resetsAtSeconds <= 0
+      (rawDuration !== undefined && durationMinutes === undefined) ||
+      (rawUsedPercent !== undefined && usedPercent === undefined) ||
+      (rawResetsAt !== undefined && resetsAtSeconds === undefined)
     ) {
       throw new CodexUsageFormatError("Codex rate-limit headers are malformed");
     }
-    return { usedPercent, resetsAtMs: resetsAtSeconds * 1_000 };
+    if (
+      durationMinutes === undefined ||
+      usedPercent === undefined ||
+      resetsAtSeconds === undefined
+    ) {
+      continue;
+    }
+
+    const usage = createWeeklyQuotaUsage(
+      position,
+      durationMinutes * 60,
+      usedPercent,
+      resetsAtSeconds,
+    );
+    if (usage !== undefined) return usage;
   }
   return undefined;
 }
@@ -117,23 +168,19 @@ function weeklyUsageFromBody(body: unknown): WeeklyQuotaUsage {
     if (typeof window !== "object" || window === null) continue;
     if (Reflect.get(window, "limit_window_seconds") !== WEEK_SECONDS) continue;
 
-    const usedPercent = Reflect.get(window, "used_percent");
-    const resetsAtSeconds = Reflect.get(window, "reset_at");
-    if (
-      typeof usedPercent === "number" &&
-      Number.isFinite(usedPercent) &&
-      typeof resetsAtSeconds === "number" &&
-      Number.isFinite(resetsAtSeconds) &&
-      resetsAtSeconds > 0
-    ) {
-      return { usedPercent, resetsAtMs: resetsAtSeconds * 1_000 };
-    }
+    const usage = createWeeklyQuotaUsage(
+      name === "primary_window" ? "primary" : "secondary",
+      Reflect.get(window, "limit_window_seconds"),
+      Reflect.get(window, "used_percent"),
+      Reflect.get(window, "reset_at"),
+    );
+    if (usage !== undefined) return usage;
   }
 
   throw new CodexUsageFormatError("Codex weekly quota is unavailable");
 }
 
-export async function readCodexWeeklyUsage(
+export async function readCodexWeeklyQuotaUsage(
   credential: CodexCredential,
   transport: typeof fetch = fetch,
   signal?: AbortSignal,

@@ -13,12 +13,16 @@ import {
 import { presentQuotaStatus, type QuotaStatus } from "./presentation.ts";
 
 const STATUS_KEY = "pi-usage";
+const STALE_AFTER_MS = 10 * 60 * 1_000;
+const REFRESH_DEBOUNCE_MS = 30_000;
+const INITIAL_BACKOFF_MS = 1_000;
+const MAX_BACKOFF_MS = 60_000;
 
-export interface UsageDependencies {
+export interface WeeklyQuotaUsageDependencies {
   readonly now: () => number;
   readonly random: () => number;
   readonly schedule: (callback: () => void, delay: number) => () => void;
-  readonly readUsage: (
+  readonly readWeeklyQuotaUsage: (
     credential: CodexCredential,
     signal?: AbortSignal,
   ) => Promise<WeeklyQuotaUsage>;
@@ -39,15 +43,20 @@ function credentialFromContext(
     : undefined;
   const accountId = accountIdEntry?.[1];
 
-  if (typeof accessToken !== "string" || typeof accountId !== "string") {
+  if (
+    typeof accessToken !== "string" ||
+    accessToken.trim() === "" ||
+    typeof accountId !== "string" ||
+    accountId.trim() === ""
+  ) {
     return undefined;
   }
   return { accessToken, accountId };
 }
 
-export function registerUsage(
+export function registerWeeklyQuotaUsage(
   pi: ExtensionAPI,
-  dependencies: UsageDependencies,
+  dependencies: WeeklyQuotaUsageDependencies,
 ): void {
   let stopPolling: (() => void) | undefined;
   let cancelStaleExpiration: (() => void) | undefined;
@@ -86,7 +95,7 @@ export function registerUsage(
     const now = dependencies.now();
     if (
       lastObservedUsage === undefined ||
-      now - lastObservedUsage.capturedAt >= 10 * 60 * 1_000 ||
+      now - lastObservedUsage.capturedAt >= STALE_AFTER_MS ||
       now >= lastObservedUsage.usage.resetsAtMs
     ) {
       clearStaleExpiration();
@@ -99,7 +108,7 @@ export function registerUsage(
       stale: true,
     });
     const deadline = Math.min(
-      lastObservedUsage.capturedAt + 10 * 60 * 1_000,
+      lastObservedUsage.capturedAt + STALE_AFTER_MS,
       lastObservedUsage.usage.resetsAtMs,
     );
     clearStaleExpiration();
@@ -116,12 +125,19 @@ export function registerUsage(
   ): Promise<void> => {
     try {
       const auth = await ctx.modelRegistry.getProviderAuth("openai-codex");
-      const credential = credentialFromContext(auth);
-      if (credential === undefined) {
+      if (auth === undefined) {
         credentialAvailable = false;
         currentAccountId = undefined;
         clearObservedUsage();
         ctx.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+      const credential = credentialFromContext(auth);
+      if (credential === undefined) {
+        credentialAvailable = true;
+        currentAccountId = undefined;
+        clearObservedUsage();
+        publish(ctx, { kind: "unavailable" });
         return;
       }
 
@@ -129,7 +145,7 @@ export function registerUsage(
       selectAccount(credential.accountId);
       let usage: WeeklyQuotaUsage;
       try {
-        usage = await dependencies.readUsage(credential, signal);
+        usage = await dependencies.readWeeklyQuotaUsage(credential, signal);
       } catch (error) {
         if (
           !(error instanceof CodexUsageRequestError) ||
@@ -142,7 +158,10 @@ export function registerUsage(
         const refreshedCredential = credentialFromContext(refreshedAuth);
         if (refreshedCredential === undefined) throw error;
         selectAccount(refreshedCredential.accountId);
-        usage = await dependencies.readUsage(refreshedCredential, signal);
+        usage = await dependencies.readWeeklyQuotaUsage(
+          refreshedCredential,
+          signal,
+        );
       }
       if (shuttingDown) return;
       nextAttemptAt = 0;
@@ -182,8 +201,8 @@ export function registerUsage(
       }
       if (nextAttemptAt <= now) {
         const baseDelay = Math.min(
-          60_000,
-          1_000 * 2 ** (consecutiveFailures - 1),
+          MAX_BACKOFF_MS,
+          INITIAL_BACKOFF_MS * 2 ** (consecutiveFailures - 1),
         );
         const jitter = 0.5 + dependencies.random();
         nextAttemptAt = now + baseDelay * jitter;
@@ -246,7 +265,10 @@ export function registerUsage(
     if (ctx.mode !== "tui" || !credentialAvailable) return;
     let usage: WeeklyQuotaUsage | undefined;
     try {
-      usage = parseCodexRateLimitHeaders(event.headers);
+      usage = parseCodexRateLimitHeaders(
+        event.headers,
+        lastObservedUsage?.usage,
+      );
     } catch (error) {
       if (error instanceof CodexUsageFormatError) {
         clearObservedUsage();
@@ -259,7 +281,8 @@ export function registerUsage(
       if (
         ctx.model?.provider === "openai-codex" &&
         (lastObservedUsage === undefined ||
-          dependencies.now() - lastObservedUsage.capturedAt >= 30_000)
+          dependencies.now() - lastObservedUsage.capturedAt >=
+            REFRESH_DEBOUNCE_MS)
       ) {
         void refresh(ctx);
       }
@@ -279,7 +302,7 @@ export function registerUsage(
     if (ctx.mode !== "tui") return;
     if (
       lastObservedUsage !== undefined &&
-      dependencies.now() - lastObservedUsage.capturedAt < 30_000
+      dependencies.now() - lastObservedUsage.capturedAt < REFRESH_DEBOUNCE_MS
     ) {
       return;
     }

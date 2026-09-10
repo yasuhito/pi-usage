@@ -10,7 +10,7 @@ import {
   type CodexCredential,
   CodexUsageRequestError,
 } from "../src/codex-usage.ts";
-import { registerUsage } from "../src/register.ts";
+import { registerWeeklyQuotaUsage } from "../src/register.ts";
 
 type ExtensionHandler = (
   event: unknown,
@@ -40,7 +40,7 @@ function registerFixture() {
   let readGate: Promise<void> | undefined;
   let now = 1_000_000;
 
-  registerUsage(pi, {
+  registerWeeklyQuotaUsage(pi, {
     now: () => now,
     random: () => 0.5,
     schedule: (callback, delay) => {
@@ -50,13 +50,17 @@ function registerFixture() {
         scheduledExpiration = undefined;
       };
     },
-    readUsage: async (credential, signal) => {
+    readWeeklyQuotaUsage: async (credential, signal) => {
       observedCredentials.push(credential);
       observedSignals.push(signal);
       await readGate;
       if (readError !== undefined) throw readError;
       if (readsFail) throw new Error("network unavailable");
-      return { usedPercent: 63.4, resetsAtMs: 2_000_000 };
+      return {
+        usedPercent: 63.4,
+        resetsAtMs: 2_000_000,
+        windowPosition: "secondary",
+      };
     },
     startPolling: () => {
       pollingStarted += 1;
@@ -165,6 +169,18 @@ test("missing Codex OAuth clears the status without starting polling", async () 
     { key: "pi-usage", text: undefined },
   ]);
   assert.equal(fixture.pollingStarted(), 0);
+});
+
+test("malformed configured Codex OAuth is displayed as unavailable", async () => {
+  const fixture = registerFixture();
+  fixture.setAccountId("");
+
+  await emit(fixture, "session_start");
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk unavailable",
+  });
 });
 
 test("polling starts with the session and stops on shutdown", async () => {

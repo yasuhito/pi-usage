@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   CodexUsageRequestError,
   parseCodexRateLimitHeaders,
-  readCodexWeeklyUsage,
+  readCodexWeeklyQuotaUsage,
 } from "../src/codex-usage.ts";
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
@@ -30,11 +30,15 @@ test("reads the seven-day window from the base Codex rate limit", async () => {
     );
 
   assert.deepEqual(
-    await readCodexWeeklyUsage(
+    await readCodexWeeklyQuotaUsage(
       { accessToken: "secret", accountId: "account-1" },
       fetchStub,
     ),
-    { usedPercent: 63.4, resetsAtMs: 3_000_000 },
+    {
+      usedPercent: 63.4,
+      resetsAtMs: 3_000_000,
+      windowPosition: "secondary",
+    },
   );
 });
 
@@ -54,7 +58,7 @@ test("rejects an unsuccessful usage response even when its body looks valid", as
     );
 
   await assert.rejects(
-    readCodexWeeklyUsage(
+    readCodexWeeklyQuotaUsage(
       { accessToken: "secret", accountId: "account-1" },
       fetchStub,
     ),
@@ -70,7 +74,7 @@ test("rejects a usage response larger than one MiB before parsing it", async () 
     });
 
   await assert.rejects(
-    readCodexWeeklyUsage(
+    readCodexWeeklyQuotaUsage(
       { accessToken: "secret", accountId: "account-1" },
       fetchStub,
     ),
@@ -91,7 +95,7 @@ test("cancels a streaming response as soon as it exceeds one MiB", async () => {
   const fetchStub: typeof fetch = async () => new Response(body);
 
   await assert.rejects(
-    readCodexWeeklyUsage(
+    readCodexWeeklyQuotaUsage(
       { accessToken: "secret", accountId: "account-1" },
       fetchStub,
     ),
@@ -120,7 +124,7 @@ test("sends credentials only to the fixed endpoint without following redirects",
     );
   };
 
-  await readCodexWeeklyUsage(
+  await readCodexWeeklyQuotaUsage(
     { accessToken: "secret", accountId: "account-1" },
     fetchStub,
   );
@@ -153,7 +157,29 @@ test("reads a weekly window found in secondary-position Codex headers", () => {
       "x-codex-secondary-window-minutes": "10080",
       "x-codex-secondary-reset-at": "4000",
     }),
-    { usedPercent: 72.5, resetsAtMs: 4_000_000 },
+    {
+      usedPercent: 72.5,
+      resetsAtMs: 4_000_000,
+      windowPosition: "secondary",
+    },
+  );
+});
+
+test("sparse Codex headers merge into the last weekly quota observation", () => {
+  assert.deepEqual(
+    parseCodexRateLimitHeaders(
+      { "x-codex-secondary-used-percent": "74" },
+      {
+        usedPercent: 63,
+        resetsAtMs: 4_000_000,
+        windowPosition: "secondary",
+      },
+    ),
+    {
+      usedPercent: 74,
+      resetsAtMs: 4_000_000,
+      windowPosition: "secondary",
+    },
   );
 });
 
@@ -188,7 +214,7 @@ test("combines caller cancellation with the five-second request timeout", async 
     );
   };
 
-  await readCodexWeeklyUsage(
+  await readCodexWeeklyQuotaUsage(
     { accessToken: "secret", accountId: "account-1" },
     fetchStub,
     controller.signal,
@@ -205,7 +231,7 @@ test("a rate-limited response exposes Retry-After without reading its body", asy
     });
 
   await assert.rejects(
-    readCodexWeeklyUsage(
+    readCodexWeeklyQuotaUsage(
       { accessToken: "secret", accountId: "account-1" },
       fetchStub,
     ),
