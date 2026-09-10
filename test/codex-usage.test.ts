@@ -34,7 +34,7 @@ test("reads the seven-day window from the base Codex rate limit", async () => {
       { accessToken: "secret", accountId: "account-1" },
       fetchStub,
     ),
-    { usedPercent: 63.4, resetsAt: 3_000 },
+    { usedPercent: 63.4, resetsAtMs: 3_000_000 },
   );
 });
 
@@ -76,6 +76,28 @@ test("rejects a usage response larger than one MiB before parsing it", async () 
     ),
     /Codex usage response is too large/,
   );
+});
+
+test("cancels a streaming response as soon as it exceeds one MiB", async () => {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const fetchStub: typeof fetch = async () => new Response(body);
+
+  await assert.rejects(
+    readCodexWeeklyUsage(
+      { accessToken: "secret", accountId: "account-1" },
+      fetchStub,
+    ),
+    /Codex usage response is too large/,
+  );
+  assert.equal(cancelled, true);
 });
 
 test("sends credentials only to the fixed endpoint without following redirects", async () => {
@@ -124,14 +146,25 @@ test("sends credentials only to the fixed endpoint without following redirects",
   );
 });
 
-test("reads a seven-day secondary window from Codex response headers", () => {
+test("reads a weekly window found in secondary-position Codex headers", () => {
   assert.deepEqual(
     parseCodexRateLimitHeaders({
       "x-codex-secondary-used-percent": "72.5",
       "x-codex-secondary-window-minutes": "10080",
       "x-codex-secondary-reset-at": "4000",
     }),
-    { usedPercent: 72.5, resetsAt: 4_000 },
+    { usedPercent: 72.5, resetsAtMs: 4_000_000 },
+  );
+});
+
+test("rejects blank required Codex response-header values", () => {
+  assert.equal(
+    parseCodexRateLimitHeaders({
+      "x-codex-primary-used-percent": " ",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-primary-reset-at": " ",
+    }),
+    undefined,
   );
 });
 

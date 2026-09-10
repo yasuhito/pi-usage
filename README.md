@@ -35,7 +35,7 @@ Sign in to Pi's `openai-codex` provider with `/login`. The meter is shown whenev
 | State | Status |
 | --- | --- |
 | Loading | `Codex wk loading…` |
-| Current | `Codex wk ━━━━━━──── 63%` |
+| Available | `Codex wk ━━━━━━──── 63%` |
 | Temporarily stale | `Codex wk ━━━━━━──── 63% ~` |
 | Unavailable | `Codex wk unavailable` |
 | Codex OAuth not configured | Hidden |

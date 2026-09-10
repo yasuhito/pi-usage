@@ -47,7 +47,7 @@ function registerFixture() {
       await readGate;
       if (readError !== undefined) throw readError;
       if (readsFail) throw new Error("network unavailable");
-      return { usedPercent: 63.4, resetsAt: 2_000_000 };
+      return { usedPercent: 63.4, resetsAtMs: 2_000_000 };
     },
     startPolling: () => {
       pollingStarted += 1;
@@ -61,6 +61,7 @@ function registerFixture() {
   const colors: string[] = [];
   const ctx = {
     mode: "tui",
+    model: { provider: "openai-codex" },
     modelRegistry: {
       getProviderAuth: async () => {
         authReads += 1;
@@ -176,7 +177,7 @@ test("agent settlement is debounced while the usage observation is fresh", async
   assert.equal(fixture.observedCredentials.length, 1);
 });
 
-test("a failed refresh immediately marks the last good usage as stale", async () => {
+test("a failed refresh immediately marks the last observed usage as stale", async () => {
   const fixture = registerFixture();
   await emit(fixture, "session_start");
   fixture.setReadsFail(true);
@@ -220,6 +221,17 @@ test("Codex response headers opportunistically replace the displayed usage", asy
     text: "Codex wk ━━━━━━━━── 82%",
   });
   assert.equal(fixture.colors.at(-1), "warning");
+});
+
+test("a Codex response without usage headers refreshes an old observation", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setNow(1_031_000);
+
+  await emit(fixture, "after_provider_response", { headers: {} });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(fixture.observedCredentials.length, 2);
 });
 
 test("overlapping refresh triggers share one in-flight request", async () => {
@@ -272,6 +284,21 @@ test("Retry-After suppresses refreshes until the provider permits them", async (
   await emit(fixture, "model_select");
 
   assert.equal(fixture.observedCredentials.length, 3);
+});
+
+test("stale usage expires even while Retry-After suppresses requests", async () => {
+  const fixture = registerFixture();
+  await emit(fixture, "session_start");
+  fixture.setReadError(new CodexUsageRequestError(429, "1200"));
+  await emit(fixture, "model_select");
+  fixture.setNow(2_000_001);
+
+  await emit(fixture, "model_select");
+
+  assert.deepEqual(fixture.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk unavailable",
+  });
 });
 
 test("temporary failures apply exponential backoff before another refresh", async () => {

@@ -14,6 +14,13 @@ export class CodexUsageRequestError extends Error {
   }
 }
 
+export class CodexUsageFormatError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexUsageFormatError";
+  }
+}
+
 export interface CodexCredential {
   readonly accessToken: string;
   readonly accountId: string;
@@ -21,18 +28,13 @@ export interface CodexCredential {
 
 export interface WeeklyQuotaUsage {
   readonly usedPercent: number;
-  readonly resetsAt: number;
+  readonly resetsAtMs: number;
 }
 
-interface UsageWindow {
-  readonly used_percent?: unknown;
-  readonly limit_window_seconds?: unknown;
-  readonly reset_at?: unknown;
-}
-
-function isWeeklyWindow(value: unknown): value is UsageWindow {
-  if (typeof value !== "object" || value === null) return false;
-  return Reflect.get(value, "limit_window_seconds") === WEEK_SECONDS;
+function numberHeader(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 export function parseCodexRateLimitHeaders(
@@ -40,15 +42,80 @@ export function parseCodexRateLimitHeaders(
 ): WeeklyQuotaUsage | undefined {
   for (const position of ["primary", "secondary"] as const) {
     const prefix = `x-codex-${position}`;
-    if (Number(headers[`${prefix}-window-minutes`]) !== 10_080) continue;
+    const durationMinutes = numberHeader(headers[`${prefix}-window-minutes`]);
+    if (durationMinutes !== 10_080) continue;
 
-    const usedPercent = Number(headers[`${prefix}-used-percent`]);
-    const resetsAt = Number(headers[`${prefix}-reset-at`]);
-    if (Number.isFinite(usedPercent) && Number.isFinite(resetsAt)) {
-      return { usedPercent, resetsAt };
+    const usedPercent = numberHeader(headers[`${prefix}-used-percent`]);
+    const resetsAtSeconds = numberHeader(headers[`${prefix}-reset-at`]);
+    if (
+      usedPercent !== undefined &&
+      resetsAtSeconds !== undefined &&
+      resetsAtSeconds > 0
+    ) {
+      return { usedPercent, resetsAtMs: resetsAtSeconds * 1_000 };
     }
   }
   return undefined;
+}
+
+async function readBoundedBody(response: Response): Promise<string> {
+  const declaredSize = numberHeader(
+    response.headers.get("content-length") ?? undefined,
+  );
+  if (declaredSize !== undefined && declaredSize > MAX_RESPONSE_BYTES) {
+    throw new CodexUsageFormatError("Codex usage response is too large");
+  }
+  if (response.body === null) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let size = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new CodexUsageFormatError("Codex usage response is too large");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function weeklyUsageFromBody(body: unknown): WeeklyQuotaUsage {
+  const rateLimit =
+    typeof body === "object" && body !== null
+      ? Reflect.get(body, "rate_limit")
+      : undefined;
+  if (typeof rateLimit !== "object" || rateLimit === null) {
+    throw new CodexUsageFormatError("Codex weekly quota is unavailable");
+  }
+
+  for (const name of ["primary_window", "secondary_window"] as const) {
+    const window = Reflect.get(rateLimit, name);
+    if (typeof window !== "object" || window === null) continue;
+    if (Reflect.get(window, "limit_window_seconds") !== WEEK_SECONDS) continue;
+
+    const usedPercent = Reflect.get(window, "used_percent");
+    const resetsAtSeconds = Reflect.get(window, "reset_at");
+    if (
+      typeof usedPercent === "number" &&
+      Number.isFinite(usedPercent) &&
+      typeof resetsAtSeconds === "number" &&
+      Number.isFinite(resetsAtSeconds) &&
+      resetsAtSeconds > 0
+    ) {
+      return { usedPercent, resetsAtMs: resetsAtSeconds * 1_000 };
+    }
+  }
+
+  throw new CodexUsageFormatError("Codex weekly quota is unavailable");
 }
 
 export async function readCodexWeeklyUsage(
@@ -75,40 +142,12 @@ export async function readCodexWeeklyUsage(
     );
   }
 
-  const declaredSize = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredSize) && declaredSize > MAX_RESPONSE_BYTES) {
-    throw new Error("Codex usage response is too large");
+  const responseText = await readBoundedBody(response);
+  let body: unknown;
+  try {
+    body = JSON.parse(responseText);
+  } catch {
+    throw new CodexUsageFormatError("Codex usage response is invalid JSON");
   }
-
-  const responseText = await response.text();
-  if (Buffer.byteLength(responseText, "utf8") > MAX_RESPONSE_BYTES) {
-    throw new Error("Codex usage response is too large");
-  }
-  const body: unknown = JSON.parse(responseText);
-  const rateLimit =
-    typeof body === "object" && body !== null
-      ? Reflect.get(body, "rate_limit")
-      : undefined;
-  const primary =
-    typeof rateLimit === "object" && rateLimit !== null
-      ? Reflect.get(rateLimit, "primary_window")
-      : undefined;
-  const secondary =
-    typeof rateLimit === "object" && rateLimit !== null
-      ? Reflect.get(rateLimit, "secondary_window")
-      : undefined;
-  const weekly = [primary, secondary].find(isWeeklyWindow);
-
-  if (
-    weekly === undefined ||
-    typeof weekly.used_percent !== "number" ||
-    typeof weekly.reset_at !== "number"
-  ) {
-    throw new Error("Codex weekly quota is unavailable");
-  }
-
-  return {
-    usedPercent: weekly.used_percent,
-    resetsAt: weekly.reset_at,
-  };
+  return weeklyUsageFromBody(body);
 }

@@ -5,6 +5,7 @@ import type {
 
 import {
   type CodexCredential,
+  CodexUsageFormatError,
   CodexUsageRequestError,
   parseCodexRateLimitHeaders,
   type WeeklyQuotaUsage,
@@ -54,15 +55,38 @@ export function registerUsage(
   let nextAttemptAt = 0;
   let consecutiveFailures = 0;
   let currentAccountId: string | undefined;
-  let lastGood:
+  let lastObservedUsage:
     | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
     | undefined;
+  const selectAccount = (accountId: string): void => {
+    if (currentAccountId === accountId) return;
+    currentAccountId = accountId;
+    lastObservedUsage = undefined;
+    nextAttemptAt = 0;
+    consecutiveFailures = 0;
+  };
   const publish = (ctx: ExtensionContext, status: QuotaStatus): void => {
     const presentation = presentQuotaStatus(status);
     ctx.ui.setStatus(
       STATUS_KEY,
       ctx.ui.theme.fg(presentation.color, presentation.text),
     );
+  };
+  const publishStaleUsage = (ctx: ExtensionContext): void => {
+    const now = dependencies.now();
+    if (
+      lastObservedUsage === undefined ||
+      now - lastObservedUsage.capturedAt > 10 * 60 * 1_000 ||
+      now >= lastObservedUsage.usage.resetsAtMs
+    ) {
+      publish(ctx, { kind: "unavailable" });
+      return;
+    }
+    publish(ctx, {
+      kind: "available",
+      usedPercent: lastObservedUsage.usage.usedPercent,
+      stale: true,
+    });
   };
 
   let inFlight: Promise<void> | undefined;
@@ -76,18 +100,13 @@ export function registerUsage(
       if (credential === undefined) {
         credentialAvailable = false;
         currentAccountId = undefined;
-        lastGood = undefined;
+        lastObservedUsage = undefined;
         ctx.ui.setStatus(STATUS_KEY, undefined);
         return;
       }
 
       credentialAvailable = true;
-      if (currentAccountId !== credential.accountId) {
-        currentAccountId = credential.accountId;
-        lastGood = undefined;
-        nextAttemptAt = 0;
-        consecutiveFailures = 0;
-      }
+      selectAccount(credential.accountId);
       let usage: WeeklyQuotaUsage;
       try {
         usage = await dependencies.readUsage(credential, signal);
@@ -102,16 +121,13 @@ export function registerUsage(
           await ctx.modelRegistry.getProviderAuth("openai-codex");
         const refreshedCredential = credentialFromContext(refreshedAuth);
         if (refreshedCredential === undefined) throw error;
-        if (currentAccountId !== refreshedCredential.accountId) {
-          currentAccountId = refreshedCredential.accountId;
-          lastGood = undefined;
-        }
+        selectAccount(refreshedCredential.accountId);
         usage = await dependencies.readUsage(refreshedCredential, signal);
       }
       if (shuttingDown) return;
       nextAttemptAt = 0;
       consecutiveFailures = 0;
-      lastGood = { usage, capturedAt: dependencies.now() };
+      lastObservedUsage = { usage, capturedAt: dependencies.now() };
       publish(ctx, {
         kind: "available",
         usedPercent: usage.usedPercent,
@@ -136,24 +152,20 @@ export function registerUsage(
         const jitter = 0.5 + dependencies.random();
         nextAttemptAt = now + baseDelay * jitter;
       }
-      if (
-        lastGood === undefined ||
-        now - lastGood.capturedAt > 10 * 60 * 1_000 ||
-        now >= lastGood.usage.resetsAt * 1_000
-      ) {
+      if (error instanceof CodexUsageFormatError) {
+        lastObservedUsage = undefined;
         publish(ctx, { kind: "unavailable" });
         return;
       }
-      publish(ctx, {
-        kind: "available",
-        usedPercent: lastGood.usage.usedPercent,
-        stale: true,
-      });
+      publishStaleUsage(ctx);
     }
   };
   const refresh = (ctx: ExtensionContext): Promise<void> => {
     if (inFlight !== undefined) return inFlight;
-    if (dependencies.now() < nextAttemptAt) return Promise.resolve();
+    if (dependencies.now() < nextAttemptAt) {
+      publishStaleUsage(ctx);
+      return Promise.resolve();
+    }
 
     const controller = new AbortController();
     activeController = controller;
@@ -189,9 +201,18 @@ export function registerUsage(
   pi.on("after_provider_response", (event, ctx) => {
     if (ctx.mode !== "tui" || !credentialAvailable) return;
     const usage = parseCodexRateLimitHeaders(event.headers);
-    if (usage === undefined) return;
+    if (usage === undefined) {
+      if (
+        ctx.model?.provider === "openai-codex" &&
+        (lastObservedUsage === undefined ||
+          dependencies.now() - lastObservedUsage.capturedAt >= 30_000)
+      ) {
+        void refresh(ctx);
+      }
+      return;
+    }
 
-    lastGood = { usage, capturedAt: dependencies.now() };
+    lastObservedUsage = { usage, capturedAt: dependencies.now() };
     publish(ctx, {
       kind: "available",
       usedPercent: usage.usedPercent,
@@ -202,8 +223,8 @@ export function registerUsage(
   pi.on("agent_settled", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     if (
-      lastGood !== undefined &&
-      dependencies.now() - lastGood.capturedAt < 30_000
+      lastObservedUsage !== undefined &&
+      dependencies.now() - lastObservedUsage.capturedAt < 30_000
     ) {
       return;
     }
@@ -223,6 +244,6 @@ export function registerUsage(
     stopPolling?.();
     stopPolling = undefined;
     currentAccountId = undefined;
-    lastGood = undefined;
+    lastObservedUsage = undefined;
   });
 }
