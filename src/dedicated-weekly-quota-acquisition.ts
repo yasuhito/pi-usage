@@ -1,8 +1,3 @@
-import {
-  parseFiniteNumber,
-  weeklyQuotaUsageFromProviderValues,
-} from "./codex-weekly-quota-values.ts";
-
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -12,16 +7,8 @@ export interface CodexCredential {
   readonly accountId: string;
 }
 
-export type RateLimitWindowPosition = "primary" | "secondary";
-
-export interface WeeklyQuotaUsage {
-  readonly usedPercent: number;
-  readonly resetsAtMs: number;
-  readonly windowPosition: RateLimitWindowPosition;
-}
-
 export type DedicatedWeeklyQuotaAcquisitionResult =
-  | { readonly kind: "observed"; readonly usage: WeeklyQuotaUsage }
+  | { readonly kind: "acquired"; readonly body: unknown }
   | { readonly kind: "authentication-rejected" }
   | {
       readonly kind: "temporary-failure";
@@ -40,12 +27,17 @@ export interface DedicatedWeeklyQuotaAcquisitionDependencies {
   readonly now: () => number;
 }
 
+function declaredResponseSize(response: Response): number | undefined {
+  const value = response.headers.get("content-length");
+  if (value === null || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 async function readBoundedBody(
   response: Response,
 ): Promise<string | undefined> {
-  const declaredSize = parseFiniteNumber(
-    response.headers.get("content-length") ?? undefined,
-  );
+  const declaredSize = declaredResponseSize(response);
   if (declaredSize !== undefined && declaredSize > MAX_RESPONSE_BYTES) {
     return undefined;
   }
@@ -72,38 +64,6 @@ async function readBoundedBody(
   }
 }
 
-function weeklyQuotaObservationFromBody(
-  body: unknown,
-): DedicatedWeeklyQuotaAcquisitionResult {
-  const rateLimit =
-    typeof body === "object" && body !== null
-      ? Reflect.get(body, "rate_limit")
-      : undefined;
-  if (typeof rateLimit !== "object" || rateLimit === null) {
-    return { kind: "malformed-observation" };
-  }
-
-  for (const name of ["primary_window", "secondary_window"] as const) {
-    const window = Reflect.get(rateLimit, name);
-    if (typeof window !== "object" || window === null) continue;
-
-    const result = weeklyQuotaUsageFromProviderValues(
-      name === "primary_window" ? "primary" : "secondary",
-      Reflect.get(window, "limit_window_seconds"),
-      Reflect.get(window, "used_percent"),
-      Reflect.get(window, "reset_at"),
-    );
-    if (result.kind === "malformed") {
-      return { kind: "malformed-observation" };
-    }
-    if (result.kind === "observed") {
-      return { kind: "observed", usage: result.usage };
-    }
-  }
-
-  return { kind: "malformed-observation" };
-}
-
 function retryAtMs(response: Response, now: number): number | undefined {
   const rawValue = response.headers.get("retry-after");
   if (rawValue === null) return undefined;
@@ -124,9 +84,7 @@ export function createAcquireDedicatedWeeklyQuotaUsage(
   dependencies: DedicatedWeeklyQuotaAcquisitionDependencies,
 ): AcquireDedicatedWeeklyQuotaUsage {
   return async (credential, signal) => {
-    if (signal?.aborted) {
-      throw signal.reason;
-    }
+    if (signal?.aborted) throw signal.reason;
 
     try {
       const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -168,17 +126,13 @@ export function createAcquireDedicatedWeeklyQuotaUsage(
 
       const responseText = await readBoundedBody(response);
       if (signal?.aborted) throw signal.reason;
-      if (responseText === undefined) {
-        return { kind: "malformed-observation" };
-      }
+      if (responseText === undefined) return { kind: "malformed-observation" };
 
-      let body: unknown;
       try {
-        body = JSON.parse(responseText);
+        return { kind: "acquired", body: JSON.parse(responseText) };
       } catch {
         return { kind: "malformed-observation" };
       }
-      return weeklyQuotaObservationFromBody(body);
     } catch {
       if (signal?.aborted) throw signal.reason;
       return { kind: "temporary-failure", retryAtMs: undefined };

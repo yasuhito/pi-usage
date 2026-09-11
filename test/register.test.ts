@@ -6,7 +6,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import type { CodexCredential } from "../src/codex-usage.ts";
+import type { CodexCredential } from "../src/dedicated-weekly-quota-acquisition.ts";
 import { registerWeeklyQuotaUsage } from "../src/register.ts";
 
 function accessTokenFor(accountId: string): string {
@@ -47,11 +47,15 @@ function registerFixture() {
     acquireDedicatedWeeklyQuotaUsage: async (credential) => {
       observedCredentials.push(credential);
       return {
-        kind: "observed",
-        usage: {
-          usedPercent: 63.4,
-          resetsAtMs: 2_000_000,
-          windowPosition: "secondary",
+        kind: "acquired",
+        body: {
+          rate_limit: {
+            secondary_window: {
+              used_percent: 63.4,
+              limit_window_seconds: 7 * 24 * 60 * 60,
+              reset_at: 2_000,
+            },
+          },
         },
       };
     },

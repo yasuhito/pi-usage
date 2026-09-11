@@ -6,7 +6,7 @@ import type {
 import type {
   AcquireDedicatedWeeklyQuotaUsage,
   CodexCredential,
-} from "./codex-usage.ts";
+} from "./dedicated-weekly-quota-acquisition.ts";
 import { presentQuotaStatus } from "./presentation.ts";
 import {
   type CodexCredentialResolution,

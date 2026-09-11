@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createAcquireDedicatedWeeklyQuotaUsage } from "../src/codex-usage.ts";
+import { createAcquireDedicatedWeeklyQuotaUsage } from "../src/dedicated-weekly-quota-acquisition.ts";
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
 const credential = { accessToken: "secret", accountId: "account-1" };
@@ -13,35 +13,33 @@ function acquisition(fetchStub: typeof fetch, now = 1_000_000) {
   });
 }
 
-function usageResponse(): Response {
-  return new Response(
-    JSON.stringify({
-      rate_limit: {
-        primary_window: {
-          used_percent: 12,
-          limit_window_seconds: 18_000,
-          reset_at: 2_000,
-        },
-        secondary_window: {
-          used_percent: 63.4,
-          limit_window_seconds: WEEK_SECONDS,
-          reset_at: 3_000,
-        },
+function usageBody() {
+  return {
+    rate_limit: {
+      primary_window: {
+        used_percent: 12,
+        limit_window_seconds: 18_000,
+        reset_at: 2_000,
       },
-    }),
-  );
+      secondary_window: {
+        used_percent: 63.4,
+        limit_window_seconds: WEEK_SECONDS,
+        reset_at: 3_000,
+      },
+    },
+  };
 }
 
-test("observes the seven-day window from the base Codex rate limit", async () => {
+function usageResponse(): Response {
+  return new Response(JSON.stringify(usageBody()));
+}
+
+test("returns the parsed provider body", async () => {
   const acquire = acquisition(async () => usageResponse());
 
   assert.deepEqual(await acquire(credential), {
-    kind: "observed",
-    usage: {
-      usedPercent: 63.4,
-      resetsAtMs: 3_000_000,
-      windowPosition: "secondary",
-    },
+    kind: "acquired",
+    body: usageBody(),
   });
 });
 
@@ -234,7 +232,7 @@ test("maps transport failures to temporary failure", async () => {
   });
 });
 
-test("maps invalid or missing weekly quota data to malformed observation", async () => {
+test("rejects invalid JSON but leaves observation interpretation to reconciliation", async () => {
   const invalidJson = acquisition(async () => new Response("{"));
   const missingWeeklyWindow = acquisition(
     async () => new Response(JSON.stringify({ rate_limit: {} })),
@@ -244,6 +242,7 @@ test("maps invalid or missing weekly quota data to malformed observation", async
     kind: "malformed-observation",
   });
   assert.deepEqual(await missingWeeklyWindow(credential), {
-    kind: "malformed-observation",
+    kind: "acquired",
+    body: { rate_limit: {} },
   });
 });

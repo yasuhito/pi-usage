@@ -1,13 +1,14 @@
 import type {
   AcquireDedicatedWeeklyQuotaUsage,
   CodexCredential,
-  WeeklyQuotaUsage,
-} from "./codex-usage.ts";
+  DedicatedWeeklyQuotaAcquisitionResult,
+} from "./dedicated-weekly-quota-acquisition.ts";
 import type { QuotaStatus } from "./presentation.ts";
-import { createWeeklyQuotaObservationReconciliation } from "./weekly-quota-observation-reconciliation.ts";
+import {
+  createWeeklyQuotaObservationReconciliation,
+  type WeeklyQuotaObservationReaction,
+} from "./weekly-quota-observation-reconciliation.ts";
 
-const STALE_AFTER_MS = 10 * 60 * 1_000;
-const REFRESH_DEBOUNCE_MS = 30_000;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -41,6 +42,7 @@ export function createWeeklyQuotaUsageLifecycle(
 ): WeeklyQuotaUsageLifecycle {
   let stopPolling: (() => void) | undefined;
   let cancelStaleExpiration: (() => void) | undefined;
+  let scheduledStaleExpirationAtMs: number | undefined;
   let activeController: AbortController | undefined;
   let shuttingDown = false;
   let credentialAvailable = false;
@@ -50,38 +52,73 @@ export function createWeeklyQuotaUsageLifecycle(
   let accountResolutionsInFlight = 0;
   const observationReconciliation =
     createWeeklyQuotaObservationReconciliation();
-  let lastObservedUsage:
-    | { readonly usage: WeeklyQuotaUsage; readonly capturedAt: number }
-    | undefined;
 
-  const clearStaleExpiration = (): void => {
-    cancelStaleExpiration?.();
-    cancelStaleExpiration = undefined;
+  const applyObservationReaction = (
+    reaction: WeeklyQuotaObservationReaction,
+  ): boolean => {
+    if (reaction.staleExpirationAtMs !== scheduledStaleExpirationAtMs) {
+      cancelStaleExpiration?.();
+      cancelStaleExpiration = undefined;
+      scheduledStaleExpirationAtMs = reaction.staleExpirationAtMs;
+
+      if (scheduledStaleExpirationAtMs !== undefined) {
+        const deadline = scheduledStaleExpirationAtMs;
+        cancelStaleExpiration = dependencies.schedule(
+          () => {
+            cancelStaleExpiration = undefined;
+            scheduledStaleExpirationAtMs = undefined;
+            applyObservationReaction(
+              observationReconciliation.advance(
+                { kind: "stale-usage-expiration-reached" },
+                dependencies.now(),
+              ),
+            );
+          },
+          Math.max(0, deadline - dependencies.now()),
+        );
+      }
+    }
+
+    if (reaction.publication === "replace") {
+      if (reaction.observation.kind === "none") {
+        dependencies.publish({ kind: "unavailable" });
+      } else {
+        dependencies.publish({
+          kind: "available",
+          usedPercent: reaction.observation.usage.usedPercent,
+          stale: reaction.observation.freshness === "stale",
+        });
+      }
+    }
+
+    return reaction.acquireDedicated;
   };
-  const clearObservedUsage = (): void => {
-    clearStaleExpiration();
-    lastObservedUsage = undefined;
+
+  const invalidateAccountObservation = (): void => {
+    applyObservationReaction(
+      observationReconciliation.advance(
+        { kind: "account-selection-invalidated" },
+        dependencies.now(),
+      ),
+    );
   };
   const selectAccount = (accountId: string): void => {
     if (currentAccountId === accountId) return;
     currentAccountId = accountId;
-    observationReconciliation.discard("account-change");
-    clearObservedUsage();
+    invalidateAccountObservation();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
   };
   const clearForMissingCredential = (): void => {
     credentialAvailable = false;
     currentAccountId = undefined;
-    observationReconciliation.discard("missing-credential");
-    clearObservedUsage();
+    invalidateAccountObservation();
     dependencies.publish(undefined);
   };
   const clearForInvalidCredential = (): void => {
     credentialAvailable = true;
     currentAccountId = undefined;
-    observationReconciliation.discard("invalid-credential");
-    clearObservedUsage();
+    invalidateAccountObservation();
     nextAttemptAt = 0;
     consecutiveFailures = 0;
     dependencies.publish({ kind: "unavailable" });
@@ -102,42 +139,6 @@ export function createWeeklyQuotaUsageLifecycle(
     selectAccount(resolution.credential.accountId);
     return resolution.credential;
   };
-  const recordFreshUsage = (usage: WeeklyQuotaUsage): void => {
-    clearStaleExpiration();
-    lastObservedUsage = { usage, capturedAt: dependencies.now() };
-    dependencies.publish({
-      kind: "available",
-      usedPercent: usage.usedPercent,
-      stale: false,
-    });
-  };
-  const publishStaleUsage = (): void => {
-    const now = dependencies.now();
-    if (
-      lastObservedUsage === undefined ||
-      now - lastObservedUsage.capturedAt >= STALE_AFTER_MS ||
-      now >= lastObservedUsage.usage.resetsAtMs
-    ) {
-      clearObservedUsage();
-      observationReconciliation.discard("stale-usage-expired");
-      dependencies.publish({ kind: "unavailable" });
-      return;
-    }
-    dependencies.publish({
-      kind: "available",
-      usedPercent: lastObservedUsage.usage.usedPercent,
-      stale: true,
-    });
-    const deadline = Math.min(
-      lastObservedUsage.capturedAt + STALE_AFTER_MS,
-      lastObservedUsage.usage.resetsAtMs,
-    );
-    clearStaleExpiration();
-    cancelStaleExpiration = dependencies.schedule(() => {
-      cancelStaleExpiration = undefined;
-      publishStaleUsage();
-    }, deadline - now);
-  };
 
   const recordTemporaryFailure = (retryAtMs: number | undefined): void => {
     const now = dependencies.now();
@@ -153,7 +154,23 @@ export function createWeeklyQuotaUsageLifecycle(
       const jitter = 0.5 + dependencies.random();
       nextAttemptAt = now + baseDelay * jitter;
     }
-    publishStaleUsage();
+  };
+
+  const applyDedicatedResult = (
+    result: DedicatedWeeklyQuotaAcquisitionResult,
+  ): void => {
+    if (result.kind === "temporary-failure") {
+      recordTemporaryFailure(result.retryAtMs);
+    } else {
+      nextAttemptAt = 0;
+      consecutiveFailures = 0;
+    }
+    applyObservationReaction(
+      observationReconciliation.advance(
+        { kind: "dedicated-weekly-quota-acquisition", result },
+        dependencies.now(),
+      ),
+    );
   };
 
   let inFlight: Promise<void> | undefined;
@@ -168,7 +185,12 @@ export function createWeeklyQuotaUsageLifecycle(
       if (credential === undefined) return;
 
       if (!ignoreBackoff && dependencies.now() < nextAttemptAt) {
-        publishStaleUsage();
+        applyObservationReaction(
+          observationReconciliation.advance(
+            { kind: "dedicated-weekly-quota-acquisition-deferred" },
+            dependencies.now(),
+          ),
+        );
         return;
       }
       let result = await dependencies.acquireDedicatedWeeklyQuotaUsage(
@@ -188,24 +210,13 @@ export function createWeeklyQuotaUsageLifecycle(
       }
       if (shuttingDown || signal.aborted) return;
 
-      result = observationReconciliation.reconcileDedicated(result);
-      if (result.kind === "observed") {
-        nextAttemptAt = 0;
-        consecutiveFailures = 0;
-        recordFreshUsage(result.usage);
-        return;
-      }
-      if (result.kind === "temporary-failure") {
-        recordTemporaryFailure(result.retryAtMs);
-        return;
-      }
-      clearObservedUsage();
-      nextAttemptAt = 0;
-      consecutiveFailures = 0;
-      dependencies.publish({ kind: "unavailable" });
+      applyDedicatedResult(result);
     } catch {
       if (shuttingDown || signal.aborted) return;
-      recordTemporaryFailure(undefined);
+      applyDedicatedResult({
+        kind: "temporary-failure",
+        retryAtMs: undefined,
+      });
     }
   };
 
@@ -254,32 +265,22 @@ export function createWeeklyQuotaUsageLifecycle(
     },
     observeCodexResponse: (headers) => {
       if (!credentialAvailable || accountResolutionsInFlight > 0) return;
-      const result = observationReconciliation.observePassive(headers);
-      if (result.kind === "unrecognized") {
-        if (
-          lastObservedUsage === undefined ||
-          dependencies.now() - lastObservedUsage.capturedAt >=
-            REFRESH_DEBOUNCE_MS
-        ) {
-          void refresh();
-        }
-        return;
-      }
-      if (result.kind === "malformed") {
-        clearObservedUsage();
-        dependencies.publish({ kind: "unavailable" });
-        return;
-      }
-      if (result.kind === "observed") recordFreshUsage(result.usage);
+      const acquireDedicated = applyObservationReaction(
+        observationReconciliation.advance(
+          { kind: "passive-weekly-quota-observation", fields: headers },
+          dependencies.now(),
+        ),
+      );
+      if (acquireDedicated) void refresh();
     },
     refreshAfterActivity: async () => {
-      if (
-        lastObservedUsage !== undefined &&
-        dependencies.now() - lastObservedUsage.capturedAt < REFRESH_DEBOUNCE_MS
-      ) {
-        return;
-      }
-      await refreshAndUpdatePolling();
+      const acquireDedicated = applyObservationReaction(
+        observationReconciliation.advance(
+          { kind: "activity" },
+          dependencies.now(),
+        ),
+      );
+      if (acquireDedicated) await refreshAndUpdatePolling();
     },
     refreshForAccountChange: async () => {
       accountResolutionsInFlight += 1;
@@ -296,8 +297,9 @@ export function createWeeklyQuotaUsageLifecycle(
       stopPolling = undefined;
       credentialAvailable = false;
       currentAccountId = undefined;
-      observationReconciliation.discard("session-end");
-      clearObservedUsage();
+      cancelStaleExpiration?.();
+      cancelStaleExpiration = undefined;
+      scheduledStaleExpirationAtMs = undefined;
     },
   };
 }

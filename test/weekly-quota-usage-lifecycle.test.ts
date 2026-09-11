@@ -4,7 +4,7 @@ import test from "node:test";
 import type {
   CodexCredential,
   DedicatedWeeklyQuotaAcquisitionResult,
-} from "../src/codex-usage.ts";
+} from "../src/dedicated-weekly-quota-acquisition.ts";
 import type { QuotaStatus } from "../src/presentation.ts";
 import {
   type CodexCredentialResolution,
@@ -26,11 +26,15 @@ function lifecycleFixture() {
   let acquisitionError: Error | undefined;
   let acquisitionGate: Promise<void> | undefined;
   let acquisitionResult: DedicatedWeeklyQuotaAcquisitionResult = {
-    kind: "observed",
-    usage: {
-      usedPercent: 63.4,
-      resetsAtMs: 2_000_000,
-      windowPosition: "secondary",
+    kind: "acquired",
+    body: {
+      rate_limit: {
+        secondary_window: {
+          used_percent: 63.4,
+          limit_window_seconds: 7 * 24 * 60 * 60,
+          reset_at: 2_000,
+        },
+      },
     },
   };
   let disableAuthAfterUsageReads: number | undefined;

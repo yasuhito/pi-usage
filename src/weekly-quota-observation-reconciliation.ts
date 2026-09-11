@@ -1,16 +1,19 @@
-import type {
-  DedicatedWeeklyQuotaAcquisitionResult,
-  RateLimitWindowPosition,
-  WeeklyQuotaUsage,
-} from "./codex-usage.ts";
-import {
-  CODEX_WEEK_SECONDS,
-  parseFiniteNumber,
-  weeklyQuotaUsageFromProviderValues,
-} from "./codex-weekly-quota-values.ts";
+import type { DedicatedWeeklyQuotaAcquisitionResult } from "./dedicated-weekly-quota-acquisition.ts";
 
-const WEEK_MINUTES = CODEX_WEEK_SECONDS / 60;
+const WEEK_SECONDS = 7 * 24 * 60 * 60;
+const WEEK_MINUTES = WEEK_SECONDS / 60;
+const STALE_AFTER_MS = 10 * 60 * 1_000;
+const REFRESH_DEBOUNCE_MS = 30_000;
 const WINDOW_POSITIONS = ["primary", "secondary"] as const;
+
+export type RateLimitWindowPosition = (typeof WINDOW_POSITIONS)[number];
+
+export interface WeeklyQuotaUsage {
+  readonly usedPercent: number;
+  readonly resetsAtMs: number;
+  readonly windowPosition: RateLimitWindowPosition;
+}
+
 const RATE_LIMIT_FIELD_NAMES = new Set(
   WINDOW_POSITIONS.flatMap((position) => [
     `x-codex-${position}-used-percent`,
@@ -19,42 +22,133 @@ const RATE_LIMIT_FIELD_NAMES = new Set(
   ]),
 );
 
-export type PassiveWeeklyQuotaObservationResult =
-  | { readonly kind: "unrecognized" }
-  | { readonly kind: "incomplete" }
-  | { readonly kind: "observed"; readonly usage: WeeklyQuotaUsage }
-  | { readonly kind: "malformed" };
+export type WeeklyQuotaObservationEvent =
+  | {
+      readonly kind: "passive-weekly-quota-observation";
+      readonly fields: Readonly<Record<string, unknown>>;
+    }
+  | {
+      readonly kind: "dedicated-weekly-quota-acquisition";
+      readonly result: DedicatedWeeklyQuotaAcquisitionResult;
+    }
+  | { readonly kind: "dedicated-weekly-quota-acquisition-deferred" }
+  | { readonly kind: "activity" }
+  | { readonly kind: "account-selection-invalidated" }
+  | { readonly kind: "stale-usage-expiration-reached" };
 
-export type WeeklyQuotaObservationDiscardReason =
-  | "account-change"
-  | "missing-credential"
-  | "invalid-credential"
-  | "stale-usage-expired"
-  | "session-end";
+export type WeeklyQuotaObservationState =
+  | { readonly kind: "none" }
+  | {
+      readonly kind: "usage";
+      readonly usage: WeeklyQuotaUsage;
+      readonly freshness: "fresh" | "stale";
+    };
+
+export interface WeeklyQuotaObservationReaction {
+  readonly observation: WeeklyQuotaObservationState;
+  readonly publication: "preserve" | "replace";
+  readonly staleExpirationAtMs: number | undefined;
+  readonly acquireDedicated: boolean;
+}
 
 export interface WeeklyQuotaObservationReconciliation {
   /**
-   * Accumulates recognized sparse fields in call order. An observed result
-   * becomes the baseline and clears accumulated fields; malformed recognized
-   * fields discard both.
+   * Applies events synchronously in call order. Time must be a finite epoch
+   * millisecond value. Provider data failures are represented by the returned
+   * reaction and never throw.
    */
-  readonly observePassive: (
-    fields: Readonly<Record<string, unknown>>,
-  ) => PassiveWeeklyQuotaObservationResult;
-  /**
-   * Reconciles the final acquisition result after any authentication retry.
-   * Temporary failure preserves all state. Permanent unavailability and final
-   * authentication rejection clear only the baseline. An observed result
-   * replaces the baseline and accumulated fields; malformed data discards both.
-   */
-  readonly reconcileDedicated: (
-    result: DedicatedWeeklyQuotaAcquisitionResult,
-  ) => DedicatedWeeklyQuotaAcquisitionResult;
-  /**
-   * Stale usage expiration clears only the baseline. Every other reason
-   * discards the baseline and accumulated fields.
-   */
-  readonly discard: (reason: WeeklyQuotaObservationDiscardReason) => void;
+  readonly advance: (
+    event: WeeklyQuotaObservationEvent,
+    nowMs: number,
+  ) => WeeklyQuotaObservationReaction;
+}
+
+type UsageResult =
+  | { readonly kind: "not-weekly" }
+  | { readonly kind: "malformed" }
+  | { readonly kind: "observed"; readonly usage: WeeklyQuotaUsage };
+
+interface CapturedUsage {
+  readonly usage: WeeklyQuotaUsage;
+  readonly capturedAtMs: number;
+  readonly freshness: "fresh" | "stale";
+}
+
+function parseFiniteNumber(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function weeklyQuotaUsageFromProviderValues(
+  position: RateLimitWindowPosition,
+  durationSeconds: unknown,
+  usedPercent: unknown,
+  resetsAtSeconds: unknown,
+): UsageResult {
+  if (durationSeconds !== WEEK_SECONDS) return { kind: "not-weekly" };
+  if (
+    typeof usedPercent !== "number" ||
+    !Number.isFinite(usedPercent) ||
+    typeof resetsAtSeconds !== "number" ||
+    !Number.isFinite(resetsAtSeconds) ||
+    resetsAtSeconds <= 0
+  ) {
+    return { kind: "malformed" };
+  }
+  const resetsAtMs = resetsAtSeconds * 1_000;
+  if (!Number.isFinite(resetsAtMs)) return { kind: "malformed" };
+  return {
+    kind: "observed",
+    usage: {
+      usedPercent,
+      resetsAtMs,
+      windowPosition: position,
+    },
+  };
+}
+
+function unsafeUsageFromDedicatedBody(body: unknown): UsageResult {
+  const rateLimit =
+    typeof body === "object" && body !== null
+      ? Reflect.get(body, "rate_limit")
+      : undefined;
+  if (typeof rateLimit !== "object" || rateLimit === null) {
+    return { kind: "malformed" };
+  }
+
+  for (const position of WINDOW_POSITIONS) {
+    const window = Reflect.get(rateLimit, `${position}_window`);
+    if (typeof window !== "object" || window === null) continue;
+
+    const result = weeklyQuotaUsageFromProviderValues(
+      position,
+      Reflect.get(window, "limit_window_seconds"),
+      Reflect.get(window, "used_percent"),
+      Reflect.get(window, "reset_at"),
+    );
+    if (result.kind !== "not-weekly") return result;
+  }
+
+  return { kind: "malformed" };
+}
+
+function usageFromDedicatedBody(body: unknown): UsageResult {
+  try {
+    return unsafeUsageFromDedicatedBody(body);
+  } catch {
+    return { kind: "malformed" };
+  }
+}
+
+function entriesFromProviderFields(
+  fields: Readonly<Record<string, unknown>>,
+): Array<[string, unknown]> | undefined {
+  try {
+    return Object.entries(fields);
+  } catch {
+    return undefined;
+  }
 }
 
 function usageForPosition(
@@ -106,6 +200,7 @@ function usageForPosition(
   ) {
     return undefined;
   }
+
   const result = weeklyQuotaUsageFromProviderValues(
     position,
     durationMinutes * 60,
@@ -118,62 +213,139 @@ function usageForPosition(
 
 export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObservationReconciliation {
   let accumulatedFields: Record<string, string> = {};
-  let baseline: WeeklyQuotaUsage | undefined;
+  let capturedUsage: CapturedUsage | undefined;
 
   const discardAll = (): void => {
     accumulatedFields = {};
-    baseline = undefined;
+    capturedUsage = undefined;
+  };
+  const clearUsage = (): void => {
+    capturedUsage = undefined;
+  };
+  const recordUsage = (usage: WeeklyQuotaUsage, capturedAtMs: number): void => {
+    accumulatedFields = {};
+    capturedUsage = { usage, capturedAtMs, freshness: "fresh" };
+  };
+  const staleDeadlineFor = (usage: CapturedUsage): number =>
+    Math.min(usage.capturedAtMs + STALE_AFTER_MS, usage.usage.resetsAtMs);
+  const staleExpirationAtMs = (): number | undefined =>
+    capturedUsage?.freshness === "stale"
+      ? staleDeadlineFor(capturedUsage)
+      : undefined;
+  const shouldAcquireDedicated = (nowMs: number): boolean =>
+    capturedUsage === undefined ||
+    nowMs - capturedUsage.capturedAtMs >= REFRESH_DEBOUNCE_MS;
+  const reaction = (
+    publication: WeeklyQuotaObservationReaction["publication"] = "preserve",
+    acquireDedicated = false,
+  ): WeeklyQuotaObservationReaction => ({
+    observation:
+      capturedUsage === undefined
+        ? { kind: "none" }
+        : {
+            kind: "usage",
+            usage: capturedUsage.usage,
+            freshness: capturedUsage.freshness,
+          },
+    publication,
+    staleExpirationAtMs: staleExpirationAtMs(),
+    acquireDedicated,
+  });
+  const staleOrUnavailable = (
+    nowMs: number,
+  ): WeeklyQuotaObservationReaction => {
+    if (capturedUsage === undefined) return reaction("replace");
+
+    const deadline = staleDeadlineFor(capturedUsage);
+    if (nowMs >= deadline) {
+      clearUsage();
+      return reaction("replace");
+    }
+
+    capturedUsage = { ...capturedUsage, freshness: "stale" };
+    return reaction("replace");
   };
 
   return {
-    observePassive: (fields) => {
-      let contributed = false;
-      for (const [name, value] of Object.entries(fields)) {
-        const normalizedName = name.toLowerCase();
-        if (!RATE_LIMIT_FIELD_NAMES.has(normalizedName)) continue;
-        if (typeof value !== "string") {
-          discardAll();
-          return { kind: "malformed" };
-        }
-        accumulatedFields[normalizedName] = value;
-        contributed = true;
+    advance: (event, nowMs) => {
+      if (!Number.isFinite(nowMs)) {
+        throw new RangeError("nowMs must be finite");
       }
-      if (!contributed) return { kind: "unrecognized" };
 
-      for (const position of WINDOW_POSITIONS) {
-        const usage = usageForPosition(accumulatedFields, baseline, position);
-        if (usage === "malformed") {
+      switch (event.kind) {
+        case "passive-weekly-quota-observation": {
+          const entries = entriesFromProviderFields(event.fields);
+          if (entries === undefined) {
+            discardAll();
+            return reaction("replace");
+          }
+
+          let contributed = false;
+          for (const [name, value] of entries) {
+            const normalizedName = name.toLowerCase();
+            if (!RATE_LIMIT_FIELD_NAMES.has(normalizedName)) continue;
+            if (typeof value !== "string") {
+              discardAll();
+              return reaction("replace");
+            }
+            accumulatedFields[normalizedName] = value;
+            contributed = true;
+          }
+          if (!contributed) {
+            return reaction("preserve", shouldAcquireDedicated(nowMs));
+          }
+
+          for (const position of WINDOW_POSITIONS) {
+            const usage = usageForPosition(
+              accumulatedFields,
+              capturedUsage?.usage,
+              position,
+            );
+            if (usage === "malformed") {
+              discardAll();
+              return reaction("replace");
+            }
+            if (usage !== undefined) {
+              recordUsage(usage, nowMs);
+              return reaction("replace");
+            }
+          }
+          return reaction();
+        }
+
+        case "dedicated-weekly-quota-acquisition": {
+          const { result } = event;
+          if (result.kind === "acquired") {
+            const usage = usageFromDedicatedBody(result.body);
+            if (usage.kind === "observed") {
+              recordUsage(usage.usage, nowMs);
+            } else {
+              discardAll();
+            }
+          } else if (result.kind === "temporary-failure") {
+            return staleOrUnavailable(nowMs);
+          } else if (result.kind === "malformed-observation") {
+            discardAll();
+          } else {
+            clearUsage();
+          }
+          return reaction("replace");
+        }
+
+        case "dedicated-weekly-quota-acquisition-deferred":
+          return staleOrUnavailable(nowMs);
+
+        case "activity":
+          return reaction("preserve", shouldAcquireDedicated(nowMs));
+
+        case "account-selection-invalidated":
           discardAll();
-          return { kind: "malformed" };
-        }
-        if (usage !== undefined) {
-          accumulatedFields = {};
-          baseline = usage;
-          return { kind: "observed", usage };
-        }
+          return reaction();
+
+        case "stale-usage-expiration-reached":
+          if (capturedUsage?.freshness !== "stale") return reaction();
+          return staleOrUnavailable(nowMs);
       }
-      return { kind: "incomplete" };
-    },
-    reconcileDedicated: (result) => {
-      if (result.kind === "observed") {
-        accumulatedFields = {};
-        baseline = result.usage;
-      } else if (result.kind === "malformed-observation") {
-        discardAll();
-      } else if (
-        result.kind === "authentication-rejected" ||
-        result.kind === "permanently-unavailable"
-      ) {
-        baseline = undefined;
-      }
-      return result;
-    },
-    discard: (reason) => {
-      if (reason === "stale-usage-expired") {
-        baseline = undefined;
-        return;
-      }
-      discardAll();
     },
   };
 }
