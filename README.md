@@ -1,9 +1,9 @@
 # @yasuhito/pi-usage
 
-A [Pi](https://pi.dev) extension that shows the active Codex account's weekly quota usage and available limit reset credits in the default footer.
+A [Pi](https://pi.dev) extension that shows the active Codex account's weekly quota usage, weekly reset countdown, and available limit reset credits in the default footer.
 
 ```text
-Codex wk ━━━━━━──── 63% · resets 2
+Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2
 ```
 
 It uses `ctx.ui.setStatus()`, so it coexists with other status extensions such as [`pi-smart-zone`](https://pi.dev/packages/pi-smart-zone).
@@ -35,14 +35,16 @@ Sign in to Pi's `openai-codex` provider with `/login`. The meter is shown whenev
 | State | Status |
 | --- | --- |
 | Loading | `Codex wk loading…` |
-| Available | `Codex wk ━━━━━━──── 63% · resets 2` |
-| Temporarily stale | `Codex wk ━━━━━━──── 63% · resets 2 ~` |
+| Available | `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2` |
+| Temporarily stale | `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2 ~` |
 | Unavailable | `Codex wk unavailable` |
 | Codex OAuth not configured | Hidden |
 
 The percentage is Codex's provider-reported weighted **weekly quota usage**, not a token count divided by a fixed token limit. The bar has ten cells. The status becomes a warning at 75% and an error at 90%.
 
-The `resets` suffix is the provider-reported number of available **limit reset credits**. It appears when Codex supplies the count, including when the count is zero.
+The `reset` suffix is the remaining time until the provider-reported weekly window reset. It uses compact day/hour, hour/minute, or minute units.
+
+The `↻N` suffix is the provider-reported number of available **limit reset credits**. It appears when Codex supplies the count, including when the count is zero.
 
 ## How it works
 

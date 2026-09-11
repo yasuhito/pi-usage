@@ -5,14 +5,18 @@ import { presentQuotaStatus } from "../src/presentation.ts";
 
 test("fresh weekly quota usage is presented as a ten-cell used bar", () => {
   assert.deepEqual(
-    presentQuotaStatus({
-      kind: "available",
-      usedPercent: 63,
-      stale: false,
-      availableLimitResetCredits: 2,
-    }),
+    presentQuotaStatus(
+      {
+        kind: "available",
+        usedPercent: 63,
+        stale: false,
+        weeklyWindowResetsAtMs: Date.UTC(2026, 8, 14, 14),
+        availableLimitResetCredits: 2,
+      },
+      Date.UTC(2026, 8, 11, 12),
+    ),
     {
-      text: "Codex wk ━━━━━━──── 63% · resets 2",
+      text: "Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2",
       color: "dim",
     },
   );
@@ -47,6 +51,33 @@ test("quota presentation rounds, clamps, colors, and marks freshness", () => {
   }
 });
 
+test("weekly reset countdown uses compact hour, minute, and elapsed forms", () => {
+  const nowMs = Date.UTC(2026, 8, 11, 12);
+  const status = {
+    kind: "available" as const,
+    usedPercent: 20,
+    stale: false,
+  };
+
+  const cases = [
+    [23 * 60 * 60_000 + 59 * 60_000 + 30_000, "23h 59m"],
+    [2 * 60 * 60_000 + 30 * 60_000, "2h 30m"],
+    [59 * 60_000 + 30_000, "59m"],
+    [42 * 60_000, "42m"],
+    [0, "now"],
+  ] as const;
+
+  for (const [remainingMs, expected] of cases) {
+    assert.equal(
+      presentQuotaStatus(
+        { ...status, weeklyWindowResetsAtMs: nowMs + remainingMs },
+        nowMs,
+      ).text,
+      `Codex wk ━━──────── 20% · reset ${expected}`,
+    );
+  }
+});
+
 test("zero limit reset credits are shown while an unavailable count is omitted", () => {
   assert.equal(
     presentQuotaStatus({
@@ -55,7 +86,7 @@ test("zero limit reset credits are shown while an unavailable count is omitted",
       stale: false,
       availableLimitResetCredits: 0,
     }).text,
-    "Codex wk ━━──────── 20% · resets 0",
+    "Codex wk ━━──────── 20% · ↻0",
   );
   assert.equal(
     presentQuotaStatus({

@@ -128,7 +128,10 @@ test("session start adapts Pi authentication and quota presentation", async () =
   ]);
   assert.deepEqual(fixture.statuses, [
     { key: "pi-usage", text: "Codex wk loading…" },
-    { key: "pi-usage", text: "Codex wk ━━━━━━──── 63% · resets 2" },
+    {
+      key: "pi-usage",
+      text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2",
+    },
   ]);
 });
 
@@ -170,7 +173,7 @@ test("responses from another provider do not enter the lifecycle", async () => {
 
   assert.deepEqual(fixture.statuses.at(-1), {
     key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63% · resets 2",
+    text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2",
   });
 });
 

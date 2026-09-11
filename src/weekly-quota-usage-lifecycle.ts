@@ -87,6 +87,7 @@ export function createWeeklyQuotaUsageLifecycle(
           kind: "available",
           usedPercent: reaction.observation.usage.usedPercent,
           stale: reaction.observation.freshness === "stale",
+          weeklyWindowResetsAtMs: reaction.observation.usage.resetsAtMs,
           ...(reaction.observation.usage.availableLimitResetCredits ===
           undefined
             ? {}

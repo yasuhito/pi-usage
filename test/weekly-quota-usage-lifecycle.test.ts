@@ -139,7 +139,12 @@ test("start publishes loading and active-account usage", async () => {
 
   assert.deepEqual(fixture.statuses, [
     { kind: "loading" },
-    { kind: "available", usedPercent: 63.4, stale: false },
+    {
+      kind: "available",
+      usedPercent: 63.4,
+      stale: false,
+      weeklyWindowResetsAtMs: 2_000_000,
+    },
   ]);
   assert.deepEqual(fixture.observedCredentials, [credential()]);
 });
@@ -199,6 +204,7 @@ test("temporary failure publishes stale usage, then unavailable when expired", a
     kind: "available",
     usedPercent: 63.4,
     stale: true,
+    weeklyWindowResetsAtMs: 2_000_000,
   });
 
   fixture.setNow(1_600_000);
@@ -241,6 +247,7 @@ test("a dedicated quota observation becomes the baseline for passive observation
     kind: "available",
     usedPercent: 82,
     stale: false,
+    weeklyWindowResetsAtMs: 2_000_000,
   });
 });
 
@@ -262,6 +269,7 @@ test("fresh headers cancel scheduled stale expiration", async () => {
     kind: "available",
     usedPercent: 82,
     stale: false,
+    weeklyWindowResetsAtMs: 4_000_000,
   });
 });
 
@@ -428,6 +436,7 @@ test("unexpected acquisition rejection uses temporary backoff", async () => {
     kind: "available",
     usedPercent: 63.4,
     stale: true,
+    weeklyWindowResetsAtMs: 2_000_000,
   });
 });
 
@@ -533,6 +542,7 @@ test("permanent acquisition unavailability preserves partial passive fields", as
     kind: "available",
     usedPercent: 74,
     stale: false,
+    weeklyWindowResetsAtMs: 4_000_000,
   });
 });
 

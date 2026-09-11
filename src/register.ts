@@ -90,7 +90,7 @@ function createLifecycle(
         ctx.ui.setStatus(STATUS_KEY, undefined);
         return;
       }
-      const presentation = presentQuotaStatus(status);
+      const presentation = presentQuotaStatus(status, dependencies.now());
       ctx.ui.setStatus(
         STATUS_KEY,
         ctx.ui.theme.fg(presentation.color, presentation.text),

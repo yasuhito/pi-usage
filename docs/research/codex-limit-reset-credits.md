@@ -55,6 +55,6 @@ OpenAI's own client confirms both the detailed inventory endpoint and the altern
 
 ## Implementation decision
 
-Use the optional `rate_limit_reset_credits.available_count` from the existing dedicated `/wham/usage` response and append `· resets N` to the weekly meter. Show zero explicitly, omit the suffix when the field is absent or malformed, retain the last count across passive header-only weekly updates, and apply the weekly observation's existing stale/account lifecycle to the count.
+Use the optional `rate_limit_reset_credits.available_count` from the existing dedicated `/wham/usage` response and append the compact `· ↻N` indicator to the weekly meter. Show zero explicitly, omit the suffix when the field is absent or malformed, retain the last count across passive header-only weekly updates, and apply the weekly observation's existing stale/account lifecycle to the count.
 
 This is intentionally a compact summary. A future expiry display would require the supplemental detailed request and CodexBar-style filtering. Like `/wham/usage`, these first-party ChatGPT endpoints are not documented as stable public OpenAI APIs, so parsing remains defensive.

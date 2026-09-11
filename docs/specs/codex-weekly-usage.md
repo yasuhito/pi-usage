@@ -20,14 +20,16 @@ The first release supports only Pi's `openai-codex` OAuth provider. It does not 
 Use `ctx.ui.setStatus()` so the meter coexists with `pi-smart-zone` and the default footer.
 
 - Loading: `Codex wk loading…`
-- Fresh: `Codex wk ━━━━━━──── 63% · resets 2`
-- Stale: `Codex wk ━━━━━━──── 63% · resets 2 ~`
+- Fresh: `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2`
+- Stale: `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2 ~`
 - Unavailable: `Codex wk unavailable`
 - No configured Codex OAuth: clear the status.
 
 The bar has ten cells. Filled cells are the used portion rounded to the nearest 10%. Theme colors are `dim` below 75%, `warning` from 75% through 89%, and `error` from 90%.
 
-When `/wham/usage` provides `rate_limit_reset_credits.available_count`, append the compact `· resets N` suffix to the right of the percentage. Show zero explicitly and omit the suffix when the optional count is absent or malformed.
+Append a compact weekly reset countdown between the percentage and the limit reset credit count, such as `· reset 3d 2h`. Derive it from the provider-reported weekly window reset timestamp. Show days and hours, hours and minutes, or minutes as space permits; show `now` when the reset time has arrived.
+
+When `/wham/usage` provides `rate_limit_reset_credits.available_count`, append the compact `· ↻N` suffix after the countdown. Show zero explicitly and omit the suffix when the optional count is absent or malformed.
 
 Display the status whenever Codex OAuth is configured, even if another model is selected.
 
