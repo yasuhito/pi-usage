@@ -16,8 +16,12 @@ _Avoid_: Secondary window
 The last successfully observed weekly quota usage when a newer observation temporarily cannot be obtained. It remains presentable for at most ten minutes and never beyond its reported reset time.
 _Avoid_: Cached usage, current usage
 
+**Limit reset credit**:
+A provider-granted, consumable credit that resets a Codex rate-limit window. It is separate from weekly quota usage and paid extra-usage balances. The footer reports the provider's available count.
+_Avoid_: Weekly credit, usage credit
+
 **Weekly quota usage lifecycle**:
-The progression of weekly quota usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end.
+The progression of weekly quota usage and its accompanying available limit reset credit count from initial acquisition through fresh observation, temporary staleness, expiration, and session end.
 _Avoid_: Usage cache lifecycle
 
 **Passive weekly quota observation**:

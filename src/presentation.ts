@@ -5,6 +5,7 @@ export type QuotaStatus =
       readonly kind: "available";
       readonly usedPercent: number;
       readonly stale: boolean;
+      readonly availableLimitResetCredits?: number;
     };
 
 export interface QuotaStatusPresentation {
@@ -32,8 +33,13 @@ export function presentQuotaStatus(
   const filledCells = Math.round(usedPercent / 10);
   const bar = "━".repeat(filledCells) + "─".repeat(10 - filledCells);
 
+  const limitResetCreditsSuffix =
+    status.availableLimitResetCredits === undefined
+      ? ""
+      : ` · resets ${status.availableLimitResetCredits}`;
+
   return {
-    text: `Codex wk ${bar} ${usedPercent}%${status.stale ? " ~" : ""}`,
+    text: `Codex wk ${bar} ${usedPercent}%${limitResetCreditsSuffix}${status.stale ? " ~" : ""}`,
     color: usedPercent >= 90 ? "error" : usedPercent >= 75 ? "warning" : "dim",
   };
 }

@@ -90,6 +90,42 @@ test("interprets the weekly window from dedicated acquisition evidence", () => {
   });
 });
 
+test("captures an available limit reset credit count from dedicated evidence", () => {
+  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const body = dedicatedBody() as Record<string, unknown>;
+  body.rate_limit_reset_credits = { available_count: 2 };
+
+  const dedicated = observeDedicated(reconciliation, NOW, body);
+  const passive = observePassive(reconciliation, {
+    "x-codex-primary-used-percent": "64",
+    "x-codex-primary-window-minutes": "10080",
+    "x-codex-primary-reset-at": "4000",
+  });
+
+  assert.deepEqual(dedicated.observation, {
+    ...usageState(63),
+    usage: { ...usageState(63).usage, availableLimitResetCredits: 2 },
+  });
+  assert.deepEqual(passive.observation, {
+    ...usageState(64, "fresh", "primary"),
+    usage: {
+      ...usageState(64, "fresh", "primary").usage,
+      availableLimitResetCredits: 2,
+    },
+  });
+});
+
+test("ignores malformed optional limit reset credit evidence", () => {
+  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const body = dedicatedBody() as Record<string, unknown>;
+  body.rate_limit_reset_credits = { available_count: -1 };
+
+  assert.deepEqual(
+    observeDedicated(reconciliation, NOW, body).observation,
+    usageState(63),
+  );
+});
+
 test("rejects a dedicated reset time that overflows epoch milliseconds", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
 

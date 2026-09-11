@@ -9,9 +9,10 @@ test("fresh weekly quota usage is presented as a ten-cell used bar", () => {
       kind: "available",
       usedPercent: 63,
       stale: false,
+      availableLimitResetCredits: 2,
     }),
     {
-      text: "Codex wk ━━━━━━──── 63%",
+      text: "Codex wk ━━━━━━──── 63% · resets 2",
       color: "dim",
     },
   );
@@ -44,6 +45,26 @@ test("quota presentation rounds, clamps, colors, and marks freshness", () => {
   for (const { status, expected } of cases) {
     assert.deepEqual(presentQuotaStatus(status), expected);
   }
+});
+
+test("zero limit reset credits are shown while an unavailable count is omitted", () => {
+  assert.equal(
+    presentQuotaStatus({
+      kind: "available",
+      usedPercent: 20,
+      stale: false,
+      availableLimitResetCredits: 0,
+    }).text,
+    "Codex wk ━━──────── 20% · resets 0",
+  );
+  assert.equal(
+    presentQuotaStatus({
+      kind: "available",
+      usedPercent: 20,
+      stale: false,
+    }).text,
+    "Codex wk ━━──────── 20%",
+  );
 });
 
 test("loading and unavailable statuses have compact neutral presentations", () => {

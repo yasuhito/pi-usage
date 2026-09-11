@@ -87,6 +87,13 @@ export function createWeeklyQuotaUsageLifecycle(
           kind: "available",
           usedPercent: reaction.observation.usage.usedPercent,
           stale: reaction.observation.freshness === "stale",
+          ...(reaction.observation.usage.availableLimitResetCredits ===
+          undefined
+            ? {}
+            : {
+                availableLimitResetCredits:
+                  reaction.observation.usage.availableLimitResetCredits,
+              }),
         });
       }
     }

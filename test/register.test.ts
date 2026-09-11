@@ -56,6 +56,7 @@ function registerFixture() {
               reset_at: 2_000,
             },
           },
+          rate_limit_reset_credits: { available_count: 2 },
         },
       };
     },
@@ -127,7 +128,7 @@ test("session start adapts Pi authentication and quota presentation", async () =
   ]);
   assert.deepEqual(fixture.statuses, [
     { key: "pi-usage", text: "Codex wk loading…" },
-    { key: "pi-usage", text: "Codex wk ━━━━━━──── 63%" },
+    { key: "pi-usage", text: "Codex wk ━━━━━━──── 63% · resets 2" },
   ]);
 });
 
@@ -169,7 +170,7 @@ test("responses from another provider do not enter the lifecycle", async () => {
 
   assert.deepEqual(fixture.statuses.at(-1), {
     key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63%",
+    text: "Codex wk ━━━━━━──── 63% · resets 2",
   });
 });
 

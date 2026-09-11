@@ -12,6 +12,7 @@ export interface WeeklyQuotaUsage {
   readonly usedPercent: number;
   readonly resetsAtMs: number;
   readonly windowPosition: RateLimitWindowPosition;
+  readonly availableLimitResetCredits?: number;
 }
 
 const RATE_LIMIT_FIELD_NAMES = new Set(
@@ -109,13 +110,23 @@ function weeklyQuotaUsageFromProviderValues(
 }
 
 function unsafeUsageFromDedicatedBody(body: unknown): UsageResult {
-  const rateLimit =
-    typeof body === "object" && body !== null
-      ? Reflect.get(body, "rate_limit")
-      : undefined;
+  if (typeof body !== "object" || body === null) {
+    return { kind: "malformed" };
+  }
+  const rateLimit = Reflect.get(body, "rate_limit");
   if (typeof rateLimit !== "object" || rateLimit === null) {
     return { kind: "malformed" };
   }
+
+  const limitResetCredits = Reflect.get(body, "rate_limit_reset_credits");
+  const availableLimitResetCredits =
+    typeof limitResetCredits === "object" && limitResetCredits !== null
+      ? Reflect.get(limitResetCredits, "available_count")
+      : undefined;
+  const hasValidLimitResetCreditCount =
+    typeof availableLimitResetCredits === "number" &&
+    Number.isSafeInteger(availableLimitResetCredits) &&
+    availableLimitResetCredits >= 0;
 
   for (const position of WINDOW_POSITIONS) {
     const window = Reflect.get(rateLimit, `${position}_window`);
@@ -127,6 +138,12 @@ function unsafeUsageFromDedicatedBody(body: unknown): UsageResult {
       Reflect.get(window, "used_percent"),
       Reflect.get(window, "reset_at"),
     );
+    if (result.kind === "observed" && hasValidLimitResetCreditCount) {
+      return {
+        kind: "observed",
+        usage: { ...result.usage, availableLimitResetCredits },
+      };
+    }
     if (result.kind !== "not-weekly") return result;
   }
 
@@ -208,7 +225,13 @@ function usageForPosition(
     resetsAtSeconds,
   );
   if (result.kind === "malformed") return "malformed";
-  return result.kind === "observed" ? result.usage : undefined;
+  if (result.kind !== "observed") return undefined;
+  return baseline?.availableLimitResetCredits === undefined
+    ? result.usage
+    : {
+        ...result.usage,
+        availableLimitResetCredits: baseline.availableLimitResetCredits,
+      };
 }
 
 export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObservationReconciliation {
