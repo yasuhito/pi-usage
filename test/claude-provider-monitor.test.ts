@@ -74,43 +74,6 @@ it.scoped("publishes Claude weekly subscription usage", () =>
   }),
 );
 
-it.scoped("polls every minute using virtual time", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture();
-    yield* f.monitor.start;
-    yield* TestClock.adjust("59999 millis");
-    assert.equal(f.reads(), 1);
-    yield* TestClock.adjust("1 millis");
-    assert.equal(f.reads(), 2);
-    yield* TestClock.adjust("1 minute");
-    assert.equal(f.reads(), 3);
-  }),
-);
-
-it.scoped("keeps the minute poll cadence while a refresh is in flight", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture();
-    yield* f.monitor.start;
-    const gate = yield* Deferred.make<void>();
-    f.setAcquisition(
-      Deferred.await(gate).pipe(
-        Effect.as({
-          usedPercent: 63.4,
-          resetsAtMs: 2_000_000,
-          credentialFingerprint: "fingerprint-1",
-        }),
-      ),
-    );
-    yield* TestClock.adjust("1 minute");
-    assert.equal(f.reads(), 2);
-    yield* TestClock.adjust("65 seconds");
-    assert.equal(f.reads(), 2);
-    yield* Deferred.succeed(gate, undefined);
-    yield* TestClock.adjust("55 seconds");
-    assert.equal(f.reads(), 3);
-  }),
-);
-
 it.scoped("debounces activity for exactly 30 seconds", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
@@ -141,6 +104,42 @@ it.scoped("keeps temporary failures stale for at most ten minutes", () =>
   }),
 );
 
+it.scoped("does not let stale expiration clear newly acquired usage", () =>
+  Effect.gen(function* () {
+    const harness = yield* fixture();
+    yield* harness.monitor.start;
+    harness.setAcquisition(
+      Effect.fail(
+        new TemporaryClaudeSubscriptionUsageFailure({
+          retryAtMs: 2_000_000,
+        }),
+      ),
+    );
+    yield* harness.monitor.refreshForAccountChange;
+    yield* TestClock.adjust("599999 millis");
+    harness.setAcquisition(
+      Effect.sleep("1 millis").pipe(
+        Effect.as({
+          usedPercent: 20,
+          resetsAtMs: 2_000_000,
+          credentialFingerprint: "fingerprint-1",
+        }),
+      ),
+    );
+    const refresh = yield* Effect.fork(harness.monitor.refreshForAccountChange);
+    while (harness.reads() < 3) yield* Effect.yieldNow();
+    yield* TestClock.adjust("1 millis");
+    yield* Fiber.join(refresh);
+
+    assert.deepEqual(harness.statuses.at(-1), {
+      kind: "available",
+      usedPercent: 20,
+      stale: false,
+      weeklyWindowResetsAtMs: 2_000_000,
+    });
+  }),
+);
+
 it.scoped("keeps malformed observations stale until the reset instant", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
@@ -158,75 +157,6 @@ it.scoped("keeps malformed observations stale until the reset instant", () =>
     assert.equal(stale?.kind === "available" && stale.stale, true);
     yield* TestClock.adjust("2 minutes");
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
-  }),
-);
-
-it.scoped("honors a valid provider retry deadline", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture();
-    f.setAcquisition(
-      Effect.fail(
-        new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: 5_000 }),
-      ),
-    );
-    yield* f.monitor.start;
-    yield* TestClock.adjust("4999 millis");
-    assert.equal(f.reads(), 1);
-    yield* TestClock.adjust("1 millis");
-    assert.equal(f.reads(), 2);
-  }),
-);
-
-it.scoped("grows deterministic retry backoff and caps it at one minute", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture();
-    f.setAcquisition(
-      Effect.fail(
-        new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: undefined }),
-      ),
-    );
-    yield* f.monitor.start;
-    assert.equal(f.reads(), 1);
-    for (const [delay, expectedReads] of [
-      [1, 2],
-      [2, 3],
-      [4, 4],
-      [8, 5],
-      [16, 6],
-      [32, 7],
-      [60, 8],
-      [60, 9],
-    ] as const) {
-      yield* TestClock.adjust(`${delay} seconds`);
-      assert.equal(f.reads(), expectedReads);
-    }
-  }),
-);
-
-it.scoped("applies injected deterministic retry jitter", () =>
-  Effect.gen(function* () {
-    let reads = 0;
-    const monitor = yield* makeClaudeProviderMonitor({
-      resolveCredentialIdentity: Effect.succeed({
-        kind: "available" as const,
-        fingerprint: "fingerprint-1",
-      }),
-      acquireClaudeSubscriptionUsage: () => {
-        reads += 1;
-        return Effect.fail(
-          new TemporaryClaudeSubscriptionUsageFailure({
-            retryAtMs: undefined,
-          }),
-        );
-      },
-      publish: () => Effect.void,
-      random: Effect.succeed(1),
-    });
-    yield* monitor.start;
-    yield* TestClock.adjust("1499 millis");
-    assert.equal(reads, 1);
-    yield* TestClock.adjust("1 millis");
-    assert.equal(reads, 2);
   }),
 );
 
@@ -352,6 +282,25 @@ it.scoped("publishes a successful acquisition made with refreshed OAuth", () =>
       weeklyWindowResetsAtMs: 2_000_000,
     });
   }),
+);
+
+it.scoped(
+  "does not publish usage carrying a different credential identity",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* fixture();
+      harness.setAcquisition(
+        Effect.succeed({
+          usedPercent: 90,
+          resetsAtMs: 2_000_000,
+          credentialFingerprint: "fingerprint-2",
+        }),
+      );
+
+      yield* harness.monitor.start;
+
+      assert.deepEqual(harness.statuses, [{ kind: "loading" }]);
+    }),
 );
 
 it.scoped("does not publish an acquisition after its identity changes", () =>

@@ -1,26 +1,21 @@
-import {
-  Cause,
-  Clock,
-  Context,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Random,
-  type Scope,
-  Stream,
-} from "effect";
+import { Cause, Context, Effect, Exit, Layer, type Scope } from "effect";
+
 import type {
   AcquireClaudeSubscriptionUsage,
   AcquiredClaudeSubscriptionUsage,
   ClaudeSubscriptionUsageAcquisitionError,
 } from "./claude-subscription-usage-acquisition.ts";
 import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
-import type { ProviderMonitor } from "./provider-monitor.ts";
+import {
+  makeProviderMonitor,
+  type ProviderMonitor,
+  type ProviderMonitorAdapter,
+  type ProviderMonitorReaction,
+  type ProviderMonitorTransition,
+  type ProviderRefreshContext,
+  type ProviderRefreshPlan,
+} from "./provider-monitor.ts";
 
-const INITIAL_BACKOFF_MS = 1_000;
-const MAX_BACKOFF_MS = 60_000;
-const POLL_INTERVAL_MS = 60_000;
 const REFRESH_DEBOUNCE_MS = 30_000;
 const STALE_AFTER_MS = 10 * 60_000;
 
@@ -56,6 +51,15 @@ interface CapturedUsage {
   readonly stale: boolean;
 }
 
+type AppliedIdentity = ProviderMonitorTransition &
+  (
+    | { readonly available: false }
+    | {
+        readonly available: true;
+        readonly fingerprint: string;
+      }
+  );
+
 function acquisitionResultFromExit(
   exit: Exit.Exit<
     AcquiredClaudeSubscriptionUsage,
@@ -70,10 +74,7 @@ function acquisitionResultFromExit(
   }
   switch (failure.value._tag) {
     case "TemporaryClaudeSubscriptionUsageFailure":
-      return {
-        kind: "temporary",
-        retryAtMs: failure.value.retryAtMs,
-      };
+      return { kind: "temporary", retryAtMs: failure.value.retryAtMs };
     case "MalformedClaudeSubscriptionUsage":
       return { kind: "temporary", retryAtMs: undefined };
     case "ClaudeAuthenticationUnavailable":
@@ -84,292 +85,216 @@ function acquisitionResultFromExit(
   }
 }
 
-/** Builds one session-scoped monitor for direct Claude subscription usage. */
-export function makeClaudeProviderMonitor(
+/** Builds one Claude policy adapter; scheduling stays in provider-monitor. */
+function makeClaudeProviderMonitorAdapter(
   dependencies: ClaudeProviderMonitorDependencies,
-): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
-  return Effect.gen(function* () {
-    const scope = yield* Effect.scope;
-    const gate = yield* Effect.makeSemaphore(1);
-    let generation = 0;
-    let active: Fiber.RuntimeFiber<void> | undefined;
-    let staleFiber: Fiber.RuntimeFiber<void> | undefined;
-    let retryFiber: Fiber.RuntimeFiber<void> | undefined;
-    let identityFingerprint: string | undefined;
-    let terminal = false;
-    let usage: CapturedUsage | undefined;
-    let nextAttemptAt = 0;
-    let consecutiveFailures = 0;
-    let triggerRefresh: (
-      forced: boolean,
-    ) => Effect.Effect<Fiber.RuntimeFiber<void> | undefined> = () =>
-      Effect.succeed(undefined);
-    let refresh: (forced: boolean) => Effect.Effect<void> = () => Effect.void;
+): ProviderMonitorAdapter {
+  let identityFingerprint: string | undefined;
+  let usage: CapturedUsage | undefined;
 
-    const isCurrent = (candidate: number) => generation === candidate;
+  const staleExpirationAtMs = () =>
+    usage?.stale === true
+      ? Math.min(usage.capturedAtMs + STALE_AFTER_MS, usage.usage.resetsAtMs)
+      : undefined;
 
-    const interruptStaleTimer = Effect.suspend(() => {
-      const fiber = staleFiber;
-      staleFiber = undefined;
-      return fiber === undefined ? Effect.void : Fiber.interrupt(fiber);
-    });
+  const reaction = (
+    publication: WeeklySubscriptionUsageStatus | undefined,
+    acquire = false,
+  ): ProviderMonitorReaction => {
+    const deadline = staleExpirationAtMs();
+    return {
+      publication,
+      staleExpiration:
+        deadline === undefined
+          ? { kind: "clear" }
+          : { kind: "arm", atMs: deadline },
+      acquire,
+    };
+  };
 
-    const interruptRetry = Effect.suspend(() => {
-      const fiber = retryFiber;
-      retryFiber = undefined;
-      return fiber === undefined ? Effect.void : Fiber.interrupt(fiber);
-    });
-
-    const publishUsage = (candidate: number): Effect.Effect<void> =>
-      Effect.suspend(() => {
-        if (!isCurrent(candidate)) return Effect.void;
-        if (usage === undefined) {
-          return dependencies.publish({ kind: "unavailable" });
-        }
-        return dependencies.publish({
+  const usageStatus = (): WeeklySubscriptionUsageStatus =>
+    usage === undefined
+      ? { kind: "unavailable" }
+      : {
           kind: "available",
           usedPercent: usage.usage.usedPercent,
           stale: usage.stale,
           weeklyWindowResetsAtMs: usage.usage.resetsAtMs,
-        });
-      });
+        };
 
-    const clearUsage = (candidate: number, publish: boolean) =>
-      Effect.gen(function* () {
-        const hadUsage = usage !== undefined;
-        usage = undefined;
-        yield* interruptStaleTimer;
-        if (publish && (hadUsage || isCurrent(candidate))) {
-          yield* publishUsage(candidate);
-        }
-      });
+  const clearUsage = (publish: boolean) => {
+    usage = undefined;
+    return reaction(publish ? usageStatus() : undefined);
+  };
 
-    const armStaleExpiration = (candidate: number) =>
-      Effect.gen(function* () {
-        yield* interruptStaleTimer;
-        if (usage === undefined || !usage.stale) return;
-        const deadline = Math.min(
-          usage.capturedAtMs + STALE_AFTER_MS,
-          usage.usage.resetsAtMs,
-        );
-        const now = yield* Clock.currentTimeMillis;
-        if (deadline <= now) {
-          yield* clearUsage(candidate, true);
-          return;
-        }
-        staleFiber = yield* Effect.forkIn(
-          Effect.gen(function* () {
-            yield* Effect.sleep(deadline - now);
-            staleFiber = undefined;
-            usage = undefined;
-            yield* publishUsage(generation);
-          }),
-          scope,
-        );
-      });
-
-    const applyIdentity = (
-      resolution: ClaudeCredentialIdentityResolution,
-      candidate: number,
-    ) =>
-      Effect.gen(function* () {
-        if (!isCurrent(candidate)) return false;
-        if (resolution.kind === "missing") {
-          identityFingerprint = undefined;
-          terminal = false;
-          nextAttemptAt = 0;
-          consecutiveFailures = 0;
-          yield* interruptRetry;
-          yield* clearUsage(candidate, true);
-          return false;
-        }
-        if (identityFingerprint !== resolution.fingerprint) {
-          const replacingUsage = usage !== undefined;
-          identityFingerprint = resolution.fingerprint;
-          terminal = false;
-          nextAttemptAt = 0;
-          consecutiveFailures = 0;
-          yield* interruptRetry;
-          yield* clearUsage(candidate, replacingUsage);
-        }
-        return true;
-      });
-
-    const scheduleRetry = (candidate: number, now: number) =>
-      Effect.gen(function* () {
-        yield* interruptRetry;
-        retryFiber = yield* Effect.forkIn(
-          Effect.gen(function* () {
-            yield* Effect.sleep(Math.max(0, nextAttemptAt - now));
-            retryFiber = undefined;
-            if (isCurrent(candidate)) yield* refresh(false);
-          }),
-          scope,
-        );
-      });
-
-    const applyResult = (result: AcquisitionResult, candidate: number) =>
-      Effect.gen(function* () {
-        if (!isCurrent(candidate)) return;
-        const now = yield* Clock.currentTimeMillis;
-        switch (result.kind) {
-          case "acquired":
-            terminal = false;
-            nextAttemptAt = 0;
-            consecutiveFailures = 0;
-            yield* interruptRetry;
-            yield* interruptStaleTimer;
-            usage = { usage: result.usage, capturedAtMs: now, stale: false };
-            yield* publishUsage(candidate);
-            return;
-          case "temporary": {
-            terminal = false;
-            consecutiveFailures += 1;
-            const instructed = result.retryAtMs;
-            if (
-              instructed !== undefined &&
-              Number.isFinite(instructed) &&
-              instructed > now
-            ) {
-              nextAttemptAt = instructed;
-            } else {
-              const base = Math.min(
-                MAX_BACKOFF_MS,
-                INITIAL_BACKOFF_MS * 2 ** (consecutiveFailures - 1),
-              );
-              const random = yield* dependencies.random ?? Random.next;
-              const delay = Math.min(
-                MAX_BACKOFF_MS,
-                Math.max(INITIAL_BACKOFF_MS, base * (0.5 + random)),
-              );
-              nextAttemptAt = now + delay;
-            }
-            if (usage !== undefined) usage = { ...usage, stale: true };
-            yield* publishUsage(candidate);
-            yield* armStaleExpiration(candidate);
-            yield* scheduleRetry(candidate, now);
-            return;
-          }
-          case "authentication-unavailable":
-            terminal = false;
-            nextAttemptAt = 0;
-            consecutiveFailures = 0;
-            yield* interruptRetry;
-            yield* clearUsage(candidate, true);
-            return;
-          case "terminal":
-            terminal = true;
-            nextAttemptAt = 0;
-            consecutiveFailures = 0;
-            yield* interruptRetry;
-            yield* clearUsage(candidate, true);
-            return;
-        }
-      });
-
-    const performRefresh = (candidate: number, forced: boolean) =>
-      Effect.gen(function* () {
-        const resolution = yield* dependencies.resolveCredentialIdentity;
-        if (!(yield* applyIdentity(resolution, candidate))) return;
-        if (!isCurrent(candidate) || (terminal && !forced)) return;
-        const now = yield* Clock.currentTimeMillis;
-        if (!forced && now < nextAttemptAt) return;
-        if (resolution.kind !== "available") return;
-        const acquisitionIdentity = resolution.fingerprint;
-        const result = acquisitionResultFromExit(
-          yield* Effect.exit(dependencies.acquireClaudeSubscriptionUsage()),
-        );
-        if (result === undefined || !isCurrent(candidate)) return;
-        const currentIdentity = yield* dependencies.resolveCredentialIdentity;
-        if (result.kind === "acquired") {
-          if (
-            currentIdentity.kind !== "available" ||
-            currentIdentity.fingerprint !== result.usage.credentialFingerprint
-          ) {
-            yield* applyIdentity(currentIdentity, candidate);
-            return;
-          }
-          yield* applyIdentity(currentIdentity, candidate);
-        } else if (
-          currentIdentity.kind !== "available" ||
-          currentIdentity.fingerprint !== acquisitionIdentity
-        ) {
-          yield* applyIdentity(currentIdentity, candidate);
-          return;
-        }
-        yield* applyResult(result, candidate);
-      });
-
-    triggerRefresh = (forced: boolean) =>
-      gate.withPermits(1)(
-        Effect.gen(function* () {
-          if (!forced && active !== undefined) return undefined;
-          if (forced) {
-            generation += 1;
-            yield* interruptRetry;
-            if (active !== undefined) yield* Fiber.interrupt(active);
-          }
-          const candidate = generation;
-          const created = yield* Effect.forkIn(
-            performRefresh(candidate, forced).pipe(
-              Effect.ensuring(
-                Effect.sync(() => {
-                  if (active === created) active = undefined;
-                }),
-              ),
-            ),
-            scope,
-          );
-          active = created;
-          return created;
-        }),
-      );
-
-    refresh = (forced: boolean): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const fiber = yield* triggerRefresh(forced);
-        if (fiber !== undefined) yield* Fiber.await(fiber);
-      });
-
-    yield* Effect.addFinalizer(() =>
-      Effect.sync(() => {
-        generation += 1;
-        active = undefined;
-        staleFiber = undefined;
-        retryFiber = undefined;
+  const applyIdentity = (
+    resolution: ClaudeCredentialIdentityResolution,
+    context: ProviderRefreshContext,
+  ): Effect.Effect<AppliedIdentity> =>
+    Effect.gen(function* () {
+      if (!(yield* context.isCurrent)) {
+        return {
+          available: false as const,
+          schedule: "preserve",
+          reaction: reaction(undefined),
+        };
+      }
+      if (resolution.kind === "missing") {
         identityFingerprint = undefined;
-        usage = undefined;
-      }),
-    );
+        return {
+          available: false as const,
+          schedule: "reset",
+          reaction: clearUsage(true),
+        };
+      }
+      if (identityFingerprint !== resolution.fingerprint) {
+        const replacingUsage = usage !== undefined;
+        identityFingerprint = resolution.fingerprint;
+        return {
+          available: true as const,
+          fingerprint: resolution.fingerprint,
+          schedule: "reset",
+          reaction: clearUsage(replacingUsage),
+        };
+      }
+      return {
+        available: true as const,
+        fingerprint: resolution.fingerprint,
+        schedule: "preserve",
+        reaction: reaction(undefined),
+      };
+    });
 
-    yield* Effect.forkIn(
-      Stream.tick(POLL_INTERVAL_MS).pipe(
-        Stream.drop(1),
-        Stream.runForEach(() =>
-          Effect.suspend(() => triggerRefresh(false)).pipe(Effect.asVoid),
-        ),
-        Effect.asVoid,
-      ),
-      scope,
-    );
-
-    return {
-      start: dependencies
-        .publish({ kind: "loading" })
-        .pipe(Effect.andThen(refresh(false))),
-      observeResponse: () => Effect.void,
-      refreshAfterActivity: Effect.gen(function* () {
-        const now = yield* Clock.currentTimeMillis;
-        if (
-          usage === undefined ||
-          now - usage.capturedAtMs >= REFRESH_DEBOUNCE_MS
-        ) {
-          yield* refresh(false);
-        }
-      }),
-      refreshForAccountChange: refresh(true),
-    } satisfies ProviderMonitor;
+  const planWithAfter = (
+    directive: ProviderRefreshPlan["directive"],
+    afterDirective: ProviderMonitorReaction,
+    transition?: AppliedIdentity,
+  ): ProviderRefreshPlan => ({
+    ...(transition === undefined ? {} : { transition }),
+    beforeDirective: reaction(undefined),
+    directive,
+    afterDirective,
   });
+
+  const acquire = (
+    acquisitionIdentity: string,
+    context: ProviderRefreshContext,
+  ) =>
+    Effect.gen(function* () {
+      const result = acquisitionResultFromExit(
+        yield* Effect.exit(dependencies.acquireClaudeSubscriptionUsage()),
+      );
+      if (result === undefined || !(yield* context.isCurrent)) {
+        return yield* Effect.interrupt;
+      }
+
+      const currentIdentity = yield* context.resolveIdentity(
+        dependencies.resolveCredentialIdentity,
+      );
+      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
+      if (result.kind === "acquired") {
+        if (
+          currentIdentity.kind !== "available" ||
+          currentIdentity.fingerprint !== result.usage.credentialFingerprint
+        ) {
+          const identity = yield* applyIdentity(currentIdentity, context);
+          return planWithAfter(
+            { kind: "completed" },
+            reaction(undefined),
+            identity,
+          );
+        }
+        const identity = yield* applyIdentity(currentIdentity, context);
+        const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+        usage = { usage: result.usage, capturedAtMs: now, stale: false };
+        return planWithAfter(
+          { kind: "completed" },
+          reaction(usageStatus()),
+          identity,
+        );
+      } else if (
+        currentIdentity.kind !== "available" ||
+        currentIdentity.fingerprint !== acquisitionIdentity
+      ) {
+        const identity = yield* applyIdentity(currentIdentity, context);
+        return planWithAfter(
+          { kind: "completed" },
+          reaction(undefined),
+          identity,
+        );
+      }
+
+      switch (result.kind) {
+        case "temporary":
+          if (usage !== undefined) usage = { ...usage, stale: true };
+          return {
+            beforeDirective: reaction(usageStatus()),
+            directive: {
+              kind: "temporary-failure" as const,
+              retryAtMs: result.retryAtMs,
+            },
+            afterDirective: reaction(undefined),
+          };
+        case "authentication-unavailable":
+          return planWithAfter({ kind: "completed" }, clearUsage(true));
+        case "terminal":
+          return planWithAfter({ kind: "terminal" }, clearUsage(true));
+      }
+    });
+
+  return {
+    prepareRefresh: (context) =>
+      Effect.gen(function* () {
+        const identity = yield* context.resolveIdentity(
+          dependencies.resolveCredentialIdentity.pipe(
+            Effect.flatMap((resolution) => applyIdentity(resolution, context)),
+          ),
+        );
+        if (!identity.available) {
+          return {
+            kind: "skip",
+            schedule: identity.schedule,
+            reaction: identity.reaction,
+          };
+        }
+        return {
+          kind: "ready",
+          schedule: identity.schedule,
+          reaction: identity.reaction,
+          execute: acquire(identity.fingerprint, context),
+        };
+      }),
+    observeActivity: (now) =>
+      Effect.sync(() =>
+        reaction(
+          undefined,
+          usage === undefined ||
+            now - usage.capturedAtMs >= REFRESH_DEBOUNCE_MS,
+        ),
+      ),
+    staleExpirationReached: (deadline) =>
+      Effect.sync(() => {
+        if (!usage?.stale || staleExpirationAtMs() !== deadline) {
+          return reaction(undefined);
+        }
+        usage = undefined;
+        return reaction({ kind: "unavailable" });
+      }),
+    finalize: Effect.sync(() => {
+      identityFingerprint = undefined;
+      usage = undefined;
+    }),
+  };
+}
+
+/** Builds one session-scoped monitor for direct Claude subscription usage. */
+export function makeClaudeProviderMonitor(
+  dependencies: ClaudeProviderMonitorDependencies,
+): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
+  return makeProviderMonitor(
+    makeClaudeProviderMonitorAdapter(dependencies),
+    dependencies,
+  );
 }
 
 export const claudeProviderMonitorLayer = (
