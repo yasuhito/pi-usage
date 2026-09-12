@@ -28,7 +28,11 @@ For local development:
 pi -e .
 ```
 
-Sign in to Pi's `openai-codex` and `anthropic` providers with `/login`. Both providers are monitored even when another model is selected. Missing or unsuitable authentication remains visible as unavailable.
+## Authentication
+
+Sign in to Pi's `openai-codex` and `anthropic` providers with `/login`. Codex and Claude are both monitored by default, even when another model is selected. There are no provider settings in this release: missing or unsuitable authentication leaves that provider visible as `unavailable` rather than removing it.
+
+Claude subscription usage requires the OAuth authentication that Pi resolves after a Claude Pro or Max login. An ordinary Anthropic API key is not suitable and is never sent to the subscription usage endpoint. The extension asks Pi to resolve authentication at request time; it does not read Pi or Claude Code credential files.
 
 ## Display
 
@@ -39,11 +43,18 @@ Sign in to Pi's `openai-codex` and `anthropic` providers with `/login`. Both pro
 | Temporarily stale | `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2 ~ Claude wk ━━━━━━━━── 80% · reset 4d 1h ~` |
 | Unavailable | `Codex wk unavailable Claude wk unavailable` |
 
-Each percentage is the provider-reported **weekly subscription usage**. Codex's percentage is weighted **weekly quota usage**, not a token count divided by a fixed token limit. Each bar has ten cells. A provider's presentation independently becomes a warning at 75% and an error at 90%.
+Each percentage is provider-reported **weekly subscription usage**. The two providers retain different meanings:
+
+- **Codex weekly quota usage** is the consumed percentage of the account's weighted weekly allowance, not a token count divided by a fixed token limit.
+- **Claude subscription usage** is the consumed percentage of the Claude Pro or Max seven-day window.
+- **Anthropic API-key rate limits** are request and token capacity for API use. They are not Claude subscription usage and are not shown.
+- **OpenRouter usage** concerns OpenRouter keys, spending, and limits. It is not direct Claude subscription usage and is not shown, including when a Claude model is routed through OpenRouter.
+
+Each bar has ten cells. A provider's presentation independently becomes a warning at 75% and an error at 90%.
 
 The `reset` suffix is the remaining time until the provider-reported weekly window reset. It uses compact day/hour, hour/minute, or minute units.
 
-The `↻N` suffix is the provider-reported number of available **limit reset credits**. It appears when Codex supplies the count, including when the count is zero.
+The `↻N` suffix is the provider-reported number of available **limit reset credits**. It is Codex-only and appears when Codex supplies the count, including when the count is zero.
 
 ## How it works
 
@@ -54,13 +65,21 @@ polling, backoff, stale expiration, and interruption. Provider-specific
 decoding stays behind small Effect interfaces; Pi event handlers are the only
 runtime boundary.
 
-It does not read Codex or Claude Code credential files, spawn their CLIs, estimate quota from local token history, persist credentials, or follow redirects.
+### Security posture
+
+Authenticated requests are restricted to fixed HTTPS origins: `https://chatgpt.com` for Codex and `https://api.anthropic.com` for Claude. Redirects are rejected, requests time out, and response bodies are bounded before schema validation. Credentials, usage observations, and raw provider responses are neither logged nor persisted.
+
+The extension does not spawn provider CLIs or estimate quota from local token history.
+
+## Current scope
+
+This release does not implement OpenRouter usage, provider settings, Claude's five-hour window, detail commands, or manual refresh. Refreshes use the built-in schedule.
 
 ## Compatibility warning
 
-The ChatGPT usage endpoint, `x-codex-*` headers, and Claude OAuth usage endpoint are **not documented as stable public APIs**. The extension parses them defensively and displays `unavailable` if their format changes.
+The Codex ChatGPT usage endpoint and the Claude OAuth usage endpoint are undocumented first-party interfaces. The `x-codex-*` headers are undocumented as well. None has a public compatibility guarantee, and any may change without notice. The extension isolates and parses them defensively and displays `unavailable` when a response no longer matches the expected contract.
 
-See [`docs/research/codex-weekly-usage.md`](docs/research/codex-weekly-usage.md) and [`docs/research/codex-limit-reset-credits.md`](docs/research/codex-limit-reset-credits.md) for source comparisons and rationale.
+See [`docs/research/codex-weekly-usage.md`](docs/research/codex-weekly-usage.md), [`docs/research/codex-limit-reset-credits.md`](docs/research/codex-limit-reset-credits.md), and [`docs/research/claude-oauth-usage-prototype.md`](docs/research/claude-oauth-usage-prototype.md) for sanitized source comparisons and rationale.
 
 ## Development
 
