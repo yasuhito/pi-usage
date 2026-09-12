@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { test } from "vitest";
 
 import type { CodexCredential } from "../src/dedicated-weekly-quota-acquisition.ts";
 import { registerWeeklyQuotaUsage } from "../src/register.ts";

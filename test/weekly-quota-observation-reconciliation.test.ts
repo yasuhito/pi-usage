@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 
 import type { AcquiredWeeklyQuotaUsage } from "../src/dedicated-weekly-quota-acquisition.ts";
 import { createWeeklyQuotaObservationReconciliation } from "../src/weekly-quota-observation-reconciliation.ts";
