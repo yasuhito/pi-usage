@@ -234,6 +234,44 @@ it.scoped(
     }),
 );
 
+it.scoped("retries temporary failures at their independent deadline", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    yield* TestClock.adjust("31 seconds");
+    f.setAcquisition(
+      Effect.fail(new TemporaryAcquisitionFailure({ retryAtMs: undefined })),
+    );
+    yield* f.monitor.refreshForAccountChange;
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("999 millis");
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("1 millis");
+    assert.equal(f.reads(), 3);
+  }),
+);
+
+it.scoped("replaces an obsolete instructed retry deadline", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    yield* TestClock.adjust("31 seconds");
+    f.setAcquisition(
+      Effect.fail(new TemporaryAcquisitionFailure({ retryAtMs: 100_000 })),
+    );
+    yield* f.monitor.refreshForAccountChange;
+    f.setAcquisition(
+      Effect.fail(new TemporaryAcquisitionFailure({ retryAtMs: undefined })),
+    );
+    yield* f.monitor.refreshForAccountChange;
+    assert.equal(f.reads(), 3);
+    yield* TestClock.adjust("1999 millis");
+    assert.equal(f.reads(), 3);
+    yield* TestClock.adjust("1 millis");
+    assert.equal(f.reads(), 4);
+  }),
+);
+
 it.scoped("permanent unavailability discards prior usage", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
@@ -241,6 +279,23 @@ it.scoped("permanent unavailability discards prior usage", () =>
     f.setAcquisition(Effect.fail(new PermanentAcquisitionFailure()));
     yield* f.monitor.refreshForAccountChange;
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+    const readsAtTerminalState = f.reads();
+    yield* TestClock.adjust("1 minute");
+    assert.equal(f.reads(), readsAtTerminalState);
+    yield* f.monitor.refreshForAccountChange;
+    assert.equal(f.reads(), readsAtTerminalState + 1);
+  }),
+);
+
+it.scoped("keeps checking for a Codex credential while unavailable", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setResolution({ kind: "missing" });
+    yield* f.monitor.start;
+    f.setResolution({ kind: "available", credential: credential() });
+    yield* TestClock.adjust("1 minute");
+    assert.equal(f.reads(), 1);
+    assert.equal(f.statuses.at(-1)?.kind, "available");
   }),
 );
 

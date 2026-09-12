@@ -3,6 +3,7 @@ import { it } from "@effect/vitest";
 import { Effect, Exit, Fiber, TestClock } from "effect";
 
 import {
+  claudeCredentialFingerprint,
   createAcquireClaudeSubscriptionUsage,
   type ResolveClaudeAuthentication,
 } from "../src/claude-subscription-usage-acquisition.ts";
@@ -224,6 +225,42 @@ it.effect(
       }
     }),
 );
+
+it.effect("honors valid Retry-After instructions", () =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      acquire(
+        async () =>
+          new Response(null, {
+            status: 429,
+            headers: { "retry-after": "7" },
+          }),
+      ),
+    );
+    assert.equal(
+      Exit.isFailure(exit) && exit.cause._tag === "Fail"
+        ? Reflect.get(exit.cause.error, "retryAtMs")
+        : undefined,
+      7_000,
+    );
+  }),
+);
+
+it("creates a normalized non-reversible credential identity", () => {
+  const fingerprint = claudeCredentialFingerprint({
+    source: "OAuth",
+    auth: { apiKey: "  secret  " },
+  });
+  assert.equal(fingerprint?.length, 64);
+  assert.equal(fingerprint?.includes("secret"), false);
+  assert.equal(
+    fingerprint,
+    claudeCredentialFingerprint({
+      source: "OAuth",
+      auth: { apiKey: "secret" },
+    }),
+  );
+});
 
 it.effect("enforces the five-second timeout", () =>
   Effect.gen(function* () {

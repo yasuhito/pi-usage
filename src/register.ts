@@ -7,7 +7,10 @@ import {
   ClaudeProviderMonitorService,
   claudeProviderMonitorLayer,
 } from "./claude-provider-monitor.ts";
-import type { AcquireClaudeSubscriptionUsage } from "./claude-subscription-usage-acquisition.ts";
+import {
+  type AcquireClaudeSubscriptionUsage,
+  claudeCredentialFingerprint,
+} from "./claude-subscription-usage-acquisition.ts";
 import {
   type CodexCredentialResolution,
   codexProviderMonitorLayer,
@@ -80,6 +83,20 @@ function credentialFromContext(
       ? headerAccountId
       : accountIdFromAccessToken(accessToken);
   return accountId === undefined ? undefined : { accessToken, accountId };
+}
+
+function claudeCredentialIdentityResolution(ctx: ExtensionContext) {
+  return Effect.tryPromise(() =>
+    ctx.modelRegistry.getProviderAuth("anthropic"),
+  ).pipe(
+    Effect.map((authentication) => {
+      const fingerprint = claudeCredentialFingerprint(authentication);
+      return fingerprint === undefined
+        ? { kind: "missing" as const }
+        : { kind: "available" as const, fingerprint };
+    }),
+    Effect.catchAll(() => Effect.succeed({ kind: "missing" as const })),
+  );
 }
 
 function credentialResolution(ctx: ExtensionContext) {
@@ -181,6 +198,7 @@ export function registerWeeklySubscriptionUsage(
           : { random: dependencies.random }),
       }),
       claudeProviderMonitorLayer({
+        resolveCredentialIdentity: claudeCredentialIdentityResolution(ctx),
         acquireClaudeSubscriptionUsage:
           dependencies.acquireClaudeSubscriptionUsage(ctx),
         publish: publish("Claude"),
@@ -222,17 +240,12 @@ export function registerWeeklySubscriptionUsage(
   pi.on("agent_settled", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     const candidate = session;
-    if (candidate !== undefined)
-      await run(
-        candidate,
-        Effect.all(
-          [
-            candidate.codexMonitor.refreshAfterActivity,
-            candidate.claudeMonitor.refreshAfterActivity,
-          ],
-          { concurrency: "unbounded" },
-        ).pipe(Effect.asVoid),
-      );
+    if (candidate === undefined) return;
+    if (ctx.model?.provider === "openai-codex") {
+      await run(candidate, candidate.codexMonitor.refreshAfterActivity);
+    } else if (ctx.model?.provider === "anthropic") {
+      await run(candidate, candidate.claudeMonitor.refreshAfterActivity);
+    }
   });
 
   pi.on("model_select", async (_event, ctx) => {

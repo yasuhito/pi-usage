@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Clock, Data, Effect, Schema } from "effect";
 import { readBoundedResponseBody } from "./bounded-response-body.ts";
 
@@ -29,7 +30,7 @@ export class ClaudeAuthenticationRejected extends Data.TaggedError(
 ) {}
 export class TemporaryClaudeSubscriptionUsageFailure extends Data.TaggedError(
   "TemporaryClaudeSubscriptionUsageFailure",
-) {}
+)<{ readonly retryAtMs: number | undefined }> {}
 export class PermanentClaudeSubscriptionUsageFailure extends Data.TaggedError(
   "PermanentClaudeSubscriptionUsageFailure",
 ) {}
@@ -69,6 +70,30 @@ function oauthKey(
   return key === undefined || key === "" ? undefined : key;
 }
 
+/** Returns only a non-reversible, session-memory-safe identity for eligible OAuth. */
+export function claudeCredentialFingerprint(
+  authentication: ClaudeAuthentication | undefined,
+): string | undefined {
+  const key = oauthKey(authentication);
+  return key === undefined
+    ? undefined
+    : createHash("sha256").update(key).digest("hex");
+}
+
+function retryAtMs(response: Response, now: number): number | undefined {
+  const rawValue = response.headers.get("retry-after");
+  if (rawValue === null) return undefined;
+  if (/^\d+$/.test(rawValue)) {
+    const retryAt = now + Number(rawValue) * 1_000;
+    return Number.isFinite(retryAt) ? retryAt : undefined;
+  }
+  const retryAt = Date.parse(rawValue);
+  return Number.isFinite(retryAt) &&
+    new Date(retryAt).toUTCString() === rawValue
+    ? retryAt
+    : undefined;
+}
+
 function requestUsage(
   fetchImplementation: typeof fetch,
   key: string,
@@ -81,7 +106,8 @@ function requestUsage(
         redirect: "manual",
         signal,
       }),
-    catch: () => new TemporaryClaudeSubscriptionUsageFailure(),
+    catch: () =>
+      new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: undefined }),
   });
 }
 
@@ -98,7 +124,15 @@ function classifyResponse(
     response.status === 429 ||
     response.status >= 500
   ) {
-    return Effect.fail(new TemporaryClaudeSubscriptionUsageFailure());
+    return Clock.currentTimeMillis.pipe(
+      Effect.flatMap((now) =>
+        Effect.fail(
+          new TemporaryClaudeSubscriptionUsageFailure({
+            retryAtMs: retryAtMs(response, now),
+          }),
+        ),
+      ),
+    );
   }
   return Effect.fail(new PermanentClaudeSubscriptionUsageFailure());
 }
@@ -124,7 +158,10 @@ export function createAcquireClaudeSubscriptionUsage(
         response,
         MAX_RESPONSE_BYTES,
         () => new MalformedClaudeSubscriptionUsage(),
-        () => new TemporaryClaudeSubscriptionUsageFailure(),
+        () =>
+          new TemporaryClaudeSubscriptionUsageFailure({
+            retryAtMs: undefined,
+          }),
       );
       let unknownBody: unknown;
       try {
@@ -152,7 +189,10 @@ export function createAcquireClaudeSubscriptionUsage(
       Effect.flatMap(decodeUsage),
       Effect.timeoutFail({
         duration: REQUEST_TIMEOUT_MS,
-        onTimeout: () => new TemporaryClaudeSubscriptionUsageFailure(),
+        onTimeout: () =>
+          new TemporaryClaudeSubscriptionUsageFailure({
+            retryAtMs: undefined,
+          }),
       }),
     );
 

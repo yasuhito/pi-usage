@@ -84,15 +84,24 @@ export function makeCodexProviderMonitor(
     let generation = 0;
     let active: Fiber.RuntimeFiber<void> | undefined;
     let staleFiber: Fiber.RuntimeFiber<void> | undefined;
+    let retryFiber: Fiber.RuntimeFiber<void> | undefined;
     let staleDeadline: number | undefined;
     let credentialAvailable = false;
+    let terminal = false;
     let currentAccountId: string | undefined;
     let resolvingAccounts = 0;
     let accountChangesInFlight = 0;
     let nextAttemptAt = 0;
     let consecutiveFailures = 0;
+    let refresh: (forced: boolean) => Effect.Effect<void> = () => Effect.void;
 
     const isCurrent = (candidate: number) => candidate === generation;
+
+    const interruptRetry = Effect.suspend(() => {
+      const fiber = retryFiber;
+      retryFiber = undefined;
+      return fiber === undefined ? Effect.void : Fiber.interrupt(fiber);
+    });
 
     const publishReaction = (
       reaction: WeeklyQuotaObservationReaction,
@@ -169,16 +178,20 @@ export function makeCodexProviderMonitor(
         if (!isCurrent(candidate)) return undefined;
         if (resolution.kind === "missing") {
           credentialAvailable = false;
+          terminal = false;
           currentAccountId = undefined;
+          yield* interruptRetry;
           yield* invalidateAccount(candidate);
           yield* dependencies.publish({ kind: "unavailable" });
           return undefined;
         }
         if (resolution.kind === "invalid") {
           credentialAvailable = true;
+          terminal = false;
           currentAccountId = undefined;
           nextAttemptAt = 0;
           consecutiveFailures = 0;
+          yield* interruptRetry;
           yield* invalidateAccount(candidate);
           yield* dependencies.publish({ kind: "unavailable" });
           return undefined;
@@ -186,8 +199,10 @@ export function makeCodexProviderMonitor(
         credentialAvailable = true;
         if (currentAccountId !== resolution.credential.accountId) {
           currentAccountId = resolution.credential.accountId;
+          terminal = false;
           nextAttemptAt = 0;
           consecutiveFailures = 0;
+          yield* interruptRetry;
           yield* invalidateAccount(candidate);
         }
         return resolution.credential;
@@ -206,6 +221,19 @@ export function makeCodexProviderMonitor(
         return yield* applyCredential(resolution, candidate);
       });
 
+    const scheduleRetry = (candidate: number, now: number) =>
+      Effect.gen(function* () {
+        yield* interruptRetry;
+        retryFiber = yield* Effect.forkIn(
+          Effect.gen(function* () {
+            yield* Effect.sleep(Math.max(0, nextAttemptAt - now));
+            retryFiber = undefined;
+            if (isCurrent(candidate)) yield* refresh(false);
+          }),
+          scope,
+        );
+      });
+
     const applyResult = (
       result: DedicatedWeeklyQuotaAcquisitionResult,
       candidate: number,
@@ -213,25 +241,32 @@ export function makeCodexProviderMonitor(
       Effect.gen(function* () {
         if (!isCurrent(candidate)) return;
         const now = yield* Clock.currentTimeMillis;
+        terminal = result.kind === "permanently-unavailable";
         if (result.kind === "temporary-failure") {
           consecutiveFailures += 1;
           if (
             result.retryAtMs !== undefined &&
-            Number.isFinite(result.retryAtMs)
+            Number.isFinite(result.retryAtMs) &&
+            result.retryAtMs > now
           ) {
             nextAttemptAt = result.retryAtMs;
-          }
-          if (nextAttemptAt <= now) {
+          } else {
             const base = Math.min(
               MAX_BACKOFF_MS,
               INITIAL_BACKOFF_MS * 2 ** (consecutiveFailures - 1),
             );
             const random = yield* dependencies.random ?? Random.next;
-            nextAttemptAt = now + base * (0.5 + random);
+            const delay = Math.min(
+              MAX_BACKOFF_MS,
+              Math.max(INITIAL_BACKOFF_MS, base * (0.5 + random)),
+            );
+            nextAttemptAt = now + delay;
           }
+          yield* scheduleRetry(candidate, now);
         } else {
           nextAttemptAt = 0;
           consecutiveFailures = 0;
+          yield* interruptRetry;
         }
         yield* publishReaction(
           reconciliation.advance(
@@ -245,7 +280,12 @@ export function makeCodexProviderMonitor(
     const performRefresh = (candidate: number, ignoreBackoff: boolean) =>
       Effect.gen(function* () {
         let credential = yield* resolve(candidate);
-        if (credential === undefined || !isCurrent(candidate)) return;
+        if (
+          credential === undefined ||
+          !isCurrent(candidate) ||
+          (terminal && !ignoreBackoff)
+        )
+          return;
         const now = yield* Clock.currentTimeMillis;
         if (!ignoreBackoff && now < nextAttemptAt) {
           yield* publishReaction(
@@ -277,13 +317,14 @@ export function makeCodexProviderMonitor(
         yield* applyResult(result, candidate);
       });
 
-    const refresh = (forced: boolean): Effect.Effect<void> =>
+    refresh = (forced: boolean): Effect.Effect<void> =>
       Effect.gen(function* () {
         const fiber = yield* gate.withPermits(1)(
           Effect.gen(function* () {
             if (!forced && active !== undefined) return active;
             if (forced) {
               generation += 1;
+              yield* interruptRetry;
               if (active !== undefined) yield* Fiber.interrupt(active);
             }
             const candidate = generation;
@@ -316,8 +357,10 @@ export function makeCodexProviderMonitor(
       Effect.sync(() => {
         generation += 1;
         credentialAvailable = false;
+        terminal = false;
         active = undefined;
         staleFiber = undefined;
+        retryFiber = undefined;
         staleDeadline = undefined;
       }),
     );
@@ -325,11 +368,7 @@ export function makeCodexProviderMonitor(
     yield* Effect.forkIn(
       Stream.repeatEffect(
         Effect.sleep(POLL_INTERVAL_MS).pipe(
-          Effect.andThen(
-            Effect.suspend(() =>
-              credentialAvailable ? refresh(false) : Effect.void,
-            ),
-          ),
+          Effect.andThen(Effect.suspend(() => refresh(false))),
         ),
       ).pipe(Stream.runDrain),
       scope,

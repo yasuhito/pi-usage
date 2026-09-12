@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
-import { Effect, TestClock } from "effect";
+import { Deferred, Effect, Fiber, TestClock } from "effect";
 
 import { makeClaudeProviderMonitor } from "../src/claude-provider-monitor.ts";
 import {
   type AcquiredClaudeSubscriptionUsage,
+  MalformedClaudeSubscriptionUsage,
   PermanentClaudeSubscriptionUsageFailure,
   TemporaryClaudeSubscriptionUsageFailure,
 } from "../src/claude-subscription-usage-acquisition.ts";
@@ -16,10 +17,21 @@ function fixture() {
       AcquiredClaudeSubscriptionUsage,
       | TemporaryClaudeSubscriptionUsageFailure
       | PermanentClaudeSubscriptionUsageFailure
+      | MalformedClaudeSubscriptionUsage
     > = Effect.succeed({ usedPercent: 63.4, resetsAtMs: 2_000_000 });
+    let identity: string | undefined = "fingerprint-1";
+    let reads = 0;
     const statuses: WeeklySubscriptionUsageStatus[] = [];
     const monitor = yield* makeClaudeProviderMonitor({
-      acquireClaudeSubscriptionUsage: () => acquisition,
+      resolveCredentialIdentity: Effect.sync(() =>
+        identity === undefined
+          ? { kind: "missing" as const }
+          : { kind: "available" as const, fingerprint: identity },
+      ),
+      acquireClaudeSubscriptionUsage: () => {
+        reads += 1;
+        return acquisition;
+      },
       publish: (status) =>
         Effect.sync(() => {
           statuses.push(status);
@@ -29,6 +41,10 @@ function fixture() {
     return {
       monitor,
       statuses,
+      reads: () => reads,
+      setIdentity: (value: string | undefined) => {
+        identity = value;
+      },
       setAcquisition: (value: typeof acquisition) => {
         acquisition = value;
       },
@@ -57,13 +73,48 @@ it.scoped("keeps temporary failures stale for at most ten minutes", () =>
     const f = yield* fixture();
     yield* f.monitor.start;
     f.setAcquisition(
-      Effect.fail(new TemporaryClaudeSubscriptionUsageFailure()),
+      Effect.fail(
+        new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: undefined }),
+      ),
     );
     yield* f.monitor.refreshForAccountChange;
     const stale = f.statuses.at(-1);
     assert.equal(stale?.kind === "available" && stale.stale, true);
     yield* TestClock.adjust("10 minutes");
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+  }),
+);
+
+it.scoped("keeps malformed observations stale until the reset instant", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setAcquisition(Effect.succeed({ usedPercent: 50, resetsAtMs: 120_000 }));
+    yield* f.monitor.start;
+    f.setAcquisition(Effect.fail(new MalformedClaudeSubscriptionUsage()));
+    yield* f.monitor.refreshForAccountChange;
+    const stale = f.statuses.at(-1);
+    assert.equal(stale?.kind === "available" && stale.stale, true);
+    yield* TestClock.adjust("2 minutes");
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+  }),
+);
+
+it.scoped("retries temporary failures at the independent deadline", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    yield* TestClock.adjust("31 seconds");
+    f.setAcquisition(
+      Effect.fail(
+        new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: undefined }),
+      ),
+    );
+    yield* f.monitor.refreshForAccountChange;
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("999 millis");
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("1 millis");
+    assert.equal(f.reads(), 3);
   }),
 );
 
@@ -75,5 +126,104 @@ it.scoped("turns terminal acquisition failures into unavailable", () =>
     );
     yield* f.monitor.start;
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+    yield* TestClock.adjust("1 minute");
+    assert.equal(f.reads(), 1);
+    f.setAcquisition(
+      Effect.fail(
+        new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: undefined }),
+      ),
+    );
+    yield* f.monitor.refreshForAccountChange;
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("1 second");
+    assert.equal(f.reads(), 3);
+  }),
+);
+
+it.scoped("keeps checking for credentials while unavailable", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setIdentity(undefined);
+    yield* f.monitor.start;
+    assert.equal(f.reads(), 0);
+    f.setIdentity("fingerprint-2");
+    yield* TestClock.adjust("1 minute");
+    assert.equal(f.reads(), 1);
+    assert.equal(f.statuses.at(-1)?.kind, "available");
+  }),
+);
+
+it.scoped("clears old usage before acquiring for a new identity", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    const pending = yield* Deferred.make<void>();
+    f.setIdentity("fingerprint-2");
+    f.setAcquisition(
+      Deferred.await(pending).pipe(
+        Effect.as({ usedPercent: 20, resetsAtMs: 2_000_000 }),
+      ),
+    );
+    const refresh = yield* Effect.fork(f.monitor.refreshForAccountChange);
+    while (f.reads() < 2) yield* Effect.yieldNow();
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+    yield* Deferred.succeed(pending, undefined);
+    yield* Fiber.join(refresh);
+    assert.deepEqual(f.statuses.at(-1), {
+      kind: "available",
+      usedPercent: 20,
+      stale: false,
+      weeklyWindowResetsAtMs: 2_000_000,
+    });
+  }),
+);
+
+it.scoped("does not publish an acquisition after its identity changes", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setIdentity(undefined);
+    yield* f.monitor.start;
+    f.setIdentity("fingerprint-1");
+    const pending = yield* Deferred.make<void>();
+    f.setAcquisition(
+      Deferred.await(pending).pipe(
+        Effect.as({ usedPercent: 90, resetsAtMs: 2_000_000 }),
+      ),
+    );
+    const refresh = yield* Effect.fork(f.monitor.refreshAfterActivity);
+    while (f.reads() < 1) yield* Effect.yieldNow();
+    f.setIdentity("fingerprint-2");
+    yield* Deferred.succeed(pending, undefined);
+    yield* Fiber.join(refresh);
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+  }),
+);
+
+it.scoped("coalesces ordinary refreshes and supersedes old identities", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setIdentity(undefined);
+    yield* f.monitor.start;
+    f.setIdentity("fingerprint-1");
+    const oldGate = yield* Deferred.make<void>();
+    f.setAcquisition(
+      Deferred.await(oldGate).pipe(
+        Effect.as({ usedPercent: 90, resetsAtMs: 2_000_000 }),
+      ),
+    );
+    const first = yield* Effect.fork(f.monitor.refreshAfterActivity);
+    const second = yield* Effect.fork(f.monitor.refreshAfterActivity);
+    while (f.reads() < 1) yield* Effect.yieldNow();
+    assert.equal(f.reads(), 1);
+    f.setIdentity("fingerprint-2");
+    f.setAcquisition(
+      Effect.succeed({ usedPercent: 20, resetsAtMs: 2_000_000 }),
+    );
+    yield* f.monitor.refreshForAccountChange;
+    yield* Fiber.await(first);
+    yield* Fiber.await(second);
+    assert.equal(f.reads(), 2);
+    const latest = f.statuses.at(-1);
+    assert.equal(latest?.kind === "available" && latest.usedPercent, 20);
   }),
 );

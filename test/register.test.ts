@@ -8,6 +8,7 @@ import { test } from "vitest";
 
 import {
   type AcquiredClaudeSubscriptionUsage,
+  ClaudeAuthenticationUnavailable,
   PermanentClaudeSubscriptionUsageFailure,
 } from "../src/claude-subscription-usage-acquisition.ts";
 import type {
@@ -49,9 +50,10 @@ function registerFixture() {
     windowPosition: "secondary",
     availableLimitResetCredits: 2,
   });
+  let claudeReads = 0;
   let claudeAcquisition: Effect.Effect<
     AcquiredClaudeSubscriptionUsage,
-    PermanentClaudeSubscriptionUsageFailure
+    PermanentClaudeSubscriptionUsageFailure | ClaudeAuthenticationUnavailable
   > = Effect.succeed({ usedPercent: 80, resetsAtMs: 2_000_000 });
 
   registerWeeklySubscriptionUsage(pi, {
@@ -61,7 +63,10 @@ function registerFixture() {
       observedCredentials.push(credential);
       return acquisition;
     },
-    acquireClaudeSubscriptionUsage: () => () => claudeAcquisition,
+    acquireClaudeSubscriptionUsage: () => () => {
+      claudeReads += 1;
+      return claudeAcquisition;
+    },
   });
 
   const ctx = {
@@ -72,8 +77,8 @@ function registerFixture() {
       return { provider };
     },
     modelRegistry: {
-      getProviderAuth: async () =>
-        authEnabled
+      getProviderAuth: async (providerName: string) =>
+        providerName !== "openai-codex" || authEnabled
           ? {
               auth: { apiKey: accessTokenFor("account-1") },
               source: "OAuth" as const,
@@ -99,6 +104,7 @@ function registerFixture() {
   return {
     emit,
     observedCredentials,
+    claudeReads: () => claudeReads,
     statuses,
     setMode: (value: ExtensionContext["mode"]) => {
       mode = value;
@@ -189,6 +195,28 @@ test("non-TUI sessions perform no work", async () => {
   await f.emit("session_start");
   assert.equal(f.observedCredentials.length, 0);
   assert.equal(f.statuses.length, 0);
+});
+
+test("activity refreshes only the direct provider that handled it", async () => {
+  const f = registerFixture();
+  f.setClaudeAcquisition(Effect.fail(new ClaudeAuthenticationUnavailable()));
+  await f.emit("session_start");
+  assert.equal(f.observedCredentials.length, 1);
+  assert.equal(f.claudeReads(), 1);
+
+  f.setClaudeAcquisition(
+    Effect.succeed({ usedPercent: 20, resetsAtMs: 2_000_000 }),
+  );
+  f.setProvider("anthropic");
+  await f.emit("agent_settled");
+  assert.equal(f.observedCredentials.length, 1);
+  assert.equal(f.claudeReads(), 2);
+
+  f.setProvider("openrouter");
+  await f.emit("agent_settled");
+  assert.equal(f.observedCredentials.length, 1);
+  assert.equal(f.claudeReads(), 2);
+  await f.emit("session_shutdown");
 });
 
 test("responses from another provider are ignored", async () => {
