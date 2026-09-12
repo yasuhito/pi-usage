@@ -27,14 +27,10 @@ function lifecycleFixture() {
   let acquisitionGate: Promise<void> | undefined;
   let acquisitionResult: DedicatedWeeklyQuotaAcquisitionResult = {
     kind: "acquired",
-    body: {
-      rate_limit: {
-        secondary_window: {
-          used_percent: 63.4,
-          limit_window_seconds: 7 * 24 * 60 * 60,
-          reset_at: 2_000,
-        },
-      },
+    usage: {
+      usedPercent: 63.4,
+      resetsAtMs: 2_000_000,
+      windowPosition: "secondary",
     },
   };
   let disableAuthAfterUsageReads: number | undefined;

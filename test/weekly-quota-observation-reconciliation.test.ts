@@ -1,36 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { AcquiredWeeklyQuotaUsage } from "../src/dedicated-weekly-quota-acquisition.ts";
 import { createWeeklyQuotaObservationReconciliation } from "../src/weekly-quota-observation-reconciliation.ts";
 
-const WEEK_SECONDS = 7 * 24 * 60 * 60;
 const NOW = 1_000_000;
-
-function dedicatedBody(
-  usedPercent = 63,
-  position: "primary" | "secondary" = "secondary",
-  resetsAtSeconds = 4_000,
-): unknown {
-  return {
-    rate_limit: {
-      [`${position}_window`]: {
-        limit_window_seconds: WEEK_SECONDS,
-        used_percent: usedPercent,
-        reset_at: resetsAtSeconds,
-      },
-    },
-  };
-}
 
 function observeDedicated(
   reconciliation: ReturnType<typeof createWeeklyQuotaObservationReconciliation>,
   nowMs = NOW,
-  body: unknown = dedicatedBody(),
+  usage: AcquiredWeeklyQuotaUsage = {
+    usedPercent: 63,
+    resetsAtMs: 4_000_000,
+    windowPosition: "secondary",
+  },
 ) {
   return reconciliation.advance(
     {
       kind: "dedicated-weekly-quota-acquisition",
-      result: { kind: "acquired", body },
+      result: { kind: "acquired", usage },
     },
     nowMs,
   );
@@ -63,39 +51,27 @@ function usageState(
   };
 }
 
-test("interprets the weekly window from dedicated acquisition evidence", () => {
+test("records weekly quota usage from dedicated acquisition", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
-  const body = {
-    rate_limit: {
-      primary_window: {
-        limit_window_seconds: 18_000,
-        used_percent: 12,
-        reset_at: 2_000,
-      },
-      secondary_window: {
-        limit_window_seconds: WEEK_SECONDS,
-        used_percent: 63.4,
-        reset_at: 4_000,
-      },
-    },
-  };
 
-  const reaction = observeDedicated(reconciliation, NOW, body);
+  const reaction = observeDedicated(reconciliation);
 
   assert.deepEqual(reaction, {
-    observation: usageState(63.4),
+    observation: usageState(63),
     publication: "replace",
     staleExpirationAtMs: undefined,
     acquireDedicated: false,
   });
 });
 
-test("captures an available limit reset credit count from dedicated evidence", () => {
+test("preserves dedicated limit reset credits across passive observation", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
-  const body = dedicatedBody() as Record<string, unknown>;
-  body.rate_limit_reset_credits = { available_count: 2 };
-
-  const dedicated = observeDedicated(reconciliation, NOW, body);
+  const dedicated = observeDedicated(reconciliation, NOW, {
+    usedPercent: 63,
+    resetsAtMs: 4_000_000,
+    windowPosition: "secondary",
+    availableLimitResetCredits: 2,
+  });
   const passive = observePassive(reconciliation, {
     "x-codex-primary-used-percent": "64",
     "x-codex-primary-window-minutes": "10080",
@@ -115,53 +91,18 @@ test("captures an available limit reset credit count from dedicated evidence", (
   });
 });
 
-test("ignores malformed optional limit reset credit evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
-  const body = dedicatedBody() as Record<string, unknown>;
-  body.rate_limit_reset_credits = { available_count: -1 };
-
-  assert.deepEqual(
-    observeDedicated(reconciliation, NOW, body).observation,
-    usageState(63),
-  );
-});
-
-test("rejects a dedicated reset time that overflows epoch milliseconds", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
-
-  const reaction = observeDedicated(
-    reconciliation,
-    NOW,
-    dedicatedBody(63, "secondary", Number.MAX_VALUE),
-  );
-
-  assert.deepEqual(reaction.observation, { kind: "none" });
-  assert.equal(reaction.publication, "replace");
-});
-
-test("treats inaccessible dedicated evidence as malformed", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
-  const body = new Proxy(
-    {},
-    {
-      get() {
-        throw new Error("inaccessible provider evidence");
-      },
-    },
-  );
-
-  const reaction = observeDedicated(reconciliation, NOW, body);
-
-  assert.deepEqual(reaction.observation, { kind: "none" });
-  assert.equal(reaction.publication, "replace");
-});
-
 test("malformed dedicated evidence clears all observation evidence", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
   });
-  observeDedicated(reconciliation, NOW, { rate_limit: {} });
+  reconciliation.advance(
+    {
+      kind: "dedicated-weekly-quota-acquisition",
+      result: { kind: "malformed-observation" },
+    },
+    NOW,
+  );
 
   const reaction = observePassive(reconciliation, {
     "x-codex-primary-used-percent": "74",

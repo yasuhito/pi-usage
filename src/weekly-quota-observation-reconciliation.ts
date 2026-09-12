@@ -1,19 +1,15 @@
-import type { DedicatedWeeklyQuotaAcquisitionResult } from "./dedicated-weekly-quota-acquisition.ts";
+import type {
+  AcquiredWeeklyQuotaUsage,
+  DedicatedWeeklyQuotaAcquisitionResult,
+} from "./dedicated-weekly-quota-acquisition.ts";
 
-const WEEK_SECONDS = 7 * 24 * 60 * 60;
-const WEEK_MINUTES = WEEK_SECONDS / 60;
+const PASSIVE_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
 const STALE_AFTER_MS = 10 * 60 * 1_000;
 const REFRESH_DEBOUNCE_MS = 30_000;
 const WINDOW_POSITIONS = ["primary", "secondary"] as const;
 
-export type RateLimitWindowPosition = (typeof WINDOW_POSITIONS)[number];
-
-export interface WeeklyQuotaUsage {
-  readonly usedPercent: number;
-  readonly resetsAtMs: number;
-  readonly windowPosition: RateLimitWindowPosition;
-  readonly availableLimitResetCredits?: number;
-}
+type RateLimitWindowPosition = AcquiredWeeklyQuotaUsage["windowPosition"];
+export type WeeklyQuotaUsage = AcquiredWeeklyQuotaUsage;
 
 const RATE_LIMIT_FIELD_NAMES = new Set(
   WINDOW_POSITIONS.flatMap((position) => [
@@ -87,7 +83,9 @@ function weeklyQuotaUsageFromProviderValues(
   usedPercent: unknown,
   resetsAtSeconds: unknown,
 ): UsageResult {
-  if (durationSeconds !== WEEK_SECONDS) return { kind: "not-weekly" };
+  if (durationSeconds !== PASSIVE_WEEKLY_WINDOW_MINUTES * 60) {
+    return { kind: "not-weekly" };
+  }
   if (
     typeof usedPercent !== "number" ||
     !Number.isFinite(usedPercent) ||
@@ -107,55 +105,6 @@ function weeklyQuotaUsageFromProviderValues(
       windowPosition: position,
     },
   };
-}
-
-function unsafeUsageFromDedicatedBody(body: unknown): UsageResult {
-  if (typeof body !== "object" || body === null) {
-    return { kind: "malformed" };
-  }
-  const rateLimit = Reflect.get(body, "rate_limit");
-  if (typeof rateLimit !== "object" || rateLimit === null) {
-    return { kind: "malformed" };
-  }
-
-  const limitResetCredits = Reflect.get(body, "rate_limit_reset_credits");
-  const availableLimitResetCredits =
-    typeof limitResetCredits === "object" && limitResetCredits !== null
-      ? Reflect.get(limitResetCredits, "available_count")
-      : undefined;
-  const hasValidLimitResetCreditCount =
-    typeof availableLimitResetCredits === "number" &&
-    Number.isSafeInteger(availableLimitResetCredits) &&
-    availableLimitResetCredits >= 0;
-
-  for (const position of WINDOW_POSITIONS) {
-    const window = Reflect.get(rateLimit, `${position}_window`);
-    if (typeof window !== "object" || window === null) continue;
-
-    const result = weeklyQuotaUsageFromProviderValues(
-      position,
-      Reflect.get(window, "limit_window_seconds"),
-      Reflect.get(window, "used_percent"),
-      Reflect.get(window, "reset_at"),
-    );
-    if (result.kind === "observed" && hasValidLimitResetCreditCount) {
-      return {
-        kind: "observed",
-        usage: { ...result.usage, availableLimitResetCredits },
-      };
-    }
-    if (result.kind !== "not-weekly") return result;
-  }
-
-  return { kind: "malformed" };
-}
-
-function usageFromDedicatedBody(body: unknown): UsageResult {
-  try {
-    return unsafeUsageFromDedicatedBody(body);
-  } catch {
-    return { kind: "malformed" };
-  }
 }
 
 function entriesFromProviderFields(
@@ -190,7 +139,7 @@ function usageForPosition(
     rawDuration === undefined
       ? prior === undefined
         ? undefined
-        : WEEK_MINUTES
+        : PASSIVE_WEEKLY_WINDOW_MINUTES
       : parseFiniteNumber(rawDuration);
   const usedPercent =
     rawUsedPercent === undefined
@@ -339,12 +288,7 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         case "dedicated-weekly-quota-acquisition": {
           const { result } = event;
           if (result.kind === "acquired") {
-            const usage = usageFromDedicatedBody(result.body);
-            if (usage.kind === "observed") {
-              recordUsage(usage.usage, nowMs);
-            } else {
-              discardAll();
-            }
+            recordUsage(result.usage, nowMs);
           } else if (result.kind === "temporary-failure") {
             return staleOrUnavailable(nowMs);
           } else if (result.kind === "malformed-observation") {

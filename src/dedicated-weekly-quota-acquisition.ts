@@ -1,14 +1,25 @@
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 5_000;
+const DEDICATED_WEEKLY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+const DEDICATED_WINDOW_POSITIONS = ["primary", "secondary"] as const;
+
+type RateLimitWindowPosition = (typeof DEDICATED_WINDOW_POSITIONS)[number];
 
 export interface CodexCredential {
   readonly accessToken: string;
   readonly accountId: string;
 }
 
+export interface AcquiredWeeklyQuotaUsage {
+  readonly usedPercent: number;
+  readonly resetsAtMs: number;
+  readonly windowPosition: RateLimitWindowPosition;
+  readonly availableLimitResetCredits?: number;
+}
+
 export type DedicatedWeeklyQuotaAcquisitionResult =
-  | { readonly kind: "acquired"; readonly body: unknown }
+  | { readonly kind: "acquired"; readonly usage: AcquiredWeeklyQuotaUsage }
   | { readonly kind: "authentication-rejected" }
   | {
       readonly kind: "temporary-failure";
@@ -80,6 +91,60 @@ function retryAtMs(response: Response, now: number): number | undefined {
     : undefined;
 }
 
+function weeklyQuotaUsageFromProviderBody(
+  body: unknown,
+): AcquiredWeeklyQuotaUsage | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+
+  const rateLimit = Reflect.get(body, "rate_limit");
+  if (typeof rateLimit !== "object" || rateLimit === null) return undefined;
+
+  const limitResetCredits = Reflect.get(body, "rate_limit_reset_credits");
+  const availableLimitResetCredits =
+    typeof limitResetCredits === "object" && limitResetCredits !== null
+      ? Reflect.get(limitResetCredits, "available_count")
+      : undefined;
+  const hasValidLimitResetCreditCount =
+    typeof availableLimitResetCredits === "number" &&
+    Number.isSafeInteger(availableLimitResetCredits) &&
+    availableLimitResetCredits >= 0;
+
+  for (const position of DEDICATED_WINDOW_POSITIONS) {
+    const window = Reflect.get(rateLimit, `${position}_window`);
+    if (typeof window !== "object" || window === null) continue;
+    if (
+      Reflect.get(window, "limit_window_seconds") !==
+      DEDICATED_WEEKLY_WINDOW_SECONDS
+    ) {
+      continue;
+    }
+
+    const usedPercent = Reflect.get(window, "used_percent");
+    const resetsAtSeconds = Reflect.get(window, "reset_at");
+    if (
+      typeof usedPercent !== "number" ||
+      !Number.isFinite(usedPercent) ||
+      typeof resetsAtSeconds !== "number" ||
+      !Number.isFinite(resetsAtSeconds) ||
+      resetsAtSeconds <= 0
+    ) {
+      return undefined;
+    }
+
+    const resetsAtMs = resetsAtSeconds * 1_000;
+    if (!Number.isFinite(resetsAtMs)) return undefined;
+
+    return {
+      usedPercent,
+      resetsAtMs,
+      windowPosition: position,
+      ...(hasValidLimitResetCreditCount ? { availableLimitResetCredits } : {}),
+    };
+  }
+
+  return undefined;
+}
+
 export function createAcquireDedicatedWeeklyQuotaUsage(
   dependencies: DedicatedWeeklyQuotaAcquisitionDependencies,
 ): AcquireDedicatedWeeklyQuotaUsage {
@@ -129,7 +194,12 @@ export function createAcquireDedicatedWeeklyQuotaUsage(
       if (responseText === undefined) return { kind: "malformed-observation" };
 
       try {
-        return { kind: "acquired", body: JSON.parse(responseText) };
+        const usage = weeklyQuotaUsageFromProviderBody(
+          JSON.parse(responseText) as unknown,
+        );
+        return usage === undefined
+          ? { kind: "malformed-observation" }
+          : { kind: "acquired", usage };
       } catch {
         return { kind: "malformed-observation" };
       }
