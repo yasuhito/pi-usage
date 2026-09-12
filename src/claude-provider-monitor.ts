@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Exit, Layer, type Scope } from "effect";
+import { Context, Effect, type Exit, Layer, type Scope } from "effect";
 
 import type {
   AcquireClaudeSubscriptionUsage,
@@ -7,13 +7,17 @@ import type {
 } from "./claude-subscription-usage-acquisition.ts";
 import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 import {
+  classifyProviderAcquisitionExit,
   makeProviderMonitor,
+  type ProviderAcquisitionCompletion,
+  type ProviderAcquisitionDisposition,
+  type ProviderAcquisitionInspection,
+  type ProviderCredentialInspection,
   type ProviderMonitor,
   type ProviderMonitorAdapter,
-  type ProviderMonitorReaction,
-  type ProviderMonitorTransition,
-  type ProviderRefreshContext,
-  type ProviderRefreshPlan,
+  type ProviderMonitorContext,
+  providerAcquisitionDefect,
+  type WeeklySubscriptionUsageChange,
 } from "./provider-monitor.ts";
 
 const REFRESH_DEBOUNCE_MS = 30_000;
@@ -43,7 +47,8 @@ type AcquisitionResult =
     }
   | { readonly kind: "temporary"; readonly retryAtMs: number | undefined }
   | { readonly kind: "authentication-unavailable" }
-  | { readonly kind: "terminal" };
+  | { readonly kind: "terminal" }
+  | Extract<ProviderAcquisitionDisposition, { readonly kind: "defect" }>;
 
 interface CapturedUsage {
   readonly usage: AcquiredClaudeSubscriptionUsage;
@@ -51,14 +56,7 @@ interface CapturedUsage {
   readonly stale: boolean;
 }
 
-type AppliedIdentity = ProviderMonitorTransition &
-  (
-    | { readonly available: false }
-    | {
-        readonly available: true;
-        readonly fingerprint: string;
-      }
-  );
+type InspectedIdentity = ProviderCredentialInspection<string>;
 
 function acquisitionResultFromExit(
   exit: Exit.Exit<
@@ -66,22 +64,26 @@ function acquisitionResultFromExit(
     ClaudeSubscriptionUsageAcquisitionError
   >,
 ): AcquisitionResult | undefined {
-  if (Exit.isSuccess(exit)) return { kind: "acquired", usage: exit.value };
-  if (Cause.isInterruptedOnly(exit.cause)) return undefined;
-  const failure = Cause.failureOption(exit.cause);
-  if (failure._tag === "None") {
-    return { kind: "temporary", retryAtMs: undefined };
-  }
-  switch (failure.value._tag) {
-    case "TemporaryClaudeSubscriptionUsageFailure":
-      return { kind: "temporary", retryAtMs: failure.value.retryAtMs };
-    case "MalformedClaudeSubscriptionUsage":
-      return { kind: "temporary", retryAtMs: undefined };
-    case "ClaudeAuthenticationUnavailable":
-    case "ClaudeAuthenticationRejected":
-      return { kind: "authentication-unavailable" };
-    case "PermanentClaudeSubscriptionUsageFailure":
-      return { kind: "terminal" };
+  const result = classifyProviderAcquisitionExit(exit);
+  switch (result.kind) {
+    case "acquired":
+      return { kind: "acquired", usage: result.value };
+    case "interrupted":
+      return undefined;
+    case "defect":
+      return result;
+    case "failed":
+      switch (result.error._tag) {
+        case "TemporaryClaudeSubscriptionUsageFailure":
+          return { kind: "temporary", retryAtMs: result.error.retryAtMs };
+        case "MalformedClaudeSubscriptionUsage":
+          return { kind: "temporary", retryAtMs: undefined };
+        case "ClaudeAuthenticationUnavailable":
+        case "ClaudeAuthenticationRejected":
+          return { kind: "authentication-unavailable" };
+        case "PermanentClaudeSubscriptionUsageFailure":
+          return { kind: "terminal" };
+      }
   }
 }
 
@@ -97,10 +99,10 @@ function makeClaudeProviderMonitorAdapter(
       ? Math.min(usage.capturedAtMs + STALE_AFTER_MS, usage.usage.resetsAtMs)
       : undefined;
 
-  const reaction = (
+  const change = (
     publication: WeeklySubscriptionUsageStatus | undefined,
     acquire = false,
-  ): ProviderMonitorReaction => {
+  ): WeeklySubscriptionUsageChange => {
     const deadline = staleExpirationAtMs();
     return {
       publication,
@@ -124,149 +126,145 @@ function makeClaudeProviderMonitorAdapter(
 
   const clearUsage = (publish: boolean) => {
     usage = undefined;
-    return reaction(publish ? usageStatus() : undefined);
+    return change(publish ? usageStatus() : undefined);
   };
 
   const applyIdentity = (
     resolution: ClaudeCredentialIdentityResolution,
-    context: ProviderRefreshContext,
-  ): Effect.Effect<AppliedIdentity> =>
+    context: ProviderMonitorContext,
+  ): Effect.Effect<InspectedIdentity> =>
     Effect.gen(function* () {
-      if (!(yield* context.isCurrent)) {
-        return {
-          available: false as const,
-          schedule: "preserve",
-          reaction: reaction(undefined),
-        };
-      }
+      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
       if (resolution.kind === "missing") {
         identityFingerprint = undefined;
         return {
-          available: false as const,
-          schedule: "reset",
-          reaction: clearUsage(true),
+          continuity: "unavailable",
+          credential: undefined,
+          change: clearUsage(true),
         };
       }
       if (identityFingerprint !== resolution.fingerprint) {
         const replacingUsage = usage !== undefined;
         identityFingerprint = resolution.fingerprint;
         return {
-          available: true as const,
-          fingerprint: resolution.fingerprint,
-          schedule: "reset",
-          reaction: clearUsage(replacingUsage),
+          continuity: "changed",
+          credential: resolution.fingerprint,
+          change: clearUsage(replacingUsage),
         };
       }
       return {
-        available: true as const,
-        fingerprint: resolution.fingerprint,
-        schedule: "preserve",
-        reaction: reaction(undefined),
+        continuity: "unchanged",
+        credential: resolution.fingerprint,
+        change: change(undefined),
       };
     });
 
-  const planWithAfter = (
-    directive: ProviderRefreshPlan["directive"],
-    afterDirective: ProviderMonitorReaction,
-    transition?: AppliedIdentity,
-  ): ProviderRefreshPlan => ({
-    ...(transition === undefined ? {} : { transition }),
-    beforeDirective: reaction(undefined),
-    directive,
-    afterDirective,
-  });
+  const inspectIdentity = (context: ProviderMonitorContext) =>
+    context.withoutPassiveObservation(
+      dependencies.resolveCredentialIdentity.pipe(
+        Effect.flatMap((resolution) => applyIdentity(resolution, context)),
+      ),
+    );
 
   const acquire = (
     acquisitionIdentity: string,
-    context: ProviderRefreshContext,
-  ) =>
+    context: ProviderMonitorContext,
+  ): Effect.Effect<ProviderAcquisitionCompletion> =>
     Effect.gen(function* () {
       const result = acquisitionResultFromExit(
         yield* Effect.exit(dependencies.acquireClaudeSubscriptionUsage()),
       );
-      if (result === undefined || !(yield* context.isCurrent)) {
-        return yield* Effect.interrupt;
+      if (result === undefined) return yield* Effect.interrupt;
+
+      const currentIdentity = yield* inspectIdentity(context);
+      if (
+        result.kind === "acquired" &&
+        currentIdentity.credential === result.usage.credentialFingerprint
+      ) {
+        const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+        if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
+        usage = { usage: result.usage, capturedAtMs: now, stale: false };
+        return {
+          continuity: currentIdentity.continuity,
+          changes: [currentIdentity.change, change(usageStatus())],
+          disposition: { kind: "completed" },
+        };
       }
 
-      const currentIdentity = yield* context.resolveIdentity(
-        dependencies.resolveCredentialIdentity,
-      );
-      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
-      if (result.kind === "acquired") {
-        if (
-          currentIdentity.kind !== "available" ||
-          currentIdentity.fingerprint !== result.usage.credentialFingerprint
-        ) {
-          const identity = yield* applyIdentity(currentIdentity, context);
-          return planWithAfter(
-            { kind: "completed" },
-            reaction(undefined),
-            identity,
-          );
-        }
-        const identity = yield* applyIdentity(currentIdentity, context);
-        const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-        usage = { usage: result.usage, capturedAtMs: now, stale: false };
-        return planWithAfter(
-          { kind: "completed" },
-          reaction(usageStatus()),
-          identity,
-        );
-      } else if (
-        currentIdentity.kind !== "available" ||
-        currentIdentity.fingerprint !== acquisitionIdentity
+      if (
+        currentIdentity.credential === undefined ||
+        currentIdentity.credential !== acquisitionIdentity
       ) {
-        const identity = yield* applyIdentity(currentIdentity, context);
-        return planWithAfter(
-          { kind: "completed" },
-          reaction(undefined),
-          identity,
-        );
+        return {
+          continuity: currentIdentity.continuity,
+          changes: [currentIdentity.change],
+          disposition: { kind: "completed" },
+        };
       }
 
       switch (result.kind) {
+        case "acquired":
+          return {
+            continuity: currentIdentity.continuity,
+            changes: [currentIdentity.change],
+            disposition: { kind: "completed" },
+          };
         case "temporary":
           if (usage !== undefined) usage = { ...usage, stale: true };
           return {
-            beforeDirective: reaction(usageStatus()),
-            directive: {
-              kind: "temporary-failure" as const,
+            continuity: currentIdentity.continuity,
+            changes: [currentIdentity.change, change(usageStatus())],
+            disposition: {
+              kind: "retry",
               retryAtMs: result.retryAtMs,
             },
-            afterDirective: reaction(undefined),
           };
         case "authentication-unavailable":
-          return planWithAfter({ kind: "completed" }, clearUsage(true));
+          return {
+            continuity: currentIdentity.continuity,
+            changes: [currentIdentity.change, clearUsage(true)],
+            disposition: { kind: "completed" },
+          };
         case "terminal":
-          return planWithAfter({ kind: "terminal" }, clearUsage(true));
+          return {
+            continuity: currentIdentity.continuity,
+            changes: [currentIdentity.change, clearUsage(true)],
+            disposition: { kind: "terminal" },
+          };
+        case "defect": {
+          const defect = providerAcquisitionDefect(result.cause);
+          return {
+            ...defect,
+            continuity: currentIdentity.continuity,
+            changes: [currentIdentity.change, ...defect.changes],
+          };
+        }
       }
     });
 
   return {
-    prepareRefresh: (context) =>
+    inspectAcquisition: (
+      context,
+    ): Effect.Effect<ProviderAcquisitionInspection> =>
       Effect.gen(function* () {
-        const identity = yield* context.resolveIdentity(
-          dependencies.resolveCredentialIdentity.pipe(
-            Effect.flatMap((resolution) => applyIdentity(resolution, context)),
-          ),
-        );
-        if (!identity.available) {
+        const identity = yield* inspectIdentity(context);
+        if (identity.credential === undefined) {
           return {
-            kind: "skip",
-            schedule: identity.schedule,
-            reaction: identity.reaction,
+            kind: "blocked",
+            continuity: "unavailable",
+            change: identity.change,
           };
         }
         return {
           kind: "ready",
-          schedule: identity.schedule,
-          reaction: identity.reaction,
-          execute: acquire(identity.fingerprint, context),
+          continuity: identity.continuity,
+          change: identity.change,
+          acquire: acquire(identity.credential, context),
         };
       }),
     observeActivity: (now) =>
       Effect.sync(() =>
-        reaction(
+        change(
           undefined,
           usage === undefined ||
             now - usage.capturedAtMs >= REFRESH_DEBOUNCE_MS,
@@ -275,10 +273,10 @@ function makeClaudeProviderMonitorAdapter(
     staleExpirationReached: (deadline) =>
       Effect.sync(() => {
         if (!usage?.stale || staleExpirationAtMs() !== deadline) {
-          return reaction(undefined);
+          return change(undefined);
         }
         usage = undefined;
-        return reaction({ kind: "unavailable" });
+        return change({ kind: "unavailable" });
       }),
     finalize: Effect.sync(() => {
       identityFingerprint = undefined;

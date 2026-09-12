@@ -151,7 +151,9 @@ export function makeWeeklySubscriptionUsageLifecycle(): Effect.Effect<WeeklySubs
         yield* runInSessionScope(
           candidate,
           Effect.all(
-            [candidate.codexMonitor.start, candidate.claudeMonitor.start],
+            [candidate.codexMonitor.start, candidate.claudeMonitor.start].map(
+              (start) => start.pipe(Effect.catchAllCause(() => Effect.void)),
+            ),
             { concurrency: "unbounded" },
           ).pipe(Effect.asVoid),
         );
@@ -184,7 +186,9 @@ export function makeWeeklySubscriptionUsageLifecycle(): Effect.Effect<WeeklySubs
           [
             candidate.codexMonitor.refreshForAccountChange,
             candidate.claudeMonitor.refreshForAccountChange,
-          ],
+          ].map((refresh) =>
+            refresh.pipe(Effect.catchAllCause(() => Effect.void)),
+          ),
           { concurrency: "unbounded" },
         ).pipe(Effect.asVoid),
       ),

@@ -1,4 +1,4 @@
-import { Cause, Effect, Exit, Layer, type Scope } from "effect";
+import { Effect, type Exit, Layer, type Scope } from "effect";
 
 import type {
   AcquireDedicatedWeeklyQuotaUsage,
@@ -9,15 +9,19 @@ import type {
 } from "./dedicated-weekly-quota-acquisition.ts";
 import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 import {
+  classifyProviderAcquisitionExit,
   makeProviderMonitor,
-  noProviderMonitorReaction,
+  noWeeklySubscriptionUsageChange,
+  type ProviderAcquisitionCompletion,
+  type ProviderAcquisitionDisposition,
+  type ProviderAcquisitionInspection,
+  type ProviderCredentialInspection,
   type ProviderMonitor,
   type ProviderMonitorAdapter,
-  type ProviderMonitorReaction,
+  type ProviderMonitorContext,
   ProviderMonitorService,
-  type ProviderMonitorTransition,
-  type ProviderRefreshContext,
-  type ProviderRefreshPlan,
+  providerAcquisitionDefect,
+  type WeeklySubscriptionUsageChange,
 } from "./provider-monitor.ts";
 import {
   createWeeklyQuotaObservationReconciliation,
@@ -28,6 +32,10 @@ export type CodexCredentialResolution =
   | { readonly kind: "missing" }
   | { readonly kind: "invalid" }
   | { readonly kind: "available"; readonly credential: CodexCredential };
+
+type AcquisitionExitResult =
+  | DedicatedWeeklyQuotaAcquisitionResult
+  | Extract<ProviderAcquisitionDisposition, { readonly kind: "defect" }>;
 
 export interface CodexProviderMonitorDependencies {
   readonly resolveCredential: Effect.Effect<CodexCredentialResolution>;
@@ -43,24 +51,30 @@ function acquisitionResultFromExit(
     AcquiredWeeklyQuotaUsage,
     DedicatedWeeklyQuotaAcquisitionError
   >,
-): DedicatedWeeklyQuotaAcquisitionResult | undefined {
-  if (Exit.isSuccess(exit)) return { kind: "acquired", usage: exit.value };
-  if (Cause.isInterruptedOnly(exit.cause)) return undefined;
-  const failure = Cause.failureOption(exit.cause);
-  if (failure._tag === "None") {
-    return { kind: "temporary-failure", retryAtMs: undefined };
+): AcquisitionExitResult | undefined {
+  const result = classifyProviderAcquisitionExit(exit);
+  switch (result.kind) {
+    case "acquired":
+      return { kind: "acquired", usage: result.value };
+    case "interrupted":
+      return undefined;
+    case "defect":
+      return result;
+    case "failed":
+      switch (result.error._tag) {
+        case "AuthenticationRejected":
+          return { kind: "authentication-rejected" };
+        case "TemporaryAcquisitionFailure":
+          return {
+            kind: "temporary-failure",
+            retryAtMs: result.error.retryAtMs,
+          };
+        case "PermanentAcquisitionFailure":
+          return { kind: "permanently-unavailable" };
+        case "MalformedAcquisition":
+          return { kind: "malformed-observation" };
+      }
   }
-  switch (failure.value._tag) {
-    case "AuthenticationRejected":
-      return { kind: "authentication-rejected" };
-    case "TemporaryAcquisitionFailure":
-      return { kind: "temporary-failure", retryAtMs: failure.value.retryAtMs };
-    case "PermanentAcquisitionFailure":
-      return { kind: "permanently-unavailable" };
-    case "MalformedAcquisition":
-      return { kind: "malformed-observation" };
-  }
-  return { kind: "temporary-failure", retryAtMs: undefined };
 }
 
 function publicationFromReaction(
@@ -80,9 +94,9 @@ function publicationFromReaction(
   };
 }
 
-function monitorReaction(
+function monitorChange(
   reaction: WeeklyQuotaObservationReaction,
-): ProviderMonitorReaction {
+): WeeklySubscriptionUsageChange {
   return {
     publication: publicationFromReaction(reaction),
     staleExpiration:
@@ -93,12 +107,12 @@ function monitorReaction(
   };
 }
 
-function directiveFromResult(
+function dispositionFromResult(
   result: DedicatedWeeklyQuotaAcquisitionResult,
-): ProviderRefreshPlan["directive"] {
+): ProviderAcquisitionDisposition {
   switch (result.kind) {
     case "temporary-failure":
-      return { kind: "temporary-failure", retryAtMs: result.retryAtMs };
+      return { kind: "retry", retryAtMs: result.retryAtMs };
     case "permanently-unavailable":
       return { kind: "terminal" };
     default:
@@ -115,58 +129,35 @@ function makeCodexProviderMonitorAdapter(
   let currentAccountId: string | undefined;
   let expectedStaleExpirationAtMs: number | undefined;
 
-  const adaptReaction = (reaction: WeeklyQuotaObservationReaction) => {
+  const adaptChange = (reaction: WeeklyQuotaObservationReaction) => {
     expectedStaleExpirationAtMs = reaction.staleExpirationAtMs;
-    return monitorReaction(reaction);
+    return monitorChange(reaction);
   };
 
   const invalidateAccount = () =>
     Effect.gen(function* () {
       const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-      return adaptReaction(
+      return adaptChange(
         reconciliation.advance({ kind: "account-selection-invalidated" }, now),
       );
     });
 
   const applyCredential = (
     resolution: CodexCredentialResolution,
-    context: ProviderRefreshContext,
-  ): Effect.Effect<
-    ProviderMonitorTransition & {
-      readonly credential: CodexCredential | undefined;
-    }
-  > =>
+    context: ProviderMonitorContext,
+  ): Effect.Effect<ProviderCredentialInspection<CodexCredential>> =>
     Effect.gen(function* () {
-      if (!(yield* context.isCurrent)) {
-        return {
-          credential: undefined,
-          schedule: "preserve",
-          reaction: noProviderMonitorReaction(),
-        };
-      }
-      if (resolution.kind === "missing") {
-        credentialAvailable = false;
+      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
+      if (resolution.kind === "missing" || resolution.kind === "invalid") {
+        credentialAvailable = resolution.kind === "invalid";
         currentAccountId = undefined;
-        const reaction = yield* invalidateAccount();
+        const change = yield* invalidateAccount();
         return {
+          continuity: "unavailable" as const,
           credential: undefined,
-          schedule: "pause-retry",
-          reaction: {
-            ...reaction,
-            publication: reaction.publication ?? { kind: "unavailable" },
-          },
-        };
-      }
-      if (resolution.kind === "invalid") {
-        credentialAvailable = true;
-        currentAccountId = undefined;
-        const reaction = yield* invalidateAccount();
-        return {
-          credential: undefined,
-          schedule: "reset",
-          reaction: {
-            ...reaction,
-            publication: reaction.publication ?? { kind: "unavailable" },
+          change: {
+            ...change,
+            publication: change.publication ?? { kind: "unavailable" },
           },
         };
       }
@@ -174,110 +165,136 @@ function makeCodexProviderMonitorAdapter(
       if (currentAccountId !== resolution.credential.accountId) {
         currentAccountId = resolution.credential.accountId;
         return {
+          continuity: "changed" as const,
           credential: resolution.credential,
-          schedule: "reset",
-          reaction: yield* invalidateAccount(),
+          change: yield* invalidateAccount(),
         };
       }
-      credentialAvailable = true;
       return {
+        continuity: "unchanged" as const,
         credential: resolution.credential,
-        schedule: "preserve",
-        reaction: noProviderMonitorReaction(),
+        change: noWeeklySubscriptionUsageChange(),
       };
     });
 
-  const resolveCredential = (context: ProviderRefreshContext) =>
-    context.resolveIdentity(
+  const inspectCredential = (context: ProviderMonitorContext) =>
+    context.withoutPassiveObservation(
       dependencies.resolveCredential.pipe(
         Effect.flatMap((resolution) => applyCredential(resolution, context)),
       ),
     );
 
-  const planFromResult = (
+  const completionFromResult = (
     result: DedicatedWeeklyQuotaAcquisitionResult,
-  ): Effect.Effect<ProviderRefreshPlan> =>
+    context: ProviderMonitorContext,
+  ): Effect.Effect<ProviderAcquisitionCompletion> =>
     Effect.gen(function* () {
+      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
       const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
       return {
-        beforeDirective: noProviderMonitorReaction(),
-        directive: directiveFromResult(result),
-        afterDirective: adaptReaction(
-          reconciliation.advance(
-            { kind: "dedicated-weekly-quota-acquisition", result },
-            now,
+        changes: [
+          adaptChange(
+            reconciliation.advance(
+              { kind: "dedicated-weekly-quota-acquisition", result },
+              now,
+            ),
           ),
-        ),
+        ],
+        disposition: dispositionFromResult(result),
       };
     });
 
-  const acquisitionResult = (
-    credential: CodexCredential,
-    context: ProviderRefreshContext,
-  ) =>
+  const acquisitionResult = (credential: CodexCredential) =>
     Effect.gen(function* () {
       const result = acquisitionResultFromExit(
         yield* Effect.exit(
           dependencies.acquireDedicatedWeeklyQuotaUsage(credential),
         ),
       );
-      if (result === undefined || !(yield* context.isCurrent)) {
-        return yield* Effect.interrupt;
-      }
+      if (result === undefined) return yield* Effect.interrupt;
       return result;
     });
 
   const completeAcquisition = (
     credential: CodexCredential,
-    context: ProviderRefreshContext,
+    context: ProviderMonitorContext,
   ) =>
-    acquisitionResult(credential, context).pipe(Effect.flatMap(planFromResult));
+    acquisitionResult(credential).pipe(
+      Effect.flatMap((result) =>
+        result.kind === "defect"
+          ? Effect.succeed(providerAcquisitionDefect(result.cause))
+          : completionFromResult(result, context),
+      ),
+    );
 
   const acquire = (
     credential: CodexCredential,
-    context: ProviderRefreshContext,
+    context: ProviderMonitorContext,
   ) =>
     Effect.gen(function* () {
-      const result = yield* acquisitionResult(credential, context);
-      if (result.kind === "authentication-rejected") {
-        const refreshed = yield* resolveCredential(context);
-        if (refreshed.credential === undefined || !(yield* context.isCurrent)) {
-          return {
-            kind: "stop" as const,
-            transition: refreshed,
-          };
-        }
+      const result = yield* acquisitionResult(credential);
+      if (result.kind === "defect") {
+        return providerAcquisitionDefect(result.cause);
+      }
+      if (result.kind !== "authentication-rejected") {
+        return yield* completionFromResult(result, context);
+      }
+
+      const refreshed = yield* inspectCredential(context);
+      if (refreshed.credential === undefined) {
         return {
-          kind: "continue" as const,
-          transition: refreshed,
-          execute: completeAcquisition(refreshed.credential, context),
+          continuity: "unavailable" as const,
+          changes: [refreshed.change],
+          disposition: { kind: "completed" as const },
         };
       }
-      return yield* planFromResult(result);
+      const completion = yield* completeAcquisition(
+        refreshed.credential,
+        context,
+      );
+      return {
+        ...completion,
+        continuity: refreshed.continuity,
+        changes: [refreshed.change, ...completion.changes],
+      };
     });
 
   return {
-    prepareRefresh: (context) =>
+    inspectAcquisition: (
+      context,
+    ): Effect.Effect<ProviderAcquisitionInspection> =>
       Effect.gen(function* () {
-        const resolved = yield* resolveCredential(context);
-        if (resolved.credential === undefined) {
+        const inspected = yield* inspectCredential(context);
+        if (inspected.credential === undefined) {
           return {
-            kind: "skip",
-            schedule: resolved.schedule,
-            reaction: resolved.reaction,
+            kind: "blocked",
+            continuity: "unavailable",
+            change: inspected.change,
           };
         }
         return {
           kind: "ready",
-          schedule: resolved.schedule,
-          reaction: resolved.reaction,
-          execute: acquire(resolved.credential, context),
+          continuity: inspected.continuity,
+          change: inspected.change,
+          acquire: acquire(inspected.credential, context),
+          acquisitionDeferred: Effect.gen(function* () {
+            const now = yield* Effect.clockWith(
+              (clock) => clock.currentTimeMillis,
+            );
+            return adaptChange(
+              reconciliation.advance(
+                { kind: "dedicated-weekly-quota-acquisition-deferred" },
+                now,
+              ),
+            );
+          }),
         };
       }),
     observeResponse: (fields, now) =>
       Effect.sync(() => {
-        if (!credentialAvailable) return noProviderMonitorReaction();
-        return adaptReaction(
+        if (!credentialAvailable) return noWeeklySubscriptionUsageChange();
+        return adaptChange(
           reconciliation.advance(
             { kind: "passive-weekly-quota-observation", fields },
             now,
@@ -286,23 +303,14 @@ function makeCodexProviderMonitorAdapter(
       }),
     observeActivity: (now) =>
       Effect.sync(() =>
-        adaptReaction(reconciliation.advance({ kind: "activity" }, now)),
-      ),
-    acquisitionDeferred: (now) =>
-      Effect.sync(() =>
-        adaptReaction(
-          reconciliation.advance(
-            { kind: "dedicated-weekly-quota-acquisition-deferred" },
-            now,
-          ),
-        ),
+        adaptChange(reconciliation.advance({ kind: "activity" }, now)),
       ),
     staleExpirationReached: (deadline, now) =>
       Effect.sync(() => {
         if (expectedStaleExpirationAtMs !== deadline) {
-          return noProviderMonitorReaction();
+          return noWeeklySubscriptionUsageChange();
         }
-        return adaptReaction(
+        return adaptChange(
           reconciliation.advance(
             { kind: "stale-usage-expiration-reached" },
             now,

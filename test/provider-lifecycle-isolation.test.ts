@@ -164,7 +164,7 @@ it.scoped("a Codex defect does not stop or alter Claude", () =>
         }),
     });
 
-    yield* Effect.all([codex.start, claude.start], {
+    yield* Effect.all([Effect.exit(codex.start), Effect.exit(claude.start)], {
       concurrency: "unbounded",
     });
     assert.deepEqual([codexReads, claudeReads], [1, 1]);
@@ -216,7 +216,7 @@ it.scoped("a Claude interruption does not stop or alter Codex", () =>
       publish: () => Effect.void,
     });
 
-    yield* Effect.all([codex.start, claude.start], {
+    yield* Effect.all([Effect.exit(codex.start), Effect.exit(claude.start)], {
       concurrency: "unbounded",
     });
     assert.deepEqual([codexReads, claudeReads], [1, 1]);

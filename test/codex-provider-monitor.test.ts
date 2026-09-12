@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
-import { Deferred, Effect, Fiber, TestClock } from "effect";
+import { Deferred, Effect, Exit, Fiber, TestClock } from "effect";
 import {
   type CodexCredentialResolution,
   makeCodexProviderMonitor,
@@ -250,6 +250,21 @@ it.scoped(
       });
       yield* Fiber.await(refresh);
     }),
+);
+
+it.scoped("does not disguise acquisition defects as retryable failures", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    f.setAcquisition(Effect.die("unexpected defect"));
+    const exit = yield* Effect.exit(f.monitor.refreshForAccountChange);
+    assert.equal(Exit.isFailure(exit), true);
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+    yield* TestClock.adjust("1 second");
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("59 seconds");
+    assert.equal(f.reads(), 3);
+  }),
 );
 
 it.scoped(

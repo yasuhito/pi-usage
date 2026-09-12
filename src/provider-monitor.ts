@@ -1,7 +1,9 @@
 import {
+  Cause,
   Clock,
   Context,
   Effect,
+  Exit,
   Fiber,
   Random,
   type Scope,
@@ -34,79 +36,118 @@ type ProviderStaleExpiration =
   | { readonly kind: "clear" }
   | { readonly kind: "arm"; readonly atMs: number };
 
-export interface ProviderMonitorReaction {
+/** Presentation and observation demand produced by one provider event. */
+export interface WeeklySubscriptionUsageChange {
   readonly publication: WeeklySubscriptionUsageStatus | undefined;
   readonly staleExpiration: ProviderStaleExpiration;
   readonly acquire: boolean;
 }
 
-type ProviderScheduleDirective =
-  | { readonly kind: "completed" }
-  | {
-      readonly kind: "temporary-failure";
-      readonly retryAtMs: number | undefined;
-    }
-  | { readonly kind: "terminal" };
+export type ProviderCredentialContinuity =
+  | "unchanged"
+  | "changed"
+  | "unavailable";
 
-export interface ProviderRefreshPlan {
-  readonly transition?: ProviderMonitorTransition;
-  readonly beforeDirective: ProviderMonitorReaction;
-  readonly directive: ProviderScheduleDirective;
-  readonly afterDirective: ProviderMonitorReaction;
-}
-
-type ProviderRefreshExecution =
-  | ProviderRefreshPlan
+export type ProviderCredentialInspection<Credential> =
   | {
-      readonly kind: "stop";
-      readonly transition: ProviderMonitorTransition;
+      readonly continuity: "unavailable";
+      readonly credential: undefined;
+      readonly change: WeeklySubscriptionUsageChange;
     }
   | {
-      readonly kind: "continue";
-      readonly transition: ProviderMonitorTransition;
-      readonly execute: Effect.Effect<ProviderRefreshExecution>;
+      readonly continuity: "unchanged" | "changed";
+      readonly credential: Credential;
+      readonly change: WeeklySubscriptionUsageChange;
     };
 
-export interface ProviderMonitorTransition {
-  readonly schedule: "preserve" | "reset" | "pause-retry";
-  readonly reaction: ProviderMonitorReaction;
+export type ClassifiedProviderAcquisitionExit<A, E> =
+  | { readonly kind: "acquired"; readonly value: A }
+  | { readonly kind: "failed"; readonly error: E }
+  | { readonly kind: "interrupted" }
+  | { readonly kind: "defect"; readonly cause: Cause.Cause<never> };
+
+export function classifyProviderAcquisitionExit<A, E>(
+  exit: Exit.Exit<A, E>,
+): ClassifiedProviderAcquisitionExit<A, E> {
+  if (Exit.isSuccess(exit)) return { kind: "acquired", value: exit.value };
+  if (Cause.isInterruptedOnly(exit.cause)) return { kind: "interrupted" };
+  const defects = Cause.keepDefects(exit.cause);
+  if (defects._tag === "Some") {
+    return { kind: "defect", cause: defects.value };
+  }
+  const failure = Cause.failureOption(exit.cause);
+  return failure._tag === "Some"
+    ? { kind: "failed", error: failure.value }
+    : { kind: "interrupted" };
 }
 
-export interface ProviderRefreshContext {
+export type ProviderAcquisitionDisposition =
+  | { readonly kind: "completed" }
+  | { readonly kind: "retry"; readonly retryAtMs: number | undefined }
+  | { readonly kind: "terminal" }
+  | { readonly kind: "defect"; readonly cause: Cause.Cause<never> };
+
+export interface ProviderAcquisitionCompletion {
+  /** Changes are committed in provider-domain order before disposition. */
+  readonly changes: ReadonlyArray<WeeklySubscriptionUsageChange>;
+  readonly disposition: ProviderAcquisitionDisposition;
+  readonly continuity?: ProviderCredentialContinuity;
+}
+
+export function providerAcquisitionDefect(
+  cause: Cause.Cause<never>,
+): ProviderAcquisitionCompletion {
+  return {
+    changes: [
+      {
+        publication: { kind: "unavailable" },
+        staleExpiration: { kind: "clear" },
+        acquire: false,
+      },
+    ],
+    disposition: { kind: "defect", cause },
+  };
+}
+
+export interface ProviderMonitorContext {
+  /** True only while the owning refresh generation may commit provider state. */
   readonly isCurrent: Effect.Effect<boolean>;
-  readonly resolveIdentity: <A, E, R>(
+  /** Suppresses passive observations caused by credential resolution. */
+  readonly withoutPassiveObservation: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E, R>;
 }
 
-type PreparedProviderRefresh = ProviderMonitorTransition &
-  (
-    | { readonly kind: "skip" }
-    | {
-        readonly kind: "ready";
-        readonly execute: Effect.Effect<ProviderRefreshExecution>;
-      }
-  );
+export type ProviderAcquisitionInspection =
+  | {
+      readonly kind: "blocked";
+      readonly continuity: "unavailable";
+      readonly change: WeeklySubscriptionUsageChange;
+    }
+  | {
+      readonly kind: "ready";
+      readonly continuity: "unchanged" | "changed";
+      readonly change: WeeklySubscriptionUsageChange;
+      readonly acquire: Effect.Effect<ProviderAcquisitionCompletion>;
+      readonly acquisitionDeferred?: Effect.Effect<WeeklySubscriptionUsageChange>;
+    };
 
-/** Provider-specific policy at the scheduling seam. */
+/** Provider-specific policy at the acquisition seam. */
 export interface ProviderMonitorAdapter {
-  readonly prepareRefresh: (
-    context: ProviderRefreshContext,
-  ) => Effect.Effect<PreparedProviderRefresh>;
+  readonly inspectAcquisition: (
+    context: ProviderMonitorContext,
+  ) => Effect.Effect<ProviderAcquisitionInspection>;
   readonly observeResponse?: (
     fields: Readonly<Record<string, unknown>>,
     nowMs: number,
-  ) => Effect.Effect<ProviderMonitorReaction>;
+  ) => Effect.Effect<WeeklySubscriptionUsageChange>;
   readonly observeActivity: (
     nowMs: number,
-  ) => Effect.Effect<ProviderMonitorReaction>;
-  readonly acquisitionDeferred?: (
-    nowMs: number,
-  ) => Effect.Effect<ProviderMonitorReaction>;
+  ) => Effect.Effect<WeeklySubscriptionUsageChange>;
   readonly staleExpirationReached: (
     deadlineMs: number,
     nowMs: number,
-  ) => Effect.Effect<ProviderMonitorReaction>;
+  ) => Effect.Effect<WeeklySubscriptionUsageChange>;
   readonly finalize: Effect.Effect<void>;
 }
 
@@ -117,7 +158,7 @@ interface ProviderMonitorDependencies {
   readonly random?: Effect.Effect<number>;
 }
 
-const emptyReaction = (): ProviderMonitorReaction => ({
+const emptyChange = (): WeeklySubscriptionUsageChange => ({
   publication: undefined,
   staleExpiration: { kind: "preserve" },
   acquire: false,
@@ -142,15 +183,17 @@ export function makeProviderMonitor(
     let nextAttemptAt = 0;
     let consecutiveFailures = 0;
     let terminal = false;
+    let acquisitionDemanded = false;
     let observationSuppressionsInFlight = 0;
+    let accountChangeRefreshesInFlight = 0;
     type RefreshMode = "ordinary" | "account-change";
 
-    let accountChangeRefreshesInFlight = 0;
     let triggerRefresh: (
       mode: RefreshMode,
     ) => Effect.Effect<Fiber.RuntimeFiber<void> | undefined> = () =>
       Effect.succeed(undefined);
     let refresh: (mode: RefreshMode) => Effect.Effect<void> = () => Effect.void;
+    let drainAcquisitionDemand: Effect.Effect<void> = Effect.void;
 
     const isCurrent = (generationSnapshot: number) =>
       generationSnapshot === refreshGeneration;
@@ -168,18 +211,25 @@ export function makeProviderMonitor(
       yield* interruptRetry;
     });
 
-    const applyReaction = (
-      reaction: ProviderMonitorReaction,
+    const applyContinuity = (continuity: ProviderCredentialContinuity) => {
+      if (continuity === "changed") return resetSchedule;
+      if (continuity === "unavailable") return interruptRetry;
+      return Effect.void;
+    };
+
+    const applyChange = (
+      change: WeeklySubscriptionUsageChange,
       generationSnapshot: number,
+      followUpDemand = false,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (!isCurrent(generationSnapshot)) return;
 
         const requestedDeadline =
-          reaction.staleExpiration.kind === "preserve"
+          change.staleExpiration.kind === "preserve"
             ? staleDeadline
-            : reaction.staleExpiration.kind === "arm"
-              ? reaction.staleExpiration.atMs
+            : change.staleExpiration.kind === "arm"
+              ? change.staleExpiration.atMs
               : undefined;
         if (requestedDeadline !== staleDeadline) {
           if (staleFiber !== undefined) yield* Fiber.interrupt(staleFiber);
@@ -205,22 +255,27 @@ export function makeProviderMonitor(
               staleFiber = undefined;
               staleDeadline = undefined;
               const atExpiration = yield* Clock.currentTimeMillis;
-              const expirationReaction = yield* adapter.staleExpirationReached(
+              const expirationChange = yield* adapter.staleExpirationReached(
                 deadline,
                 atExpiration,
               );
-              yield* applyReaction(expirationReaction, refreshGeneration);
+              yield* applyChange(expirationChange, refreshGeneration);
+              yield* drainAcquisitionDemand;
             }),
             scope,
           );
           staleFiber = staleExpirationFiber;
         }
 
-        if (reaction.publication !== undefined) {
-          yield* dependencies.publish(reaction.publication);
+        if (change.publication !== undefined) {
+          yield* dependencies.publish(change.publication);
         }
-        if (reaction.acquire && isCurrent(generationSnapshot)) {
-          yield* refresh("ordinary");
+        if (
+          change.acquire &&
+          isCurrent(generationSnapshot) &&
+          (followUpDemand || activeRefreshFiber === undefined)
+        ) {
+          acquisitionDemanded = true;
         }
       });
 
@@ -237,22 +292,25 @@ export function makeProviderMonitor(
         );
       });
 
-    const applyDirective = (
-      directive: ProviderScheduleDirective,
+    const applyDisposition = (
+      disposition: ProviderAcquisitionDisposition,
       generationSnapshot: number,
     ) =>
       Effect.gen(function* () {
         if (!isCurrent(generationSnapshot)) return;
+        if (disposition.kind === "defect") {
+          return yield* Effect.failCause(disposition.cause);
+        }
         const now = yield* Clock.currentTimeMillis;
-        if (directive.kind === "temporary-failure") {
+        if (disposition.kind === "retry") {
           terminal = false;
           consecutiveFailures += 1;
           if (
-            directive.retryAtMs !== undefined &&
-            Number.isFinite(directive.retryAtMs) &&
-            directive.retryAtMs > now
+            disposition.retryAtMs !== undefined &&
+            Number.isFinite(disposition.retryAtMs) &&
+            disposition.retryAtMs > now
           ) {
-            nextAttemptAt = directive.retryAtMs;
+            nextAttemptAt = disposition.retryAtMs;
           } else {
             const base = Math.min(
               MAX_BACKOFF_MS,
@@ -269,56 +327,31 @@ export function makeProviderMonitor(
           return;
         }
         yield* resetSchedule;
-        terminal = directive.kind === "terminal";
+        terminal = disposition.kind === "terminal";
       });
 
-    const applyTransition = (
-      transition: ProviderMonitorTransition,
+    const applyCompletion = (
+      completion: ProviderAcquisitionCompletion,
       generationSnapshot: number,
     ) =>
       Effect.gen(function* () {
         if (!isCurrent(generationSnapshot)) return;
-        switch (transition.schedule) {
-          case "preserve":
-            break;
-          case "reset":
-            yield* resetSchedule;
-            break;
-          case "pause-retry":
-            terminal = false;
-            yield* interruptRetry;
-            break;
+        for (const change of completion.changes) {
+          yield* applyChange(change, generationSnapshot, true);
         }
-        yield* applyReaction(transition.reaction, generationSnapshot);
-      });
-
-    const applyExecution = (
-      executionEffect: Effect.Effect<ProviderRefreshExecution>,
-      generationSnapshot: number,
-    ): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const execution = yield* executionEffect;
-        if (!isCurrent(generationSnapshot)) return;
-        if ("kind" in execution) {
-          yield* applyTransition(execution.transition, generationSnapshot);
-          if (execution.kind === "continue" && isCurrent(generationSnapshot)) {
-            yield* applyExecution(execution.execute, generationSnapshot);
-          }
-          return;
+        if (completion.continuity !== undefined) {
+          yield* applyContinuity(completion.continuity);
         }
-        if (execution.transition !== undefined) {
-          yield* applyTransition(execution.transition, generationSnapshot);
+        if (completion.continuity !== "unavailable") {
+          yield* applyDisposition(completion.disposition, generationSnapshot);
         }
-        yield* applyReaction(execution.beforeDirective, generationSnapshot);
-        yield* applyDirective(execution.directive, generationSnapshot);
-        yield* applyReaction(execution.afterDirective, generationSnapshot);
       });
 
     const performRefresh = (generationSnapshot: number, mode: RefreshMode) =>
       Effect.gen(function* () {
-        const context: ProviderRefreshContext = {
+        const context: ProviderMonitorContext = {
           isCurrent: Effect.sync(() => isCurrent(generationSnapshot)),
-          resolveIdentity: (effect) =>
+          withoutPassiveObservation: (effect) =>
             Effect.suspend(() => {
               observationSuppressionsInFlight += 1;
               return effect.pipe(
@@ -330,21 +363,23 @@ export function makeProviderMonitor(
               );
             }),
         };
-        const prepared = yield* adapter.prepareRefresh(context);
+        const inspection = yield* adapter.inspectAcquisition(context);
         if (!isCurrent(generationSnapshot)) return;
-        yield* applyTransition(prepared, generationSnapshot);
-        if (prepared.kind === "skip" || !isCurrent(generationSnapshot)) return;
+        yield* applyContinuity(inspection.continuity);
+        yield* applyChange(inspection.change, generationSnapshot);
+        if (inspection.kind === "blocked") return;
         if (terminal && mode === "ordinary") return;
         const now = yield* Clock.currentTimeMillis;
         if (mode === "ordinary" && now < nextAttemptAt) {
-          if (adapter.acquisitionDeferred !== undefined) {
-            const reaction = yield* adapter.acquisitionDeferred(now);
-            yield* applyReaction(reaction, generationSnapshot);
+          if (inspection.acquisitionDeferred !== undefined) {
+            const change = yield* inspection.acquisitionDeferred;
+            yield* applyChange(change, generationSnapshot);
           }
           return;
         }
 
-        yield* applyExecution(prepared.execute, generationSnapshot);
+        const completion = yield* inspection.acquire;
+        yield* applyCompletion(completion, generationSnapshot);
       });
 
     triggerRefresh = (mode: RefreshMode) =>
@@ -363,11 +398,12 @@ export function makeProviderMonitor(
           const refreshFiber = yield* Effect.forkIn(
             performRefresh(generationSnapshot, mode).pipe(
               Effect.ensuring(
-                Effect.sync(() => {
+                Effect.gen(function* () {
                   if (mode === "account-change")
                     accountChangeRefreshesInFlight -= 1;
                   if (activeRefreshFiber === refreshFiber)
                     activeRefreshFiber = undefined;
+                  yield* drainAcquisitionDemand;
                 }),
               ),
             ),
@@ -381,8 +417,16 @@ export function makeProviderMonitor(
     refresh = (mode: RefreshMode) =>
       Effect.gen(function* () {
         const fiber = yield* triggerRefresh(mode);
-        if (fiber !== undefined) yield* Fiber.await(fiber);
+        if (fiber !== undefined) yield* Fiber.join(fiber);
       });
+
+    drainAcquisitionDemand = Effect.suspend(() => {
+      if (!acquisitionDemanded || activeRefreshFiber !== undefined) {
+        return Effect.void;
+      }
+      acquisitionDemanded = false;
+      return refresh("ordinary");
+    });
 
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
@@ -391,6 +435,7 @@ export function makeProviderMonitor(
         retryFiber = undefined;
         staleFiber = undefined;
         staleDeadline = undefined;
+        acquisitionDemanded = false;
         observationSuppressionsInFlight = 0;
         accountChangeRefreshesInFlight = 0;
         yield* adapter.finalize;
@@ -424,19 +469,21 @@ export function makeProviderMonitor(
           return Effect.gen(function* () {
             if (adapter.observeResponse === undefined) return;
             const now = yield* Clock.currentTimeMillis;
-            const reaction = yield* adapter.observeResponse(fields, now);
-            yield* applyReaction(reaction, generationSnapshot);
+            const change = yield* adapter.observeResponse(fields, now);
+            yield* applyChange(change, generationSnapshot);
+            yield* drainAcquisitionDemand;
           });
         }),
       refreshAfterActivity: Effect.gen(function* () {
         const generationSnapshot = refreshGeneration;
         const now = yield* Clock.currentTimeMillis;
-        const reaction = yield* adapter.observeActivity(now);
-        yield* applyReaction(reaction, generationSnapshot);
+        const change = yield* adapter.observeActivity(now);
+        yield* applyChange(change, generationSnapshot);
+        yield* drainAcquisitionDemand;
       }),
       refreshForAccountChange: refresh("account-change"),
     } satisfies ProviderMonitor;
   });
 }
 
-export const noProviderMonitorReaction = emptyReaction;
+export const noWeeklySubscriptionUsageChange = emptyChange;
