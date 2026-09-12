@@ -216,23 +216,39 @@ it.effect(
 );
 
 it.effect(
-  "represents terminal, retryable, redirect, and repeated auth outcomes as typed failures",
+  "finalizes bodies for terminal, retryable, redirect, and repeated auth outcomes",
   () =>
     Effect.gen(function* () {
       const cases = [
-        [400, "PermanentClaudeSubscriptionUsageFailure"],
-        [302, "PermanentClaudeSubscriptionUsageFailure"],
-        [408, "TemporaryClaudeSubscriptionUsageFailure"],
-        [425, "TemporaryClaudeSubscriptionUsageFailure"],
-        [429, "TemporaryClaudeSubscriptionUsageFailure"],
-        [500, "TemporaryClaudeSubscriptionUsageFailure"],
-        [403, "ClaudeAuthenticationRejected"],
+        [400, "PermanentClaudeSubscriptionUsageFailure", 1],
+        [302, "PermanentClaudeSubscriptionUsageFailure", 1],
+        [408, "TemporaryClaudeSubscriptionUsageFailure", 1],
+        [425, "TemporaryClaudeSubscriptionUsageFailure", 1],
+        [429, "TemporaryClaudeSubscriptionUsageFailure", 1],
+        [500, "TemporaryClaudeSubscriptionUsageFailure", 1],
+        [403, "ClaudeAuthenticationRejected", 2],
       ] as const;
-      for (const [status, tag] of cases) {
+      for (const [status, tag, expectedRequests] of cases) {
+        let cancelled = 0;
+        const bodies: ReadableStream<Uint8Array>[] = [];
         const exit = yield* Effect.exit(
-          acquire(async () => new Response(null, { status })),
+          acquire(async () => {
+            const body = new ReadableStream<Uint8Array>({
+              cancel() {
+                cancelled += 1;
+              },
+            });
+            bodies.push(body);
+            return new Response(body, { status });
+          }),
         );
         assert.equal(failureTag(exit), tag);
+        assert.equal(cancelled, expectedRequests);
+        assert.equal(bodies.length, expectedRequests);
+        assert.equal(
+          bodies.every((body) => !body.locked),
+          true,
+        );
       }
     }),
 );
@@ -361,6 +377,43 @@ it.effect("awaits streamed response cancellation before completing", () =>
       "MalformedClaudeSubscriptionUsage",
     );
   }),
+);
+
+it.effect(
+  "awaits cancellation and releases the lock for an oversized declared body",
+  () =>
+    Effect.gen(function* () {
+      let cancelStarted = false;
+      let finishCancellation: (() => void) | undefined;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelStarted = true;
+          return new Promise<void>((resolve) => {
+            finishCancellation = resolve;
+          });
+        },
+      });
+      const fiber = yield* Effect.fork(
+        Effect.exit(
+          acquire(
+            async () =>
+              new Response(body, {
+                headers: { "content-length": String(64 * 1024 + 1) },
+              }),
+          ),
+        ),
+      );
+      while (!cancelStarted) yield* Effect.yieldNow();
+      assert.equal((yield* Fiber.poll(fiber))._tag, "None");
+      assert.equal(body.locked, true);
+      assert.ok(finishCancellation);
+      finishCancellation();
+      assert.equal(
+        failureTag(yield* Fiber.join(fiber)),
+        "MalformedClaudeSubscriptionUsage",
+      );
+      assert.equal(body.locked, false);
+    }),
 );
 
 it.effect("bounds declared and streamed response bodies at 64 KiB", () =>

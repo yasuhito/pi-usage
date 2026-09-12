@@ -1,5 +1,41 @@
 import { Effect } from "effect";
 
+async function cancelAndReleaseReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<void> {
+  try {
+    await reader.cancel();
+  } catch {
+    // Cleanup defects must not replace or expose the exchange outcome.
+  }
+  try {
+    reader.releaseLock();
+  } catch {
+    // A reader may already have released its lock while unwinding.
+  }
+}
+
+/** Scopes a response so unread data is cancelled and its reader lock released. */
+export function withFinalizedResponseBody<A, E, R>(
+  response: Response,
+  use: (response: Response) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> {
+  return Effect.acquireUseRelease(Effect.succeed(response), use, (response) =>
+    Effect.promise(async () => {
+      const body = response.body;
+      if (body === null) return;
+
+      let reader: ReadableStreamDefaultReader<Uint8Array>;
+      try {
+        reader = body.getReader();
+      } catch {
+        return;
+      }
+      await cancelAndReleaseReader(reader);
+    }),
+  );
+}
+
 function declaredResponseSize(response: Response): number | undefined {
   const value = response.headers.get("content-length");
   if (value === null || !/^\d+$/.test(value)) return undefined;
@@ -45,18 +81,6 @@ export function readBoundedResponseBody<Malformed, Temporary>(
         catch: (error) =>
           overflow !== undefined && error === overflow ? overflow : temporary(),
       }),
-    (reader) =>
-      Effect.promise(async () => {
-        try {
-          await reader.cancel();
-        } catch {
-          // Cancellation failure must not replace the bounded-read outcome.
-        }
-        try {
-          reader.releaseLock();
-        } catch {
-          // A reader may already have released its lock while unwinding.
-        }
-      }),
+    (reader) => Effect.promise(() => cancelAndReleaseReader(reader)),
   );
 }

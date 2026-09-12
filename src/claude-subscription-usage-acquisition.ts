@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { Clock, Data, Effect, Schema } from "effect";
-import { readBoundedResponseBody } from "./bounded-response-body.ts";
+import {
+  readBoundedResponseBody,
+  withFinalizedResponseBody,
+} from "./bounded-response-body.ts";
 
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -188,8 +191,11 @@ export function createAcquireClaudeSubscriptionUsage(
 
   const exchange = (key: string) =>
     requestUsage(dependencies.fetch, key).pipe(
-      Effect.flatMap(classifyResponse),
-      Effect.flatMap(decodeUsage),
+      Effect.flatMap((response) =>
+        withFinalizedResponseBody(response, (response) =>
+          classifyResponse(response).pipe(Effect.flatMap(decodeUsage)),
+        ),
+      ),
       Effect.map((usage) => ({
         ...usage,
         credentialFingerprint: fingerprintOAuthKey(key),

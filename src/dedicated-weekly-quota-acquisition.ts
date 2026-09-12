@@ -1,5 +1,8 @@
 import { Clock, Data, Effect, Schema } from "effect";
-import { readBoundedResponseBody } from "./bounded-response-body.ts";
+import {
+  readBoundedResponseBody,
+  withFinalizedResponseBody,
+} from "./bounded-response-body.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -139,42 +142,50 @@ export function createAcquireDedicatedWeeklyQuotaUsage(
         catch: () => new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
       });
 
-      if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-          return yield* new AuthenticationRejected();
-        }
-        if (
-          response.status === 408 ||
-          response.status === 425 ||
-          response.status === 429 ||
-          response.status >= 500
-        ) {
-          const now = yield* Clock.currentTimeMillis;
-          return yield* new TemporaryAcquisitionFailure({
-            retryAtMs:
-              response.status === 429 ? retryAtMs(response, now) : undefined,
-          });
-        }
-        return yield* new PermanentAcquisitionFailure();
-      }
+      return yield* withFinalizedResponseBody(response, (response) =>
+        Effect.gen(function* () {
+          if (!response.ok) {
+            if (response.status === 401 || response.status === 403) {
+              return yield* new AuthenticationRejected();
+            }
+            if (
+              response.status === 408 ||
+              response.status === 425 ||
+              response.status === 429 ||
+              response.status >= 500
+            ) {
+              const now = yield* Clock.currentTimeMillis;
+              return yield* new TemporaryAcquisitionFailure({
+                retryAtMs:
+                  response.status === 429
+                    ? retryAtMs(response, now)
+                    : undefined,
+              });
+            }
+            return yield* new PermanentAcquisitionFailure();
+          }
 
-      const text = yield* readBoundedResponseBody(
-        response,
-        MAX_RESPONSE_BYTES,
-        () => new MalformedAcquisition(),
-        () => new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
+          const text = yield* readBoundedResponseBody(
+            response,
+            MAX_RESPONSE_BYTES,
+            () => new MalformedAcquisition(),
+            () => new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
+          );
+          let unknownBody: unknown;
+          try {
+            unknownBody = JSON.parse(text) as unknown;
+          } catch {
+            return yield* new MalformedAcquisition();
+          }
+          const body = yield* Schema.decodeUnknown(ProviderBody)(
+            unknownBody,
+          ).pipe(Effect.mapError(() => new MalformedAcquisition()));
+          const usage = interpretProviderBody(body);
+          return usage === undefined
+            ? yield* new MalformedAcquisition()
+            : usage;
+        }),
       );
-      let unknownBody: unknown;
-      try {
-        unknownBody = JSON.parse(text) as unknown;
-      } catch {
-        return yield* new MalformedAcquisition();
-      }
-      const body = yield* Schema.decodeUnknown(ProviderBody)(unknownBody).pipe(
-        Effect.mapError(() => new MalformedAcquisition()),
-      );
-      const usage = interpretProviderBody(body);
-      return usage === undefined ? yield* new MalformedAcquisition() : usage;
     }).pipe(
       Effect.timeoutFail({
         duration: REQUEST_TIMEOUT_MS,

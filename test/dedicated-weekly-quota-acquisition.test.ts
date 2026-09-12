@@ -75,17 +75,24 @@ it.effect("rejects reset timestamps that overflow epoch milliseconds", () =>
   }),
 );
 
-it.effect("expresses HTTP outcomes as typed failures", () =>
+it.effect("finalizes bodies for every rejected HTTP outcome", () =>
   Effect.gen(function* () {
     const cases = [
       [401, "AuthenticationRejected"],
       [302, "PermanentAcquisitionFailure"],
       [408, "TemporaryAcquisitionFailure"],
+      [429, "TemporaryAcquisitionFailure"],
       [500, "TemporaryAcquisitionFailure"],
     ] as const;
     for (const [status, tag] of cases) {
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+      });
       const exit = yield* Effect.exit(
-        acquire(async () => new Response(null, { status })),
+        acquire(async () => new Response(body, { status })),
       );
       assert.equal(
         Exit.isFailure(exit) && exit.cause._tag === "Fail"
@@ -93,6 +100,39 @@ it.effect("expresses HTTP outcomes as typed failures", () =>
           : undefined,
         tag,
       );
+      assert.equal(cancelled, true);
+      assert.equal(body.locked, false);
+    }
+  }),
+);
+
+it.effect("preserves a typed rejection when response cleanup fails", () =>
+  Effect.gen(function* () {
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        return Promise.reject(
+          new Error("secret account-1 authenticated-header raw-response-body"),
+        );
+      },
+    });
+    const exit = yield* Effect.exit(
+      acquire(async () => new Response(body, { status: 401 })),
+    );
+    assert.equal(
+      Exit.isFailure(exit) && exit.cause._tag === "Fail"
+        ? exit.cause.error._tag
+        : undefined,
+      "AuthenticationRejected",
+    );
+    assert.equal(body.locked, false);
+    const serialized = JSON.stringify(exit);
+    for (const privateValue of [
+      "secret",
+      "account-1",
+      "authenticated-header",
+      "raw-response-body",
+    ]) {
+      assert.equal(serialized.includes(privateValue), false);
     }
   }),
 );
