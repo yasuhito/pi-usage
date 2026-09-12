@@ -1,0 +1,3 @@
+# Use Effect for provider usage monitoring
+
+Adopt Effect 3 for provider monitors, acquisition, schema validation, typed errors, concurrent lifecycles, retry, cancellation, and scoped resource management. Provider modules expose Effect interfaces and are composed as Layers and Streams; only the outer Pi event adapter executes them, while genuinely pure calculations remain ordinary functions. This larger migration is accepted because Codex and Claude must run independently now and future providers have different acquisition and quota semantics that would make further Promise-, timer-, and AbortController-based orchestration increasingly difficult to manage.
