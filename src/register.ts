@@ -2,32 +2,18 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Clock, Context, Effect, Exit, Fiber, Layer, Scope } from "effect";
-import {
-  ClaudeProviderMonitorService,
-  claudeProviderMonitorLayer,
-} from "./claude-provider-monitor.ts";
+import { Clock, Effect } from "effect";
 import {
   type AcquireClaudeSubscriptionUsage,
   claudeCredentialFingerprint,
 } from "./claude-subscription-usage-acquisition.ts";
-import {
-  type CodexCredentialResolution,
-  codexProviderMonitorLayer,
-} from "./codex-provider-monitor.ts";
+import type { CodexCredentialResolution } from "./codex-provider-monitor.ts";
 import type {
   AcquireDedicatedWeeklyQuotaUsage,
   CodexCredential,
 } from "./dedicated-weekly-quota-acquisition.ts";
-import {
-  type MonitoredProviderName,
-  presentProviderSubscriptionUsage,
-  type WeeklySubscriptionUsageStatus,
-} from "./presentation.ts";
-import {
-  type ProviderMonitor,
-  ProviderMonitorService,
-} from "./provider-monitor.ts";
+import { presentProviderSubscriptionUsage } from "./presentation.ts";
+import { makeWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-usage-lifecycle.ts";
 
 const STATUS_KEY = "pi-usage";
 
@@ -114,83 +100,25 @@ function credentialResolution(ctx: ExtensionContext) {
   );
 }
 
-interface Session {
-  readonly id: number;
-  readonly scope: Scope.CloseableScope;
-  readonly codexMonitor: ProviderMonitor;
-  readonly claudeMonitor: ProviderMonitor;
-}
-
 export function registerWeeklySubscriptionUsage(
   pi: ExtensionAPI,
   dependencies: WeeklySubscriptionUsageDependencies,
 ): void {
-  let session: Session | undefined;
-  let nextSessionId = 0;
-  let sessionTransition = Promise.resolve();
+  const lifecycle = Effect.runSync(makeWeeklySubscriptionUsageLifecycle());
   const now = dependencies.now ?? Clock.currentTimeMillis;
-
-  const serializeSessionTransition = async <A>(
-    transition: () => Promise<A>,
-  ): Promise<A> => {
-    const result = sessionTransition.then(transition, transition);
-    sessionTransition = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  };
-
-  const closeSession = async (
-    candidate: Session | undefined,
-  ): Promise<void> => {
-    if (candidate === undefined) return;
-    if (session === candidate) session = undefined;
-    await Effect.runPromise(Scope.close(candidate.scope, Exit.void));
-  };
-
-  const runInSessionScope = async (
-    candidate: Session,
-    effect: Effect.Effect<void>,
-  ) => {
-    await Effect.runPromise(
-      Effect.suspend(() => {
-        if (session !== candidate) return Effect.void;
-        return Effect.forkIn(
-          effect.pipe(Effect.catchAllCause(() => Effect.void)),
-          candidate.scope,
-        ).pipe(Effect.flatMap(Fiber.await), Effect.asVoid);
-      }),
-    );
-  };
+  const run = (effect: Effect.Effect<void>) => Effect.runPromise(effect);
 
   pi.on("session_start", async (_event, ctx) => {
-    const id = ++nextSessionId;
-    const candidate = await serializeSessionTransition(async () => {
-      await closeSession(session);
-      if (id !== nextSessionId || ctx.mode !== "tui") return undefined;
-
-      const scope = await Effect.runPromise(Scope.make());
-      if (id !== nextSessionId) {
-        await Effect.runPromise(Scope.close(scope, Exit.void));
-        return undefined;
-      }
-      const statuses: Record<
-        MonitoredProviderName,
-        WeeklySubscriptionUsageStatus
-      > = {
-        Codex: { kind: "loading" },
-        Claude: { kind: "loading" },
-      };
-      let lastRendered: string | undefined;
-      const publish =
-        (providerName: MonitoredProviderName) =>
-        (status: WeeklySubscriptionUsageStatus): Effect.Effect<void> =>
-          Effect.gen(function* () {
-            if (session?.id !== id) return;
-            const currentTime = yield* now;
-            if (session?.id !== id) return;
-            statuses[providerName] = status;
+    if (ctx.mode !== "tui") {
+      await run(lifecycle.shutdown);
+      return;
+    }
+    let lastRendered: string | undefined;
+    await run(
+      lifecycle.start({
+        now,
+        present: (statuses, currentTime) =>
+          Effect.sync(() => {
             const rendered = (["Codex", "Claude"] as const)
               .map((name) => {
                 const presentation = presentProviderSubscriptionUsage(
@@ -204,99 +132,47 @@ export function registerWeeklySubscriptionUsage(
             if (rendered === lastRendered) return;
             lastRendered = rendered;
             ctx.ui.setStatus(STATUS_KEY, rendered);
-          });
-
-      const monitorLayers = Layer.merge(
-        codexProviderMonitorLayer({
+          }),
+        codex: {
           resolveCredential: credentialResolution(ctx),
           acquireDedicatedWeeklyQuotaUsage:
             dependencies.acquireDedicatedWeeklyQuotaUsage,
-          publish: publish("Codex"),
           ...(dependencies.random === undefined
             ? {}
             : { random: dependencies.random }),
-        }),
-        claudeProviderMonitorLayer({
+        },
+        makeClaudeDependencies: () => ({
           resolveCredentialIdentity: claudeCredentialIdentityResolution(ctx),
           acquireClaudeSubscriptionUsage:
             dependencies.acquireClaudeSubscriptionUsage(ctx),
-          publish: publish("Claude"),
           ...(dependencies.random === undefined
             ? {}
             : { random: dependencies.random }),
         }),
-      );
-      const services = await Effect.runPromise(
-        Layer.buildWithScope(monitorLayers, scope),
-      );
-      const codexMonitor = Context.get(services, ProviderMonitorService);
-      const claudeMonitor = Context.get(services, ClaudeProviderMonitorService);
-      if (id !== nextSessionId) {
-        await Effect.runPromise(Scope.close(scope, Exit.void));
-        return;
-      }
-      const candidate = { id, scope, codexMonitor, claudeMonitor };
-      session = candidate;
-      return candidate;
-    });
-    if (candidate === undefined) return;
-    await runInSessionScope(
-      candidate,
-      Effect.all(
-        [candidate.codexMonitor.start, candidate.claudeMonitor.start],
-        {
-          concurrency: "unbounded",
-        },
-      ).pipe(Effect.asVoid),
+      }),
     );
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
     if (ctx.mode !== "tui" || ctx.model?.provider !== "openai-codex") return;
-    const candidate = session;
-    if (candidate !== undefined) {
-      await runInSessionScope(
-        candidate,
-        candidate.codexMonitor.observeResponse(event.headers),
-      );
-    }
+    await run(lifecycle.observeCodexResponse(event.headers));
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
-    const candidate = session;
-    if (candidate === undefined) return;
     if (ctx.model?.provider === "openai-codex") {
-      await runInSessionScope(
-        candidate,
-        candidate.codexMonitor.refreshAfterActivity,
-      );
+      await run(lifecycle.refreshAfterActivity("Codex"));
     } else if (ctx.model?.provider === "anthropic") {
-      await runInSessionScope(
-        candidate,
-        candidate.claudeMonitor.refreshAfterActivity,
-      );
+      await run(lifecycle.refreshAfterActivity("Claude"));
     }
   });
 
   pi.on("model_select", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
-    const candidate = session;
-    if (candidate !== undefined)
-      await runInSessionScope(
-        candidate,
-        Effect.all(
-          [
-            candidate.codexMonitor.refreshForAccountChange,
-            candidate.claudeMonitor.refreshForAccountChange,
-          ],
-          { concurrency: "unbounded" },
-        ).pipe(Effect.asVoid),
-      );
+    await run(lifecycle.refreshForAccountChange);
   });
 
   pi.on("session_shutdown", async () => {
-    nextSessionId += 1;
-    await serializeSessionTransition(() => closeSession(session));
+    await run(lifecycle.shutdown);
   });
 }

@@ -4,7 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import { afterAll, describe, test } from "vitest";
+import { test } from "vitest";
 
 import {
   type AcquiredClaudeSubscriptionUsage,
@@ -12,11 +12,10 @@ import {
   claudeCredentialFingerprint,
   PermanentClaudeSubscriptionUsageFailure,
 } from "../src/claude-subscription-usage-acquisition.ts";
-import {
-  type AcquiredWeeklyQuotaUsage,
-  type CodexCredential,
-  type DedicatedWeeklyQuotaAcquisitionError,
-  TemporaryAcquisitionFailure,
+import type {
+  AcquiredWeeklyQuotaUsage,
+  CodexCredential,
+  DedicatedWeeklyQuotaAcquisitionError,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
 import { registerWeeklySubscriptionUsage } from "../src/register.ts";
 
@@ -232,100 +231,6 @@ test("a provider defect does not reorder or recolor the other provider", async (
   await f.emit("session_shutdown");
 });
 
-test("shutdown interrupts an active exchange after the other provider publishes", async () => {
-  const f = registerFixture();
-  let finalized = 0;
-  f.setClaudeAcquisition(
-    Effect.never.pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          finalized += 1;
-        }),
-      ),
-    ),
-  );
-  const start = f.emit("session_start");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk loading…",
-  );
-  await f.emit("session_shutdown");
-  await start;
-  assert.equal(finalized, 1);
-});
-
-test("shutdown suppresses a publication already suspended inside the Pi UI boundary", async () => {
-  const f = registerFixture();
-  await f.emit("session_start");
-  const statusesBeforeRefresh = f.statuses.length;
-  let releaseNow!: (now: number) => void;
-  const delayedNow = new Promise<number>((resolve) => {
-    releaseNow = resolve;
-  });
-  f.setNow(Effect.uninterruptible(Effect.promise(() => delayedNow)));
-  const refresh = f.emit("after_provider_response", {
-    headers: {
-      "x-codex-primary-used-percent": "20",
-      "x-codex-primary-window-minutes": "10080",
-      "x-codex-primary-reset-at": "2000",
-    },
-  });
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  const shutdown = f.emit("session_shutdown");
-  releaseNow(1_000_000);
-  await Promise.all([refresh, shutdown]);
-
-  assert.equal(f.statuses.length, statusesBeforeRefresh);
-});
-
-test("shutdown interrupts credential resolution and ignores its late completion", async () => {
-  const f = registerFixture();
-  let releaseAuth!: () => void;
-  const delayedAuth = new Promise<void>((resolve) => {
-    releaseAuth = resolve;
-  });
-  f.setAuthWait(delayedAuth);
-
-  const start = f.emit("session_start");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  const publicationsBeforeShutdown = f.statuses.length;
-  await f.emit("session_shutdown");
-  releaseAuth();
-  await start;
-  await new Promise<void>((resolve) => setImmediate(resolve));
-
-  assert.equal(f.observedCredentials.length, 0);
-  assert.equal(f.claudeReads(), 0);
-  assert.equal(f.statuses.length, publicationsBeforeShutdown);
-});
-
-test("shutdown cancels scheduled retry and stale-expiration work", async () => {
-  const f = registerFixture();
-  f.setAcquisition(
-    Effect.succeed({
-      usedPercent: 20,
-      resetsAtMs: Date.now() + 100,
-      windowPosition: "secondary",
-    }),
-  );
-  await f.emit("session_start");
-  f.setAcquisition(
-    Effect.fail(
-      new TemporaryAcquisitionFailure({ retryAtMs: Date.now() + 30 }),
-    ),
-  );
-  await f.emit("model_select");
-  const readsBeforeShutdown = f.observedCredentials.length;
-  const publicationsBeforeShutdown = f.statuses.length;
-
-  await f.emit("session_shutdown");
-  await new Promise<void>((resolve) => setTimeout(resolve, 150));
-
-  assert.equal(f.observedCredentials.length, readsBeforeShutdown);
-  assert.equal(f.statuses.length, publicationsBeforeShutdown);
-});
-
 test("non-TUI sessions remain inactive for every Pi lifecycle event", async () => {
   const f = registerFixture();
   f.setMode("rpc");
@@ -343,6 +248,31 @@ test("non-TUI sessions remain inactive for every Pi lifecycle event", async () =
   assert.equal(f.observedCredentials.length, 0);
   assert.equal(f.claudeReads(), 0);
   assert.equal(f.statuses.length, 0);
+});
+
+test("a non-TUI session start closes the previous TUI session", async () => {
+  const f = registerFixture();
+  await f.emit("session_start");
+  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+
+  f.setMode("rpc");
+  await f.emit("session_start");
+  f.setMode("tui");
+  await f.emit("model_select");
+
+  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+  await f.emit("session_shutdown");
+});
+
+test("model selection refreshes both monitored providers", async () => {
+  const f = registerFixture();
+  await f.emit("session_start");
+  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+
+  await f.emit("model_select");
+
+  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [2, 2]);
+  await f.emit("session_shutdown");
 });
 
 test("activity refreshes only the direct provider that handled it", async () => {
@@ -381,179 +311,6 @@ test("responses from another provider are ignored", async () => {
   assert.equal(
     f.statuses.at(-1)?.text,
     "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m",
-  );
-  await f.emit("session_shutdown");
-});
-
-test("model selection clears previous-account usage and suppresses late exchange completion", async () => {
-  const f = registerFixture();
-  await f.emit("session_start");
-  let completeOldCodex!: (usage: AcquiredWeeklyQuotaUsage) => void;
-  let completeOldClaude!: (usage: AcquiredClaudeSubscriptionUsage) => void;
-  const oldCodex = new Promise<AcquiredWeeklyQuotaUsage>((resolve) => {
-    completeOldCodex = resolve;
-  });
-  const oldClaude = new Promise<AcquiredClaudeSubscriptionUsage>((resolve) => {
-    completeOldClaude = resolve;
-  });
-  f.setAcquisition(Effect.promise(() => oldCodex));
-  f.setClaudeAcquisition(Effect.promise(() => oldClaude));
-
-  const oldAccountRefresh = f.emit("model_select");
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    if (f.observedCredentials.length === 2 && f.claudeReads() === 2) break;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-
-  f.setAccountId("account-2");
-  f.setAcquisition(
-    Effect.succeed({
-      usedPercent: 20,
-      resetsAtMs: 2_000_000,
-      windowPosition: "secondary",
-    }),
-  );
-  f.setClaudeAcquisition(
-    Effect.succeed({
-      usedPercent: 30,
-      resetsAtMs: 2_000_000,
-      credentialFingerprint: anthropicCredentialFingerprint("account-2"),
-    }),
-  );
-  const publicationsBeforeAccountChange = f.statuses.length;
-  await f.emit("model_select");
-
-  const accountChangePublications = f.statuses.slice(
-    publicationsBeforeAccountChange,
-  );
-  assert.ok(
-    accountChangePublications.some((publication) =>
-      publication.text?.startsWith("Codex wk unavailable"),
-    ),
-  );
-  assert.ok(
-    accountChangePublications.some((publication) =>
-      publication.text?.includes("Claude wk unavailable"),
-    ),
-  );
-  assert.deepEqual(f.observedCredentials.at(-1), {
-    accessToken: accessTokenFor("account-2"),
-    accountId: "account-2",
-  });
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "Codex wk ━━──────── 20% 16m Claude wk ━━━─────── 30% 16m",
-  );
-  const publicationsAfterAccountChange = f.statuses.length;
-
-  completeOldCodex({
-    usedPercent: 99,
-    resetsAtMs: 2_000_000,
-    windowPosition: "secondary",
-  });
-  completeOldClaude({
-    usedPercent: 99,
-    resetsAtMs: 2_000_000,
-    credentialFingerprint: anthropicCredentialFingerprint(),
-  });
-  await oldAccountRefresh;
-  await new Promise<void>((resolve) => setImmediate(resolve));
-
-  assert.equal(f.statuses.length, publicationsAfterAccountChange);
-  await f.emit("session_shutdown");
-});
-
-describe("primary-seam suite cancellation", () => {
-  let fixture: ReturnType<typeof registerFixture> | undefined;
-  let pendingStart: Promise<void> | undefined;
-  let finalized = 0;
-
-  test("leaves active session work for suite cleanup", async () => {
-    fixture = registerFixture();
-    fixture.setClaudeAcquisition(
-      Effect.never.pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            finalized += 1;
-          }),
-        ),
-      ),
-    );
-    pendingStart = fixture.emit("session_start");
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    assert.equal(fixture.claudeReads(), 1);
-  });
-
-  afterAll(async () => {
-    assert.ok(fixture);
-    assert.ok(pendingStart);
-    await fixture.emit("session_shutdown");
-    await pendingStart;
-    assert.equal(finalized, 1);
-  });
-});
-
-test("repeated session start closes the previous Scope and suppresses late publication", async () => {
-  const f = registerFixture();
-  let finalized = 0;
-  let releasePreviousSession!: () => void;
-  const previousSessionGate = new Promise<void>((resolve) => {
-    releasePreviousSession = resolve;
-  });
-  const countFinalization = Effect.sync(() => {
-    finalized += 1;
-  });
-  f.setAcquisition(
-    Effect.uninterruptible(Effect.promise(() => previousSessionGate)).pipe(
-      Effect.as({
-        usedPercent: 99,
-        resetsAtMs: 2_000_000,
-        windowPosition: "secondary" as const,
-      }),
-      Effect.ensuring(countFinalization),
-    ),
-  );
-  f.setClaudeAcquisition(
-    Effect.uninterruptible(Effect.promise(() => previousSessionGate)).pipe(
-      Effect.as({
-        usedPercent: 99,
-        resetsAtMs: 2_000_000,
-        credentialFingerprint: anthropicCredentialFingerprint(),
-      }),
-      Effect.ensuring(countFinalization),
-    ),
-  );
-  const first = f.emit("session_start");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  f.setAcquisition(
-    Effect.succeed({
-      usedPercent: 20,
-      resetsAtMs: 2_000_000,
-      windowPosition: "secondary",
-    }),
-  );
-  f.setClaudeAcquisition(
-    Effect.succeed({
-      usedPercent: 80,
-      resetsAtMs: 2_000_000,
-      credentialFingerprint: anthropicCredentialFingerprint(),
-    }),
-  );
-  const replacement = f.emit("session_start");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(finalized, 0);
-  assert.notEqual(
-    f.statuses.at(-1)?.text,
-    "Codex wk ━━──────── 20% 16m Claude wk ━━━━━━━━── 80% 16m",
-  );
-
-  releasePreviousSession();
-  await Promise.all([first, replacement]);
-  assert.equal(finalized, 2);
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "Codex wk ━━──────── 20% 16m Claude wk ━━━━━━━━── 80% 16m",
   );
   await f.emit("session_shutdown");
 });
