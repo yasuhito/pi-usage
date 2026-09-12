@@ -168,7 +168,7 @@ test("session start adapts Pi authentication and quota presentation", async () =
   ]);
   assert.deepEqual(f.statuses.at(-1), {
     key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk ━━━━━━━━── 80% · reset 16m",
+    text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m",
   });
   await f.emit("session_shutdown");
 });
@@ -179,7 +179,7 @@ test("missing Codex authentication remains unavailable without delaying Claude",
   await f.emit("session_start");
   assert.deepEqual(f.statuses.at(-1), {
     key: "pi-usage",
-    text: "Codex wk unavailable Claude wk ━━━━━━━━── 80% · reset 16m",
+    text: "Codex wk unavailable Claude wk ━━━━━━━━── 80% 16m",
   });
   assert.equal(f.observedCredentials.length, 0);
   await f.emit("session_shutdown");
@@ -202,7 +202,7 @@ test("provider names and independently colored details compose without a separat
   await f.emit("session_start");
   assert.equal(
     f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:wk ━━━━━━──── 63% · reset 16m · ↻2] [accent:Claude] [warning:wk ━━━━━━━━── 80% · reset 16m]",
+    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [warning:wk ━━━━━━━━── 80% 16m]",
   );
   await f.emit("session_shutdown");
 });
@@ -215,7 +215,7 @@ test("a failed provider remains independently presentable", async () => {
   await f.emit("session_start");
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk unavailable",
+    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk unavailable",
   );
   await f.emit("session_shutdown");
 });
@@ -227,7 +227,7 @@ test("a provider defect does not reorder or recolor the other provider", async (
   await f.emit("session_start");
   assert.equal(
     f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:wk ━━━━━━──── 63% · reset 16m · ↻2] [accent:Claude] [dim:wk unavailable]",
+    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [dim:wk unavailable]",
   );
   await f.emit("session_shutdown");
 });
@@ -248,7 +248,7 @@ test("shutdown interrupts an active exchange after the other provider publishes"
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk loading…",
+    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk loading…",
   );
   await f.emit("session_shutdown");
   await start;
@@ -380,7 +380,7 @@ test("responses from another provider are ignored", async () => {
   });
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk ━━━━━━━━── 80% · reset 16m",
+    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m",
   );
   await f.emit("session_shutdown");
 });
@@ -442,7 +442,7 @@ test("model selection clears previous-account usage and suppresses late exchange
   });
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━──────── 20% · reset 16m Claude wk ━━━─────── 30% · reset 16m",
+    "Codex wk ━━──────── 20% 16m Claude wk ━━━─────── 30% 16m",
   );
   const publicationsAfterAccountChange = f.statuses.length;
 
@@ -545,7 +545,7 @@ test("repeated session start closes the previous Scope and suppresses late publi
   assert.equal(finalized, 0);
   assert.notEqual(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━──────── 20% · reset 16m Claude wk ━━━━━━━━── 80% · reset 16m",
+    "Codex wk ━━──────── 20% 16m Claude wk ━━━━━━━━── 80% 16m",
   );
 
   releasePreviousSession();
@@ -553,7 +553,7 @@ test("repeated session start closes the previous Scope and suppresses late publi
   assert.equal(finalized, 2);
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━──────── 20% · reset 16m Claude wk ━━━━━━━━── 80% · reset 16m",
+    "Codex wk ━━──────── 20% 16m Claude wk ━━━━━━━━── 80% 16m",
   );
   await f.emit("session_shutdown");
 });

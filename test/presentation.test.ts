@@ -19,7 +19,7 @@ test("fresh weekly quota usage is presented as a ten-cell used bar", () => {
       Date.UTC(2026, 8, 11, 12),
     ),
     {
-      text: "Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2",
+      text: "Codex wk ━━━━━━──── 63% 3d2h ↻2",
       color: "dim",
     },
   );
@@ -63,8 +63,8 @@ test("weekly reset countdown uses compact hour, minute, and elapsed forms", () =
   };
 
   const cases = [
-    [23 * 60 * 60_000 + 59 * 60_000 + 30_000, "23h 59m"],
-    [2 * 60 * 60_000 + 30 * 60_000, "2h 30m"],
+    [23 * 60 * 60_000 + 59 * 60_000 + 30_000, "23h59m"],
+    [2 * 60 * 60_000 + 30 * 60_000, "2h30m"],
     [59 * 60_000 + 30_000, "59m"],
     [42 * 60_000, "42m"],
     [0, "now"],
@@ -76,7 +76,7 @@ test("weekly reset countdown uses compact hour, minute, and elapsed forms", () =
         { ...status, weeklyWindowResetsAtMs: nowMs + remainingMs },
         nowMs,
       ).text,
-      `Codex wk ━━──────── 20% · reset ${expected}`,
+      `Codex wk ━━──────── 20% ${expected}`,
     );
   }
 });
@@ -89,7 +89,7 @@ test("zero limit reset credits are shown while an unavailable count is omitted",
       stale: false,
       availableLimitResetCredits: 0,
     }).text,
-    "Codex wk ━━──────── 20% · ↻0",
+    "Codex wk ━━──────── 20% ↻0",
   );
   assert.equal(
     presentCodexQuotaStatus({

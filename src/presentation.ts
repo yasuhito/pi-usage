@@ -30,8 +30,8 @@ function formatWeeklyResetCountdown(remainingMs: number): string {
   const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
   const minutes = totalMinutes % 60;
 
-  if (days > 0) return `${days}d${hours > 0 ? ` ${hours}h` : ""}`;
-  if (hours > 0) return `${hours}h${minutes > 0 ? ` ${minutes}m` : ""}`;
+  if (days > 0) return `${days}d${hours > 0 ? `${hours}h` : ""}`;
+  if (hours > 0) return `${hours}h${minutes > 0 ? `${minutes}m` : ""}`;
   return `${minutes}m`;
 }
 
@@ -58,11 +58,11 @@ export function presentProviderSubscriptionUsage(
   const resetCountdownSuffix =
     status.weeklyWindowResetsAtMs === undefined
       ? ""
-      : ` · reset ${formatWeeklyResetCountdown(status.weeklyWindowResetsAtMs - nowMs)}`;
+      : ` ${formatWeeklyResetCountdown(status.weeklyWindowResetsAtMs - nowMs)}`;
   const limitResetCreditsSuffix =
     status.availableLimitResetCredits === undefined
       ? ""
-      : ` · ↻${status.availableLimitResetCredits}`;
+      : ` ↻${status.availableLimitResetCredits}`;
 
   return {
     providerName,

@@ -3,7 +3,7 @@
 A [Pi](https://pi.dev) extension that shows Codex and Claude subscription usage in the default footer.
 
 ```text
-Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2 Claude wk ━━━━━━━━── 80% · reset 4d 1h
+Codex wk ━━━━━━──── 63% 3d2h ↻2 Claude wk ━━━━━━━━── 80% 4d1h
 ```
 
 It uses `ctx.ui.setStatus()`, so it coexists with other status extensions such as [`pi-smart-zone`](https://pi.dev/packages/pi-smart-zone).
@@ -39,8 +39,8 @@ Claude subscription usage requires the OAuth authentication that Pi resolves aft
 | State | Status |
 | --- | --- |
 | Loading | `Codex wk loading… Claude wk loading…` |
-| Available | `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2 Claude wk ━━━━━━━━── 80% · reset 4d 1h` |
-| Temporarily stale | `Codex wk ━━━━━━──── 63% · reset 3d 2h · ↻2 ~ Claude wk ━━━━━━━━── 80% · reset 4d 1h ~` |
+| Available | `Codex wk ━━━━━━──── 63% 3d2h ↻2 Claude wk ━━━━━━━━── 80% 4d1h` |
+| Temporarily stale | `Codex wk ━━━━━━──── 63% 3d2h ↻2 ~ Claude wk ━━━━━━━━── 80% 4d1h ~` |
 | Unavailable | `Codex wk unavailable Claude wk unavailable` |
 
 Each percentage is provider-reported **weekly subscription usage**. The two providers retain different meanings:
@@ -52,7 +52,7 @@ Each percentage is provider-reported **weekly subscription usage**. The two prov
 
 Each bar has ten cells. A provider's presentation independently becomes a warning at 75% and an error at 90%.
 
-The `reset` suffix is the remaining time until the provider-reported weekly window reset. It uses compact day/hour, hour/minute, or minute units.
+The weekly reset countdown after the percentage is the remaining time until the provider-reported weekly window reset. It uses compact day/hour, hour/minute, or minute units without spaces between units.
 
 The `↻N` suffix is the provider-reported number of available **limit reset credits**. It is Codex-only and appears when Codex supplies the count, including when the count is zero.
 
