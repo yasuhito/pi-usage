@@ -4,7 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import { test } from "vitest";
+import { afterAll, describe, test } from "vitest";
 
 import {
   type AcquiredClaudeSubscriptionUsage,
@@ -461,6 +461,37 @@ test("model selection clears previous-account usage and suppresses late exchange
 
   assert.equal(f.statuses.length, publicationsAfterAccountChange);
   await f.emit("session_shutdown");
+});
+
+describe("primary-seam suite cancellation", () => {
+  let fixture: ReturnType<typeof registerFixture> | undefined;
+  let pendingStart: Promise<void> | undefined;
+  let finalized = 0;
+
+  test("leaves active session work for suite cleanup", async () => {
+    fixture = registerFixture();
+    fixture.setClaudeAcquisition(
+      Effect.never.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            finalized += 1;
+          }),
+        ),
+      ),
+    );
+    pendingStart = fixture.emit("session_start");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(fixture.claudeReads(), 1);
+  });
+
+  afterAll(async () => {
+    assert.ok(fixture);
+    assert.ok(pendingStart);
+    await fixture.emit("session_shutdown");
+    await pendingStart;
+    assert.equal(finalized, 1);
+  });
 });
 
 test("repeated session start closes the previous Scope and suppresses late publication", async () => {
