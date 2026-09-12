@@ -277,7 +277,16 @@ export function makeClaudeProviderMonitor(
         );
         if (result === undefined || !isCurrent(candidate)) return;
         const currentIdentity = yield* dependencies.resolveCredentialIdentity;
-        if (
+        if (result.kind === "acquired") {
+          if (
+            currentIdentity.kind !== "available" ||
+            currentIdentity.fingerprint !== result.usage.credentialFingerprint
+          ) {
+            yield* applyIdentity(currentIdentity, candidate);
+            return;
+          }
+          yield* applyIdentity(currentIdentity, candidate);
+        } else if (
           currentIdentity.kind !== "available" ||
           currentIdentity.fingerprint !== acquisitionIdentity
         ) {

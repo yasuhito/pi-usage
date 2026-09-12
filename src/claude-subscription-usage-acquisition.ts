@@ -20,6 +20,7 @@ export type ResolveClaudeAuthentication = Effect.Effect<
 export interface AcquiredClaudeSubscriptionUsage {
   readonly usedPercent: number;
   readonly resetsAtMs: number;
+  readonly credentialFingerprint: string;
 }
 
 export class ClaudeAuthenticationUnavailable extends Data.TaggedError(
@@ -70,14 +71,16 @@ function oauthKey(
   return key === undefined || key === "" ? undefined : key;
 }
 
+function fingerprintOAuthKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
 /** Returns only a non-reversible, session-memory-safe identity for eligible OAuth. */
 export function claudeCredentialFingerprint(
   authentication: ClaudeAuthentication | undefined,
 ): string | undefined {
   const key = oauthKey(authentication);
-  return key === undefined
-    ? undefined
-    : createHash("sha256").update(key).digest("hex");
+  return key === undefined ? undefined : fingerprintOAuthKey(key);
 }
 
 function retryAtMs(response: Response, now: number): number | undefined {
@@ -187,6 +190,10 @@ export function createAcquireClaudeSubscriptionUsage(
     requestUsage(dependencies.fetch, key).pipe(
       Effect.flatMap(classifyResponse),
       Effect.flatMap(decodeUsage),
+      Effect.map((usage) => ({
+        ...usage,
+        credentialFingerprint: fingerprintOAuthKey(key),
+      })),
       Effect.timeoutFail({
         duration: REQUEST_TIMEOUT_MS,
         onTimeout: () =>

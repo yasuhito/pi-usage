@@ -199,7 +199,6 @@ it.effect("interrupts response-body reads when the timeout expires", () =>
       pull() {},
       cancel() {
         cancelled = true;
-        return new Promise<void>(() => {});
       },
     });
     const fiber = yield* Effect.fork(

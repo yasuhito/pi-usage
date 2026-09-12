@@ -9,6 +9,7 @@ import { test } from "vitest";
 import {
   type AcquiredClaudeSubscriptionUsage,
   ClaudeAuthenticationUnavailable,
+  claudeCredentialFingerprint,
   PermanentClaudeSubscriptionUsageFailure,
 } from "../src/claude-subscription-usage-acquisition.ts";
 import type {
@@ -24,6 +25,15 @@ function accessTokenFor(accountId: string): string {
     }),
   ).toString("base64url");
   return `header.${payload}.signature`;
+}
+
+function anthropicCredentialFingerprint(): string {
+  const fingerprint = claudeCredentialFingerprint({
+    source: "OAuth",
+    auth: { apiKey: accessTokenFor("account-1") },
+  });
+  assert.ok(fingerprint);
+  return fingerprint;
 }
 
 type ExtensionHandler = (
@@ -54,7 +64,11 @@ function registerFixture() {
   let claudeAcquisition: Effect.Effect<
     AcquiredClaudeSubscriptionUsage,
     PermanentClaudeSubscriptionUsageFailure | ClaudeAuthenticationUnavailable
-  > = Effect.succeed({ usedPercent: 80, resetsAtMs: 2_000_000 });
+  > = Effect.succeed({
+    usedPercent: 80,
+    resetsAtMs: 2_000_000,
+    credentialFingerprint: anthropicCredentialFingerprint(),
+  });
 
   registerWeeklySubscriptionUsage(pi, {
     now: Effect.succeed(1_000_000),
@@ -205,7 +219,11 @@ test("activity refreshes only the direct provider that handled it", async () => 
   assert.equal(f.claudeReads(), 1);
 
   f.setClaudeAcquisition(
-    Effect.succeed({ usedPercent: 20, resetsAtMs: 2_000_000 }),
+    Effect.succeed({
+      usedPercent: 20,
+      resetsAtMs: 2_000_000,
+      credentialFingerprint: anthropicCredentialFingerprint(),
+    }),
   );
   f.setProvider("anthropic");
   await f.emit("agent_settled");

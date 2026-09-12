@@ -46,11 +46,17 @@ export function readBoundedResponseBody<Malformed, Temporary>(
           overflow !== undefined && error === overflow ? overflow : temporary(),
       }),
     (reader) =>
-      Effect.sync(() => {
-        void reader
-          .cancel()
-          .catch(() => undefined)
-          .finally(() => reader.releaseLock());
+      Effect.promise(async () => {
+        try {
+          await reader.cancel();
+        } catch {
+          // Cancellation failure must not replace the bounded-read outcome.
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // A reader may already have released its lock while unwinding.
+        }
       }),
   );
 }

@@ -5,6 +5,8 @@ import { Deferred, Effect, Fiber, TestClock } from "effect";
 import { makeClaudeProviderMonitor } from "../src/claude-provider-monitor.ts";
 import {
   type AcquiredClaudeSubscriptionUsage,
+  claudeCredentialFingerprint,
+  createAcquireClaudeSubscriptionUsage,
   MalformedClaudeSubscriptionUsage,
   PermanentClaudeSubscriptionUsageFailure,
   TemporaryClaudeSubscriptionUsageFailure,
@@ -18,7 +20,11 @@ function fixture() {
       | TemporaryClaudeSubscriptionUsageFailure
       | PermanentClaudeSubscriptionUsageFailure
       | MalformedClaudeSubscriptionUsage
-    > = Effect.succeed({ usedPercent: 63.4, resetsAtMs: 2_000_000 });
+    > = Effect.succeed({
+      usedPercent: 63.4,
+      resetsAtMs: 2_000_000,
+      credentialFingerprint: "fingerprint-1",
+    });
     let identity: string | undefined = "fingerprint-1";
     let reads = 0;
     const statuses: WeeklySubscriptionUsageStatus[] = [];
@@ -88,7 +94,13 @@ it.scoped("keeps temporary failures stale for at most ten minutes", () =>
 it.scoped("keeps malformed observations stale until the reset instant", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
-    f.setAcquisition(Effect.succeed({ usedPercent: 50, resetsAtMs: 120_000 }));
+    f.setAcquisition(
+      Effect.succeed({
+        usedPercent: 50,
+        resetsAtMs: 120_000,
+        credentialFingerprint: "fingerprint-1",
+      }),
+    );
     yield* f.monitor.start;
     f.setAcquisition(Effect.fail(new MalformedClaudeSubscriptionUsage()));
     yield* f.monitor.refreshForAccountChange;
@@ -147,6 +159,13 @@ it.scoped("keeps checking for credentials while unavailable", () =>
     yield* f.monitor.start;
     assert.equal(f.reads(), 0);
     f.setIdentity("fingerprint-2");
+    f.setAcquisition(
+      Effect.succeed({
+        usedPercent: 63.4,
+        resetsAtMs: 2_000_000,
+        credentialFingerprint: "fingerprint-2",
+      }),
+    );
     yield* TestClock.adjust("1 minute");
     assert.equal(f.reads(), 1);
     assert.equal(f.statuses.at(-1)?.kind, "available");
@@ -161,7 +180,11 @@ it.scoped("clears old usage before acquiring for a new identity", () =>
     f.setIdentity("fingerprint-2");
     f.setAcquisition(
       Deferred.await(pending).pipe(
-        Effect.as({ usedPercent: 20, resetsAtMs: 2_000_000 }),
+        Effect.as({
+          usedPercent: 20,
+          resetsAtMs: 2_000_000,
+          credentialFingerprint: "fingerprint-2",
+        }),
       ),
     );
     const refresh = yield* Effect.fork(f.monitor.refreshForAccountChange);
@@ -170,6 +193,59 @@ it.scoped("clears old usage before acquiring for a new identity", () =>
     yield* Deferred.succeed(pending, undefined);
     yield* Fiber.join(refresh);
     assert.deepEqual(f.statuses.at(-1), {
+      kind: "available",
+      usedPercent: 20,
+      stale: false,
+      weeklyWindowResetsAtMs: 2_000_000,
+    });
+  }),
+);
+
+it.scoped("publishes a successful acquisition made with refreshed OAuth", () =>
+  Effect.gen(function* () {
+    let key = "secret-1";
+    let requests = 0;
+    const statuses: WeeklySubscriptionUsageStatus[] = [];
+    const authentication = () => ({
+      source: "OAuth",
+      auth: { apiKey: key },
+    });
+    const acquireClaudeSubscriptionUsage = createAcquireClaudeSubscriptionUsage(
+      {
+        resolveAuthentication: Effect.sync(authentication),
+        fetch: async () => {
+          requests += 1;
+          if (requests === 1) {
+            key = "secret-2";
+            return new Response(null, { status: 401 });
+          }
+          return new Response(
+            JSON.stringify({
+              seven_day: {
+                utilization: 20,
+                resets_at: new Date(2_000_000).toISOString(),
+              },
+            }),
+          );
+        },
+      },
+    );
+    const monitor = yield* makeClaudeProviderMonitor({
+      resolveCredentialIdentity: Effect.sync(() => ({
+        kind: "available" as const,
+        fingerprint: claudeCredentialFingerprint(authentication()) ?? "",
+      })),
+      acquireClaudeSubscriptionUsage,
+      publish: (status) =>
+        Effect.sync(() => {
+          statuses.push(status);
+        }),
+    });
+
+    yield* monitor.start;
+
+    assert.equal(requests, 2);
+    assert.deepEqual(statuses.at(-1), {
       kind: "available",
       usedPercent: 20,
       stale: false,
@@ -187,7 +263,11 @@ it.scoped("does not publish an acquisition after its identity changes", () =>
     const pending = yield* Deferred.make<void>();
     f.setAcquisition(
       Deferred.await(pending).pipe(
-        Effect.as({ usedPercent: 90, resetsAtMs: 2_000_000 }),
+        Effect.as({
+          usedPercent: 90,
+          resetsAtMs: 2_000_000,
+          credentialFingerprint: "fingerprint-1",
+        }),
       ),
     );
     const refresh = yield* Effect.fork(f.monitor.refreshAfterActivity);
@@ -208,7 +288,11 @@ it.scoped("coalesces ordinary refreshes and supersedes old identities", () =>
     const oldGate = yield* Deferred.make<void>();
     f.setAcquisition(
       Deferred.await(oldGate).pipe(
-        Effect.as({ usedPercent: 90, resetsAtMs: 2_000_000 }),
+        Effect.as({
+          usedPercent: 90,
+          resetsAtMs: 2_000_000,
+          credentialFingerprint: "fingerprint-1",
+        }),
       ),
     );
     const first = yield* Effect.fork(f.monitor.refreshAfterActivity);
@@ -217,7 +301,11 @@ it.scoped("coalesces ordinary refreshes and supersedes old identities", () =>
     assert.equal(f.reads(), 1);
     f.setIdentity("fingerprint-2");
     f.setAcquisition(
-      Effect.succeed({ usedPercent: 20, resetsAtMs: 2_000_000 }),
+      Effect.succeed({
+        usedPercent: 20,
+        resetsAtMs: 2_000_000,
+        credentialFingerprint: "fingerprint-2",
+      }),
     );
     yield* f.monitor.refreshForAccountChange;
     yield* Fiber.await(first);

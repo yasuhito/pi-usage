@@ -49,6 +49,10 @@ it.effect("decodes the allowlisted seven-day subscription window", () =>
     assert.deepEqual(usage, {
       usedPercent: 63.4,
       resetsAtMs: Date.parse("2026-09-18T12:34:56.789Z"),
+      credentialFingerprint: claudeCredentialFingerprint({
+        source: "OAuth",
+        auth: { apiKey: "secret" },
+      }),
     });
   }),
 );
@@ -181,6 +185,13 @@ it.effect("re-resolves OAuth and retries authentication rejection once", () =>
         : new Response(JSON.stringify(goodBody));
     }, resolveAuthentication);
     assert.equal(usage.usedPercent, 63.4);
+    assert.equal(
+      usage.credentialFingerprint,
+      claudeCredentialFingerprint({
+        source: "OAuth",
+        auth: { apiKey: "secret-2" },
+      }),
+    );
     assert.equal(resolutions, 2);
     assert.equal(requests, 2);
   }),
@@ -311,6 +322,44 @@ it.effect("times out and cancels a stalled response body", () =>
       "TemporaryClaudeSubscriptionUsageFailure",
     );
     assert.equal(cancelled, true);
+  }),
+);
+
+it.effect("awaits streamed response cancellation before completing", () =>
+  Effect.gen(function* () {
+    let cancelStarted = false;
+    let finishCancellation: (() => void) | undefined;
+    const fiber = yield* Effect.fork(
+      Effect.exit(
+        acquire(
+          async () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new Uint8Array(64 * 1024 + 1));
+                },
+                cancel() {
+                  cancelStarted = true;
+                  return new Promise<void>((resolve) => {
+                    finishCancellation = resolve;
+                  });
+                },
+              }),
+            ),
+        ),
+      ),
+    );
+    while (!cancelStarted) yield* Effect.yieldNow();
+    yield* Effect.promise<void>(
+      () => new Promise((resolve) => setImmediate(resolve)),
+    );
+    assert.equal((yield* Fiber.poll(fiber))._tag, "None");
+    assert.ok(finishCancellation);
+    finishCancellation();
+    assert.equal(
+      failureTag(yield* Fiber.join(fiber)),
+      "MalformedClaudeSubscriptionUsage",
+    );
   }),
 );
 
