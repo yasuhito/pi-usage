@@ -165,13 +165,12 @@ export function makeCodexProviderMonitor(
     const invalidateAccount = (candidate: number) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        yield* publishReaction(
-          reconciliation.advance(
-            { kind: "account-selection-invalidated" },
-            now,
-          ),
-          candidate,
+        const reaction = reconciliation.advance(
+          { kind: "account-selection-invalidated" },
+          now,
         );
+        yield* publishReaction(reaction, candidate);
+        return reaction.publication === "replace";
       });
 
     const applyCredential = (
@@ -185,8 +184,10 @@ export function makeCodexProviderMonitor(
           terminal = false;
           currentAccountId = undefined;
           yield* interruptRetry;
-          yield* invalidateAccount(candidate);
-          yield* dependencies.publish({ kind: "unavailable" });
+          const removedUsage = yield* invalidateAccount(candidate);
+          if (!removedUsage) {
+            yield* dependencies.publish({ kind: "unavailable" });
+          }
           return undefined;
         }
         if (resolution.kind === "invalid") {
@@ -196,8 +197,10 @@ export function makeCodexProviderMonitor(
           nextAttemptAt = 0;
           consecutiveFailures = 0;
           yield* interruptRetry;
-          yield* invalidateAccount(candidate);
-          yield* dependencies.publish({ kind: "unavailable" });
+          const removedUsage = yield* invalidateAccount(candidate);
+          if (!removedUsage) {
+            yield* dependencies.publish({ kind: "unavailable" });
+          }
           return undefined;
         }
         credentialAvailable = true;

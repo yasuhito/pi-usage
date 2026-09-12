@@ -305,9 +305,11 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         case "activity":
           return reaction("preserve", shouldAcquireDedicated(nowMs));
 
-        case "account-selection-invalidated":
+        case "account-selection-invalidated": {
+          const hadUsage = capturedUsage !== undefined;
           discardAll();
-          return reaction();
+          return reaction(hadUsage ? "replace" : "preserve");
+        }
 
         case "stale-usage-expiration-reached":
           if (capturedUsage?.freshness !== "stale") return reaction();

@@ -355,7 +355,7 @@ for (const result of [
   });
 }
 
-test("account selection invalidation discards usage and sparse evidence without publication", () => {
+test("account selection invalidation publishes usage removal and discards sparse evidence", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   observeDedicated(reconciliation);
   observePassive(reconciliation, {
@@ -372,7 +372,7 @@ test("account selection invalidation discards usage and sparse evidence without 
   });
 
   assert.deepEqual(changed.observation, { kind: "none" });
-  assert.equal(changed.publication, "preserve");
+  assert.equal(changed.publication, "replace");
   assert.deepEqual(remainder.observation, { kind: "none" });
 });
 
