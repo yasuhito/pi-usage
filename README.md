@@ -57,6 +57,11 @@ The extension:
 5. opportunistically incorporates `x-codex-*` response headers;
 6. refreshes at startup, after relevant activity, and every minute.
 
+Internally, one session-scoped Effect monitor owns acquisition, polling,
+backoff, stale expiration, and interruption. Codex-specific decoding and
+observation reconciliation stay behind the monitor's small Effect interface;
+Pi event handlers are the only runtime boundary.
+
 It does not read Codex CLI files, spawn Codex, estimate quota from local token history, persist credentials, or follow redirects.
 
 ## Compatibility warning

@@ -3,9 +3,13 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
 import { test } from "vitest";
 
-import type { CodexCredential } from "../src/dedicated-weekly-quota-acquisition.ts";
+import type {
+  AcquiredWeeklyQuotaUsage,
+  CodexCredential,
+} from "../src/dedicated-weekly-quota-acquisition.ts";
 import { registerWeeklyQuotaUsage } from "../src/register.ts";
 
 function accessTokenFor(accountId: string): string {
@@ -18,17 +22,15 @@ function accessTokenFor(accountId: string): string {
 }
 
 type ExtensionHandler = (
-  event: unknown,
+  event: { readonly headers?: Readonly<Record<string, unknown>> },
   ctx: ExtensionContext,
 ) => void | Promise<void>;
 
 function registerFixture() {
   const handlers = new Map<string, ExtensionHandler[]>();
   const pi = {
-    on(event: string, handler: ExtensionHandler): void {
-      const registered = handlers.get(event) ?? [];
-      registered.push(handler);
-      handlers.set(event, registered);
+    on(event: string, handler: ExtensionHandler) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
   } as unknown as ExtensionAPI;
   const observedCredentials: CodexCredential[] = [];
@@ -36,30 +38,19 @@ function registerFixture() {
   let mode: ExtensionContext["mode"] = "tui";
   let provider = "openai-codex";
   let authEnabled = true;
-  let pollingStarted = 0;
-  let pollingStopped = 0;
+  let acquisition: Effect.Effect<AcquiredWeeklyQuotaUsage> = Effect.succeed({
+    usedPercent: 63.4,
+    resetsAtMs: 2_000_000,
+    windowPosition: "secondary",
+    availableLimitResetCredits: 2,
+  });
 
   registerWeeklyQuotaUsage(pi, {
-    now: () => 1_000_000,
-    random: () => 0.5,
-    schedule: () => () => {},
-    acquireDedicatedWeeklyQuotaUsage: async (credential) => {
+    now: Effect.succeed(1_000_000),
+    random: Effect.succeed(0.5),
+    acquireDedicatedWeeklyQuotaUsage: (credential) => {
       observedCredentials.push(credential);
-      return {
-        kind: "acquired",
-        usage: {
-          usedPercent: 63.4,
-          resetsAtMs: 2_000_000,
-          windowPosition: "secondary",
-          availableLimitResetCredits: 2,
-        },
-      };
-    },
-    startPolling: () => {
-      pollingStarted += 1;
-      return () => {
-        pollingStopped += 1;
-      };
+      return acquisition;
     },
   });
 
@@ -85,102 +76,100 @@ function registerFixture() {
         statuses.push({ key, text }),
     },
   } as unknown as ExtensionContext;
-
-  const emit = async (event: string, payload: unknown = {}): Promise<void> => {
-    for (const handler of handlers.get(event) ?? []) {
-      await handler(payload, ctx);
-    }
+  const emit = async (event: string, payload: unknown = {}) => {
+    for (const handler of handlers.get(event) ?? [])
+      await handler(
+        payload as { readonly headers?: Readonly<Record<string, unknown>> },
+        ctx,
+      );
   };
-
   return {
     emit,
     observedCredentials,
-    pollingStarted: () => pollingStarted,
-    pollingStopped: () => pollingStopped,
-    setAuthEnabled: (value: boolean) => {
-      authEnabled = value;
-    },
+    statuses,
     setMode: (value: ExtensionContext["mode"]) => {
       mode = value;
     },
     setProvider: (value: string) => {
       provider = value;
     },
-    statuses,
+    setAuthEnabled: (value: boolean) => {
+      authEnabled = value;
+    },
+    setAcquisition: (value: typeof acquisition) => {
+      acquisition = value;
+    },
   };
 }
 
 test("session start adapts Pi authentication and quota presentation", async () => {
-  const fixture = registerFixture();
-
-  await fixture.emit("session_start");
-
-  assert.deepEqual(fixture.observedCredentials, [
-    {
-      accessToken: accessTokenFor("account-1"),
-      accountId: "account-1",
-    },
+  const f = registerFixture();
+  await f.emit("session_start");
+  assert.deepEqual(f.observedCredentials, [
+    { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
   ]);
-  assert.deepEqual(fixture.statuses, [
+  assert.deepEqual(f.statuses, [
     { key: "pi-usage", text: "Codex wk loading…" },
-    {
-      key: "pi-usage",
-      text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2",
-    },
+    { key: "pi-usage", text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2" },
   ]);
+  await f.emit("session_shutdown");
 });
 
-test("missing Pi authentication clears the status", async () => {
-  const fixture = registerFixture();
-  fixture.setAuthEnabled(false);
+test("missing Pi authentication clears status without requesting", async () => {
+  const f = registerFixture();
+  f.setAuthEnabled(false);
+  await f.emit("session_start");
+  assert.deepEqual(f.statuses.at(-1), { key: "pi-usage", text: undefined });
+  assert.equal(f.observedCredentials.length, 0);
+  await f.emit("session_shutdown");
+});
 
-  await fixture.emit("session_start");
+test("non-TUI sessions perform no work", async () => {
+  const f = registerFixture();
+  f.setMode("rpc");
+  await f.emit("session_start");
+  assert.equal(f.observedCredentials.length, 0);
+  assert.equal(f.statuses.length, 0);
+});
 
-  assert.deepEqual(fixture.statuses.at(-1), {
-    key: "pi-usage",
-    text: undefined,
+test("responses from another provider are ignored", async () => {
+  const f = registerFixture();
+  await f.emit("session_start");
+  f.setProvider("anthropic");
+  await f.emit("after_provider_response", {
+    headers: { "x-codex-secondary-used-percent": "99" },
   });
-  assert.equal(fixture.pollingStarted(), 0);
-});
-
-test("non-TUI sessions do not start a lifecycle", async () => {
-  const fixture = registerFixture();
-  fixture.setMode("rpc");
-
-  await fixture.emit("session_start");
-
-  assert.equal(fixture.observedCredentials.length, 0);
-  assert.equal(fixture.statuses.length, 0);
-});
-
-test("responses from another provider do not enter the lifecycle", async () => {
-  const fixture = registerFixture();
-  await fixture.emit("session_start");
-  fixture.setProvider("anthropic");
-
-  await fixture.emit("after_provider_response", {
-    headers: {
-      "x-codex-secondary-used-percent": "99",
-      "x-codex-secondary-window-minutes": "10080",
-      "x-codex-secondary-reset-at": "4000",
-    },
-  });
-
-  assert.deepEqual(fixture.statuses.at(-1), {
-    key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2",
-  });
-});
-
-test("a new TUI session replaces and stops the previous lifecycle", async () => {
-  const fixture = registerFixture();
-
-  await fixture.emit("session_start");
-  await fixture.emit("session_start");
-  await fixture.emit("session_shutdown");
-
-  assert.deepEqual(
-    { started: fixture.pollingStarted(), stopped: fixture.pollingStopped() },
-    { started: 2, stopped: 2 },
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2",
   );
+  await f.emit("session_shutdown");
+});
+
+test("repeated session start closes the previous Scope and suppresses late publication", async () => {
+  const f = registerFixture();
+  let finalized = 0;
+  f.setAcquisition(
+    Effect.never.pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          finalized += 1;
+        }),
+      ),
+    ),
+  );
+  const first = f.emit("session_start");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  f.setAcquisition(
+    Effect.succeed({
+      usedPercent: 20,
+      resetsAtMs: 2_000_000,
+      windowPosition: "secondary",
+    }),
+  );
+  await f.emit("session_start");
+  await first;
+  assert.equal(finalized, 1);
+  assert.equal(f.statuses.at(-1)?.text, "Codex wk ━━──────── 20% · reset 16m");
+  await f.emit("session_shutdown");
 });
