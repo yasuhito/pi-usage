@@ -53,6 +53,6 @@
     "LICENSE"
   ],
   "dependencies": {
-    "effect": "^3.22.2"
+    "effect": "3.22.2"
   }
 }
