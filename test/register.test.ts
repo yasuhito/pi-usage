@@ -166,6 +166,17 @@ test("missing Codex authentication remains unavailable without delaying Claude",
   await f.emit("session_shutdown");
 });
 
+test("direct Codex activity refreshes Codex without refreshing Claude", async () => {
+  const f = registerFixture();
+  f.setAuthEnabled(false);
+  await f.emit("session_start");
+  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [0, 1]);
+  f.setAuthEnabled(true);
+  await f.emit("agent_settled");
+  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+  await f.emit("session_shutdown");
+});
+
 test("provider names and independently colored details compose without a separator", async () => {
   const f = registerFixture();
   f.setShowThemeColors(true);
@@ -186,6 +197,18 @@ test("a failed provider remains independently presentable", async () => {
   assert.equal(
     f.statuses.at(-1)?.text,
     "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk unavailable",
+  );
+  await f.emit("session_shutdown");
+});
+
+test("a provider defect does not reorder or recolor the other provider", async () => {
+  const f = registerFixture();
+  f.setShowThemeColors(true);
+  f.setClaudeAcquisition(Effect.die("Claude acquisition defect"));
+  await f.emit("session_start");
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "[accent:Codex] [dim:wk ━━━━━━──── 63% · reset 16m · ↻2] [accent:Claude] [dim:wk unavailable]",
   );
   await f.emit("session_shutdown");
 });

@@ -93,6 +93,10 @@ export function makeCodexProviderMonitor(
     let accountChangesInFlight = 0;
     let nextAttemptAt = 0;
     let consecutiveFailures = 0;
+    let triggerRefresh: (
+      forced: boolean,
+    ) => Effect.Effect<Fiber.RuntimeFiber<void> | undefined> = () =>
+      Effect.succeed(undefined);
     let refresh: (forced: boolean) => Effect.Effect<void> = () => Effect.void;
 
     const isCurrent = (candidate: number) => candidate === generation;
@@ -317,40 +321,43 @@ export function makeCodexProviderMonitor(
         yield* applyResult(result, candidate);
       });
 
-    refresh = (forced: boolean): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const fiber = yield* gate.withPermits(1)(
-          Effect.gen(function* () {
-            if (!forced && active !== undefined) return active;
-            if (forced) {
-              generation += 1;
-              yield* interruptRetry;
-              if (active !== undefined) yield* Fiber.interrupt(active);
-            }
-            const candidate = generation;
-            if (forced) accountChangesInFlight += 1;
-            const refreshEffect = performRefresh(candidate, forced).pipe(
+    triggerRefresh = (forced: boolean) =>
+      gate.withPermits(1)(
+        Effect.gen(function* () {
+          if (!forced && active !== undefined) return undefined;
+          if (forced) {
+            generation += 1;
+            yield* interruptRetry;
+            if (active !== undefined) yield* Fiber.interrupt(active);
+          }
+          const candidate = generation;
+          if (forced) accountChangesInFlight += 1;
+          const refreshEffect = performRefresh(candidate, forced).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (forced) accountChangesInFlight -= 1;
+              }),
+            ),
+          );
+          const created = yield* Effect.forkIn(
+            refreshEffect.pipe(
               Effect.ensuring(
                 Effect.sync(() => {
-                  if (forced) accountChangesInFlight -= 1;
+                  if (active === created) active = undefined;
                 }),
               ),
-            );
-            const created = yield* Effect.forkIn(
-              refreshEffect.pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    if (active === created) active = undefined;
-                  }),
-                ),
-              ),
-              scope,
-            );
-            active = created;
-            return created;
-          }),
-        );
-        yield* Fiber.await(fiber);
+            ),
+            scope,
+          );
+          active = created;
+          return created;
+        }),
+      );
+
+    refresh = (forced: boolean): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        const fiber = yield* triggerRefresh(forced);
+        if (fiber !== undefined) yield* Fiber.await(fiber);
       });
 
     yield* Effect.addFinalizer(() =>
@@ -366,11 +373,13 @@ export function makeCodexProviderMonitor(
     );
 
     yield* Effect.forkIn(
-      Stream.repeatEffect(
-        Effect.sleep(POLL_INTERVAL_MS).pipe(
-          Effect.andThen(Effect.suspend(() => refresh(false))),
+      Stream.tick(POLL_INTERVAL_MS).pipe(
+        Stream.drop(1),
+        Stream.runForEach(() =>
+          Effect.suspend(() => triggerRefresh(false)).pipe(Effect.asVoid),
         ),
-      ).pipe(Stream.runDrain),
+        Effect.asVoid,
+      ),
       scope,
     );
 

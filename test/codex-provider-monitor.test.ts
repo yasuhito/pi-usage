@@ -100,13 +100,44 @@ it.scoped("presents missing authentication as unavailable", () =>
   }),
 );
 
-it.scoped("polls every minute and debounces fresh activity", () =>
+it.scoped("polls every minute using virtual time", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
     yield* f.monitor.start;
+    yield* TestClock.adjust("59999 millis");
+    assert.equal(f.reads(), 1);
+    yield* TestClock.adjust("1 millis");
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("1 minute");
+    assert.equal(f.reads(), 3);
+  }),
+);
+
+it.scoped("keeps the minute poll cadence while a refresh is in flight", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    const gate = yield* Deferred.make<void>();
+    f.setAcquisition(Deferred.await(gate).pipe(Effect.as(goodUsage)));
+    yield* TestClock.adjust("1 minute");
+    assert.equal(f.reads(), 2);
+    yield* TestClock.adjust("65 seconds");
+    assert.equal(f.reads(), 2);
+    yield* Deferred.succeed(gate, undefined);
+    yield* TestClock.adjust("55 seconds");
+    assert.equal(f.reads(), 3);
+  }),
+);
+
+it.scoped("debounces activity for exactly 30 seconds", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    yield* TestClock.adjust("29999 millis");
     yield* f.monitor.refreshAfterActivity;
     assert.equal(f.reads(), 1);
-    yield* TestClock.adjust("1 minute");
+    yield* TestClock.adjust("1 millis");
+    yield* f.monitor.refreshAfterActivity;
     assert.equal(f.reads(), 2);
   }),
 );
@@ -234,20 +265,66 @@ it.scoped(
     }),
 );
 
-it.scoped("retries temporary failures at their independent deadline", () =>
+it.scoped("honors a valid provider retry deadline", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
+    f.setAcquisition(
+      Effect.fail(new TemporaryAcquisitionFailure({ retryAtMs: 5_000 })),
+    );
     yield* f.monitor.start;
-    yield* TestClock.adjust("31 seconds");
+    yield* TestClock.adjust("4999 millis");
+    assert.equal(f.reads(), 1);
+    yield* TestClock.adjust("1 millis");
+    assert.equal(f.reads(), 2);
+  }),
+);
+
+it.scoped("grows deterministic retry backoff and caps it at one minute", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
     f.setAcquisition(
       Effect.fail(new TemporaryAcquisitionFailure({ retryAtMs: undefined })),
     );
-    yield* f.monitor.refreshForAccountChange;
-    assert.equal(f.reads(), 2);
-    yield* TestClock.adjust("999 millis");
-    assert.equal(f.reads(), 2);
+    yield* f.monitor.start;
+    assert.equal(f.reads(), 1);
+    for (const [delay, expectedReads] of [
+      [1, 2],
+      [2, 3],
+      [4, 4],
+      [8, 5],
+      [16, 6],
+      [32, 7],
+      [60, 8],
+      [60, 9],
+    ] as const) {
+      yield* TestClock.adjust(`${delay} seconds`);
+      assert.equal(f.reads(), expectedReads);
+    }
+  }),
+);
+
+it.scoped("applies injected deterministic retry jitter", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const monitor = yield* makeCodexProviderMonitor({
+      resolveCredential: Effect.succeed({
+        kind: "available" as const,
+        credential: credential(),
+      }),
+      acquireDedicatedWeeklyQuotaUsage: () => {
+        reads += 1;
+        return Effect.fail(
+          new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
+        );
+      },
+      publish: () => Effect.void,
+      random: Effect.succeed(1),
+    });
+    yield* monitor.start;
+    yield* TestClock.adjust("1499 millis");
+    assert.equal(reads, 1);
     yield* TestClock.adjust("1 millis");
-    assert.equal(f.reads(), 3);
+    assert.equal(reads, 2);
   }),
 );
 
