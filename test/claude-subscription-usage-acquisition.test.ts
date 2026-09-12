@@ -65,7 +65,10 @@ it.effect("rejects malformed required weekly data without clamping", () =>
       { utilization: -1, resets_at: "2026-09-18T12:34:56Z" },
       { utilization: 101, resets_at: "2026-09-18T12:34:56Z" },
       { utilization: 50, resets_at: "not-an-instant" },
+      { utilization: 50, resets_at: "2026-02-30T00:00:00Z" },
+      { utilization: 50, resets_at: "2026-09-18" },
       { utilization: 50, resets_at: "1969-01-01T00:00:00Z" },
+      { utilization: 50, resets_at: "+275760-09-13T00:00:00.001Z" },
     ]) {
       const exit = yield* Effect.exit(
         acquire(
@@ -77,6 +80,59 @@ it.effect("rejects malformed required weekly data without clamping", () =>
         "MalformedClaudeSubscriptionUsage",
         JSON.stringify(seven_day),
       );
+    }
+  }),
+);
+
+it.effect("rejects non-finite utilization without publication", () =>
+  Effect.gen(function* () {
+    for (const utilization of ["NaN", "1e400", "-1e400"]) {
+      const exit = yield* Effect.exit(
+        acquire(
+          async () =>
+            new Response(
+              `{"seven_day":{"utilization":${utilization},"resets_at":"2026-09-18T12:34:56Z"}}`,
+            ),
+        ),
+      );
+      assert.equal(
+        failureTag(exit),
+        "MalformedClaudeSubscriptionUsage",
+        utilization,
+      );
+    }
+  }),
+);
+
+it.effect("applies the additive and optional-window response contract", () =>
+  Effect.gen(function* () {
+    const acceptedBodies = [
+      {
+        seven_day: goodBody.seven_day,
+      },
+      {
+        five_hour: null,
+        seven_day: goodBody.seven_day,
+        seven_day_opus: null,
+        unknown_top_level: { raw: true },
+      },
+      {
+        seven_day: {
+          utilization: 63.4,
+          resets_at: "2026-09-18T12:34Z",
+        },
+      },
+    ];
+    for (const body of acceptedBodies) {
+      const usage = yield* acquire(
+        async () => new Response(JSON.stringify(body)),
+      );
+      assert.equal(usage.usedPercent, 63.4);
+    }
+
+    for (const body of ["", "{", "{}", '{"seven_day":null}']) {
+      const exit = yield* Effect.exit(acquire(async () => new Response(body)));
+      assert.equal(failureTag(exit), "MalformedClaudeSubscriptionUsage", body);
     }
   }),
 );
@@ -251,6 +307,96 @@ it.effect(
         );
       }
     }),
+);
+
+it.effect(
+  "keeps an OAuth-authenticated 429 separate from authentication metadata",
+  () =>
+    Effect.gen(function* () {
+      let resolutions = 0;
+      let requests = 0;
+      const exit = yield* Effect.exit(
+        acquire(
+          async (_input, init) => {
+            requests += 1;
+            assert.deepEqual(init?.headers, {
+              Authorization: "Bearer oauth-secret",
+            });
+            return new Response("rate-limit-raw-secret", { status: 429 });
+          },
+          Effect.sync(() => {
+            resolutions += 1;
+            return {
+              source: "OAuth",
+              auth: { apiKey: "oauth-secret" },
+            };
+          }),
+        ),
+      );
+      assert.equal(failureTag(exit), "TemporaryClaudeSubscriptionUsageFailure");
+      assert.equal(resolutions, 1);
+      assert.equal(requests, 1);
+      assert.equal(JSON.stringify(exit).includes("oauth-secret"), false);
+      assert.equal(
+        JSON.stringify(exit).includes("rate-limit-raw-secret"),
+        false,
+      );
+    }),
+);
+
+it.effect("keeps every unsuccessful exchange outcome secret-safe", () =>
+  Effect.gen(function* () {
+    const cases = [
+      [400, "PermanentClaudeSubscriptionUsageFailure", 1],
+      [404, "PermanentClaudeSubscriptionUsageFailure", 1],
+      [302, "PermanentClaudeSubscriptionUsageFailure", 1],
+      [408, "TemporaryClaudeSubscriptionUsageFailure", 1],
+      [425, "TemporaryClaudeSubscriptionUsageFailure", 1],
+      [429, "TemporaryClaudeSubscriptionUsageFailure", 1],
+      [503, "TemporaryClaudeSubscriptionUsageFailure", 1],
+      [401, "ClaudeAuthenticationRejected", 2],
+      [403, "ClaudeAuthenticationRejected", 2],
+      [200, "MalformedClaudeSubscriptionUsage", 1],
+    ] as const;
+    for (const [status, expectedTag, expectedRequests] of cases) {
+      let requests = 0;
+      const exit = yield* Effect.exit(
+        acquire(async () => {
+          requests += 1;
+          return new Response("raw-response-secret", {
+            status,
+            headers: { "x-authenticated-secret": "header-secret" },
+          });
+        }, oauth("credential-secret")),
+      );
+      const serialized = JSON.stringify(exit);
+      assert.equal(failureTag(exit), expectedTag);
+      assert.equal(requests, expectedRequests);
+      for (const secret of [
+        "credential-secret",
+        "raw-response-secret",
+        "header-secret",
+        "x-authenticated-secret",
+      ]) {
+        assert.equal(
+          serialized.includes(secret),
+          false,
+          `${status}: ${secret}`,
+        );
+      }
+    }
+
+    const networkExit = yield* Effect.exit(
+      acquire(async () => {
+        throw new Error("transport-secret");
+      }, oauth("credential-secret")),
+    );
+    assert.equal(
+      failureTag(networkExit),
+      "TemporaryClaudeSubscriptionUsageFailure",
+    );
+    assert.equal(JSON.stringify(networkExit).includes("secret"), false);
+  }),
 );
 
 it.effect("honors valid Retry-After instructions", () =>
