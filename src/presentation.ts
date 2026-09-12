@@ -1,4 +1,4 @@
-export type QuotaStatus =
+export type WeeklySubscriptionUsageStatus =
   | { readonly kind: "loading" }
   | { readonly kind: "unavailable" }
   | {
@@ -9,7 +9,15 @@ export type QuotaStatus =
       readonly availableLimitResetCredits?: number;
     };
 
-export interface QuotaStatusPresentation {
+export type MonitoredProviderName = "Codex" | "Claude";
+
+export interface ProviderSubscriptionUsagePresentation {
+  readonly providerName: MonitoredProviderName;
+  readonly detail: string;
+  readonly color: "dim" | "warning" | "error";
+}
+
+export interface SubscriptionUsagePresentation {
   readonly text: string;
   readonly color: "dim" | "warning" | "error";
 }
@@ -27,16 +35,15 @@ function formatWeeklyResetCountdown(remainingMs: number): string {
   return `${minutes}m`;
 }
 
-export function presentQuotaStatus(
-  status: QuotaStatus,
+export function presentProviderSubscriptionUsage(
+  providerName: MonitoredProviderName,
+  status: WeeklySubscriptionUsageStatus,
   nowMs = Date.now(),
-): QuotaStatusPresentation {
+): ProviderSubscriptionUsagePresentation {
   if (status.kind !== "available") {
     return {
-      text:
-        status.kind === "loading"
-          ? "Codex wk loading…"
-          : "Codex wk unavailable",
+      providerName,
+      detail: status.kind === "loading" ? "wk loading…" : "wk unavailable",
       color: "dim",
     };
   }
@@ -58,7 +65,20 @@ export function presentQuotaStatus(
       : ` · ↻${status.availableLimitResetCredits}`;
 
   return {
-    text: `Codex wk ${bar} ${usedPercent}%${resetCountdownSuffix}${limitResetCreditsSuffix}${status.stale ? " ~" : ""}`,
+    providerName,
+    detail: `wk ${bar} ${usedPercent}%${resetCountdownSuffix}${limitResetCreditsSuffix}${status.stale ? " ~" : ""}`,
     color: usedPercent >= 90 ? "error" : usedPercent >= 75 ? "warning" : "dim",
+  };
+}
+
+/** Backwards-compatible single-provider presentation for the Codex seam. */
+export function presentCodexQuotaStatus(
+  status: WeeklySubscriptionUsageStatus,
+  nowMs = Date.now(),
+): SubscriptionUsagePresentation {
+  const presentation = presentProviderSubscriptionUsage("Codex", status, nowMs);
+  return {
+    text: `${presentation.providerName} ${presentation.detail}`,
+    color: presentation.color,
   };
 }

@@ -6,11 +6,15 @@ import type {
 import { Effect } from "effect";
 import { test } from "vitest";
 
+import {
+  type AcquiredClaudeSubscriptionUsage,
+  PermanentClaudeSubscriptionUsageFailure,
+} from "../src/claude-subscription-usage-acquisition.ts";
 import type {
   AcquiredWeeklyQuotaUsage,
   CodexCredential,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
-import { registerWeeklyQuotaUsage } from "../src/register.ts";
+import { registerWeeklySubscriptionUsage } from "../src/register.ts";
 
 function accessTokenFor(accountId: string): string {
   const payload = Buffer.from(
@@ -38,20 +42,26 @@ function registerFixture() {
   let mode: ExtensionContext["mode"] = "tui";
   let provider = "openai-codex";
   let authEnabled = true;
+  let showThemeColors = false;
   let acquisition: Effect.Effect<AcquiredWeeklyQuotaUsage> = Effect.succeed({
     usedPercent: 63.4,
     resetsAtMs: 2_000_000,
     windowPosition: "secondary",
     availableLimitResetCredits: 2,
   });
+  let claudeAcquisition: Effect.Effect<
+    AcquiredClaudeSubscriptionUsage,
+    PermanentClaudeSubscriptionUsageFailure
+  > = Effect.succeed({ usedPercent: 80, resetsAtMs: 2_000_000 });
 
-  registerWeeklyQuotaUsage(pi, {
+  registerWeeklySubscriptionUsage(pi, {
     now: Effect.succeed(1_000_000),
     random: Effect.succeed(0.5),
     acquireDedicatedWeeklyQuotaUsage: (credential) => {
       observedCredentials.push(credential);
       return acquisition;
     },
+    acquireClaudeSubscriptionUsage: () => () => claudeAcquisition,
   });
 
   const ctx = {
@@ -71,7 +81,10 @@ function registerFixture() {
           : undefined,
     },
     ui: {
-      theme: { fg: (_color: string, text: string) => text },
+      theme: {
+        fg: (color: string, text: string) =>
+          showThemeColors ? `[${color}:${text}]` : text,
+      },
       setStatus: (key: string, text: string | undefined) =>
         statuses.push({ key, text }),
     },
@@ -96,8 +109,14 @@ function registerFixture() {
     setAuthEnabled: (value: boolean) => {
       authEnabled = value;
     },
+    setShowThemeColors: (value: boolean) => {
+      showThemeColors = value;
+    },
     setAcquisition: (value: typeof acquisition) => {
       acquisition = value;
+    },
+    setClaudeAcquisition: (value: typeof claudeAcquisition) => {
+      claudeAcquisition = value;
     },
   };
 }
@@ -108,20 +127,60 @@ test("session start adapts Pi authentication and quota presentation", async () =
   assert.deepEqual(f.observedCredentials, [
     { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
   ]);
-  assert.deepEqual(f.statuses, [
-    { key: "pi-usage", text: "Codex wk loading…" },
-    { key: "pi-usage", text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2" },
-  ]);
+  assert.deepEqual(f.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk ━━━━━━━━── 80% · reset 16m",
+  });
   await f.emit("session_shutdown");
 });
 
-test("missing Pi authentication clears status without requesting", async () => {
+test("missing Codex authentication remains unavailable without delaying Claude", async () => {
   const f = registerFixture();
   f.setAuthEnabled(false);
   await f.emit("session_start");
-  assert.deepEqual(f.statuses.at(-1), { key: "pi-usage", text: undefined });
+  assert.deepEqual(f.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk unavailable Claude wk ━━━━━━━━── 80% · reset 16m",
+  });
   assert.equal(f.observedCredentials.length, 0);
   await f.emit("session_shutdown");
+});
+
+test("provider names and independently colored details compose without a separator", async () => {
+  const f = registerFixture();
+  f.setShowThemeColors(true);
+  await f.emit("session_start");
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "[accent:Codex] [dim:wk ━━━━━━──── 63% · reset 16m · ↻2] [accent:Claude] [warning:wk ━━━━━━━━── 80% · reset 16m]",
+  );
+  await f.emit("session_shutdown");
+});
+
+test("a failed provider remains independently presentable", async () => {
+  const f = registerFixture();
+  f.setClaudeAcquisition(
+    Effect.fail(new PermanentClaudeSubscriptionUsageFailure()),
+  );
+  await f.emit("session_start");
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk unavailable",
+  );
+  await f.emit("session_shutdown");
+});
+
+test("a slow provider does not delay the other provider's publication", async () => {
+  const f = registerFixture();
+  f.setClaudeAcquisition(Effect.never);
+  const start = f.emit("session_start");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk loading…",
+  );
+  await f.emit("session_shutdown");
+  await start;
 });
 
 test("non-TUI sessions perform no work", async () => {
@@ -141,7 +200,7 @@ test("responses from another provider are ignored", async () => {
   });
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2",
+    "Codex wk ━━━━━━──── 63% · reset 16m · ↻2 Claude wk ━━━━━━━━── 80% · reset 16m",
   );
   await f.emit("session_shutdown");
 });
@@ -170,6 +229,9 @@ test("repeated session start closes the previous Scope and suppresses late publi
   await f.emit("session_start");
   await first;
   assert.equal(finalized, 1);
-  assert.equal(f.statuses.at(-1)?.text, "Codex wk ━━──────── 20% · reset 16m");
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "Codex wk ━━──────── 20% · reset 16m Claude wk ━━━━━━━━── 80% · reset 16m",
+  );
   await f.emit("session_shutdown");
 });

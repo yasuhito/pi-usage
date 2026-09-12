@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import { presentQuotaStatus } from "../src/presentation.ts";
+import {
+  presentCodexQuotaStatus,
+  presentProviderSubscriptionUsage,
+} from "../src/presentation.ts";
 
 test("fresh weekly quota usage is presented as a ten-cell used bar", () => {
   assert.deepEqual(
-    presentQuotaStatus(
+    presentCodexQuotaStatus(
       {
         kind: "available",
         usedPercent: 63,
@@ -47,7 +50,7 @@ test("quota presentation rounds, clamps, colors, and marks freshness", () => {
   ];
 
   for (const { status, expected } of cases) {
-    assert.deepEqual(presentQuotaStatus(status), expected);
+    assert.deepEqual(presentCodexQuotaStatus(status), expected);
   }
 });
 
@@ -69,7 +72,7 @@ test("weekly reset countdown uses compact hour, minute, and elapsed forms", () =
 
   for (const [remainingMs, expected] of cases) {
     assert.equal(
-      presentQuotaStatus(
+      presentCodexQuotaStatus(
         { ...status, weeklyWindowResetsAtMs: nowMs + remainingMs },
         nowMs,
       ).text,
@@ -80,7 +83,7 @@ test("weekly reset countdown uses compact hour, minute, and elapsed forms", () =
 
 test("zero limit reset credits are shown while an unavailable count is omitted", () => {
   assert.equal(
-    presentQuotaStatus({
+    presentCodexQuotaStatus({
       kind: "available",
       usedPercent: 20,
       stale: false,
@@ -89,7 +92,7 @@ test("zero limit reset credits are shown while an unavailable count is omitted",
     "Codex wk ━━──────── 20% · ↻0",
   );
   assert.equal(
-    presentQuotaStatus({
+    presentCodexQuotaStatus({
       kind: "available",
       usedPercent: 20,
       stale: false,
@@ -98,12 +101,37 @@ test("zero limit reset credits are shown while an unavailable count is omitted",
   );
 });
 
+test("Claude retains its weekly label and shares Codex thresholds", () => {
+  assert.deepEqual(
+    presentProviderSubscriptionUsage("Claude", {
+      kind: "available",
+      usedPercent: 90,
+      stale: true,
+    }),
+    {
+      providerName: "Claude",
+      detail: "wk ━━━━━━━━━─ 90% ~",
+      color: "error",
+    },
+  );
+  assert.deepEqual(
+    presentProviderSubscriptionUsage("Claude", {
+      kind: "unavailable",
+    }),
+    {
+      providerName: "Claude",
+      detail: "wk unavailable",
+      color: "dim",
+    },
+  );
+});
+
 test("loading and unavailable statuses have compact neutral presentations", () => {
-  assert.deepEqual(presentQuotaStatus({ kind: "loading" }), {
+  assert.deepEqual(presentCodexQuotaStatus({ kind: "loading" }), {
     text: "Codex wk loading…",
     color: "dim",
   });
-  assert.deepEqual(presentQuotaStatus({ kind: "unavailable" }), {
+  assert.deepEqual(presentCodexQuotaStatus({ kind: "unavailable" }), {
     text: "Codex wk unavailable",
     color: "dim",
   });

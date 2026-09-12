@@ -1,11 +1,12 @@
 {
   "name": "@yasuhito/pi-usage",
   "version": "0.1.0",
-  "description": "A Pi extension that displays Codex weekly quota usage, weekly reset countdown, and limit reset credits",
+  "description": "A Pi extension that displays Codex and Claude weekly subscription usage",
   "keywords": [
     "pi-package",
     "pi-extension",
     "codex",
+    "claude",
     "usage"
   ],
   "type": "module",

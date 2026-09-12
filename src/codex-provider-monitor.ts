@@ -17,7 +17,7 @@ import type {
   DedicatedWeeklyQuotaAcquisitionError,
   DedicatedWeeklyQuotaAcquisitionResult,
 } from "./dedicated-weekly-quota-acquisition.ts";
-import type { QuotaStatus } from "./presentation.ts";
+import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 import {
   type ProviderMonitor,
   ProviderMonitorService,
@@ -39,7 +39,9 @@ export type CodexCredentialResolution =
 export interface CodexProviderMonitorDependencies {
   readonly resolveCredential: Effect.Effect<CodexCredentialResolution>;
   readonly acquireDedicatedWeeklyQuotaUsage: AcquireDedicatedWeeklyQuotaUsage;
-  readonly publish: (status: QuotaStatus | undefined) => Effect.Effect<void>;
+  readonly publish: (
+    status: WeeklySubscriptionUsageStatus,
+  ) => Effect.Effect<void>;
   readonly random?: Effect.Effect<number>;
 }
 
@@ -169,7 +171,7 @@ export function makeCodexProviderMonitor(
           credentialAvailable = false;
           currentAccountId = undefined;
           yield* invalidateAccount(candidate);
-          yield* dependencies.publish(undefined);
+          yield* dependencies.publish({ kind: "unavailable" });
           return undefined;
         }
         if (resolution.kind === "invalid") {

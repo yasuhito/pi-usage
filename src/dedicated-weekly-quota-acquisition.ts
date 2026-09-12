@@ -1,4 +1,5 @@
 import { Clock, Data, Effect, Schema } from "effect";
+import { readBoundedResponseBody } from "./bounded-response-body.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -65,55 +66,6 @@ const ProviderBody = Schema.Struct({
   rate_limit: Schema.Record({ key: Schema.String, value: Schema.Unknown }),
   rate_limit_reset_credits: Schema.optional(Schema.Unknown),
 });
-
-function declaredResponseSize(response: Response): number | undefined {
-  const value = response.headers.get("content-length");
-  if (value === null || !/^\d+$/.test(value)) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function readBoundedBody(response: Response) {
-  const declaredSize = declaredResponseSize(response);
-  if (declaredSize !== undefined && declaredSize > MAX_RESPONSE_BYTES) {
-    return Effect.fail(new MalformedAcquisition());
-  }
-  const body = response.body;
-  if (body === null) return Effect.succeed("");
-
-  const decoder = new TextDecoder();
-  let size = 0;
-  let text = "";
-  return Effect.acquireUseRelease(
-    Effect.sync(() => body.getReader()),
-    (reader) =>
-      Effect.tryPromise({
-        try: async () => {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            size += value.byteLength;
-            if (size > MAX_RESPONSE_BYTES) {
-              throw new MalformedAcquisition();
-            }
-            text += decoder.decode(value, { stream: true });
-          }
-          return text + decoder.decode();
-        },
-        catch: (error) =>
-          error instanceof MalformedAcquisition
-            ? error
-            : new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
-      }),
-    (reader) =>
-      Effect.sync(() => {
-        void reader
-          .cancel()
-          .catch(() => undefined)
-          .finally(() => reader.releaseLock());
-      }),
-  );
-}
 
 function retryAtMs(response: Response, now: number): number | undefined {
   const rawValue = response.headers.get("retry-after");
@@ -206,7 +158,12 @@ export function createAcquireDedicatedWeeklyQuotaUsage(
         return yield* new PermanentAcquisitionFailure();
       }
 
-      const text = yield* readBoundedBody(response);
+      const text = yield* readBoundedResponseBody(
+        response,
+        MAX_RESPONSE_BYTES,
+        () => new MalformedAcquisition(),
+        () => new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
+      );
       let unknownBody: unknown;
       try {
         unknownBody = JSON.parse(text) as unknown;

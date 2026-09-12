@@ -13,7 +13,7 @@ import {
   PermanentAcquisitionFailure,
   TemporaryAcquisitionFailure,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
-import type { QuotaStatus } from "../src/presentation.ts";
+import type { WeeklySubscriptionUsageStatus } from "../src/presentation.ts";
 
 const credential = (accountId = "account-1"): CodexCredential => ({
   accessToken: `token-${accountId}`,
@@ -40,7 +40,7 @@ function fixture() {
     > = Effect.succeed(goodUsage);
     let reads = 0;
     const credentials: CodexCredential[] = [];
-    const statuses: Array<QuotaStatus | undefined> = [];
+    const statuses: Array<WeeklySubscriptionUsageStatus> = [];
     const monitor = yield* makeCodexProviderMonitor({
       resolveCredential: Effect.sync(() => resolution),
       acquireDedicatedWeeklyQuotaUsage: (value) => {
@@ -86,12 +86,15 @@ it.scoped("publishes loading and active-account usage", () =>
   }),
 );
 
-it.scoped("keeps missing authentication hidden", () =>
+it.scoped("presents missing authentication as unavailable", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
     f.setResolution({ kind: "missing" });
     yield* f.monitor.start;
-    assert.deepEqual(f.statuses, [{ kind: "loading" }, undefined]);
+    assert.deepEqual(f.statuses, [
+      { kind: "loading" },
+      { kind: "unavailable" },
+    ]);
     yield* TestClock.adjust("2 minutes");
     assert.equal(f.reads(), 0);
   }),
@@ -241,7 +244,7 @@ it.scoped("permanent unavailability discards prior usage", () =>
   }),
 );
 
-it.scoped("logout during authentication refresh clears the status", () =>
+it.scoped("logout during authentication refresh presents unavailable", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
     yield* f.monitor.start;
@@ -251,7 +254,7 @@ it.scoped("logout during authentication refresh clears the status", () =>
       }).pipe(Effect.andThen(Effect.fail(new AuthenticationRejected()))),
     );
     yield* f.monitor.refreshForAccountChange;
-    assert.equal(f.statuses.at(-1), undefined);
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
   }),
 );
 
