@@ -37,7 +37,7 @@
   },
   "homepage": "https://github.com/yasuhito/pi-usage#readme",
   "scripts": {
-    "test": "node --test test/*.test.ts",
+    "test": "node --test --test-reporter=dot test/*.test.ts",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit",
