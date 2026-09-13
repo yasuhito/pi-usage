@@ -314,7 +314,10 @@ test("stale usage expires while sparse passive evidence survives", () => {
   );
 
   const expired = reconciliation.advance(
-    { kind: "stale-usage-expiration-reached" },
+    {
+      kind: "stale-usage-expiration-reached",
+      deadlineMs: NOW + 600_000,
+    },
     NOW + 600_000,
   );
   const completed = observePassive(

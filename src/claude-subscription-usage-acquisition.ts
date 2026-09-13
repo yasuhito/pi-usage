@@ -8,6 +8,18 @@ import {
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 5_000;
+const RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
+// Compatibility identifier for the verified Claude Code OAuth request shape.
+// Update only after re-verifying the contract documented in the prototype.
+const CLAUDE_CODE_COMPATIBILITY_VERSION = "2.1.251";
+
+const CLAUDE_USAGE_HEADERS = {
+  Accept: "application/json",
+  "User-Agent": `claude-cli/${CLAUDE_CODE_COMPATIBILITY_VERSION}`,
+  "anthropic-beta": "oauth-2025-04-20",
+  "anthropic-dangerous-direct-browser-access": "true",
+  "x-app": "cli",
+} as const;
 
 export interface ClaudeAuthentication {
   readonly source?: string;
@@ -154,7 +166,10 @@ function requestUsage(
     try: (signal) =>
       fetchImplementation(CLAUDE_USAGE_URL, {
         method: "GET",
-        headers: { Authorization: `Bearer ${key}` },
+        headers: {
+          ...CLAUDE_USAGE_HEADERS,
+          Authorization: `Bearer ${key}`,
+        },
         redirect: "manual",
         signal,
       }),
@@ -180,7 +195,13 @@ function classifyResponse(
       Effect.flatMap((now) =>
         Effect.fail(
           new TemporaryClaudeSubscriptionUsageFailure({
-            retryAtMs: retryAtMs(response, now),
+            retryAtMs:
+              response.status === 429
+                ? Math.max(
+                    now + RATE_LIMIT_COOLDOWN_MS,
+                    retryAtMs(response, now) ?? 0,
+                  )
+                : retryAtMs(response, now),
           }),
         ),
       ),

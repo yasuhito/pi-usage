@@ -1,203 +1,139 @@
-import { Context, Effect, Exit, Fiber, Layer, Scope } from "effect";
-
-import {
-  type ClaudeProviderMonitorDependencies,
-  ClaudeProviderMonitorService,
-  claudeProviderMonitorLayer,
-} from "./claude-provider-monitor.ts";
-import {
-  type CodexProviderMonitorDependencies,
-  codexProviderMonitorLayer,
-} from "./codex-provider-monitor.ts";
-import type {
-  MonitoredProviderName,
-  WeeklySubscriptionUsageStatus,
-} from "./presentation.ts";
-import {
-  type ProviderMonitor,
-  ProviderMonitorService,
-} from "./provider-monitor.ts";
-
-export interface WeeklySubscriptionUsageLifecycleSessionDependencies {
-  readonly codex: Omit<CodexProviderMonitorDependencies, "publish">;
-  readonly makeClaudeDependencies: () => Omit<
-    ClaudeProviderMonitorDependencies,
-    "publish"
-  >;
-  readonly now: Effect.Effect<number>;
-  readonly present: (
-    statuses: Readonly<
-      Record<MonitoredProviderName, WeeklySubscriptionUsageStatus>
-    >,
-    nowMs: number,
-  ) => Effect.Effect<void>;
+export interface WeeklySubscriptionUsageWithReset {
+  readonly resetsAtMs: number;
 }
 
-export interface WeeklySubscriptionUsageLifecycle {
-  readonly start: (
-    dependencies: WeeklySubscriptionUsageLifecycleSessionDependencies,
-  ) => Effect.Effect<void>;
-  readonly observeCodexResponse: (
-    responseHeaders: Readonly<Record<string, unknown>>,
-  ) => Effect.Effect<void>;
-  readonly refreshAfterActivity: (
-    providerName: MonitoredProviderName,
-  ) => Effect.Effect<void>;
-  readonly refreshForAccountChange: Effect.Effect<void>;
-  readonly shutdown: Effect.Effect<void>;
+export type WeeklySubscriptionUsageLifecycleEvent<
+  Usage extends WeeklySubscriptionUsageWithReset,
+> =
+  | {
+      readonly kind: "observed";
+      readonly usage: Usage;
+      readonly observedAtMs: number;
+    }
+  | { readonly kind: "temporarily-unavailable"; readonly nowMs: number }
+  | {
+      readonly kind: "stale-expiration-reached";
+      readonly deadlineMs: number;
+      readonly nowMs: number;
+    }
+  | { readonly kind: "invalidated" }
+  | { readonly kind: "session-ended" };
+
+export type WeeklySubscriptionUsageObservation<Usage> =
+  | { readonly kind: "none" }
+  | {
+      readonly kind: "usage";
+      readonly usage: Usage;
+      readonly freshness: "fresh" | "stale";
+    };
+
+export interface WeeklySubscriptionUsageLifecycleState<Usage> {
+  readonly observation: WeeklySubscriptionUsageObservation<Usage>;
+  readonly staleExpirationAtMs: number | undefined;
 }
 
-interface Session {
-  readonly id: number;
-  readonly scope: Scope.CloseableScope;
-  readonly codexMonitor: ProviderMonitor;
-  readonly claudeMonitor: ProviderMonitor;
+export interface WeeklySubscriptionUsageLifecycleReaction<Usage>
+  extends WeeklySubscriptionUsageLifecycleState<Usage> {
+  readonly publication: "preserve" | "replace";
 }
 
-/** Owns replacement, scoped monitor lifetime, and suppression of late work. */
-export function makeWeeklySubscriptionUsageLifecycle(): Effect.Effect<WeeklySubscriptionUsageLifecycle> {
-  return Effect.gen(function* () {
-    const transitionGate = yield* Effect.makeSemaphore(1);
-    let session: Session | undefined;
-    let nextSessionId = 0;
+export interface WeeklySubscriptionUsageLifecycle<
+  Usage extends WeeklySubscriptionUsageWithReset,
+> {
+  readonly current: () => WeeklySubscriptionUsageLifecycleState<Usage>;
+  readonly advance: (
+    event: WeeklySubscriptionUsageLifecycleEvent<Usage>,
+  ) => WeeklySubscriptionUsageLifecycleReaction<Usage>;
+}
 
-    const closeSession = (candidate: Session | undefined) =>
-      Effect.gen(function* () {
-        if (candidate === undefined) return;
-        if (session === candidate) session = undefined;
-        yield* Scope.close(candidate.scope, Exit.void);
-      });
+export interface WeeklySubscriptionUsageLifecyclePolicy {
+  /** Omit to retain stale usage until its reported reset time. */
+  readonly staleRetentionMs?: number;
+}
 
-    const runInSessionScope = (
-      candidate: Session,
-      effect: Effect.Effect<void>,
-    ) =>
-      Effect.suspend(() => {
-        if (session !== candidate) return Effect.void;
-        return Effect.forkIn(
-          effect.pipe(Effect.catchAllCause(() => Effect.void)),
-          candidate.scope,
-        ).pipe(Effect.flatMap(Fiber.await), Effect.asVoid);
-      });
+interface CapturedUsage<Usage extends WeeklySubscriptionUsageWithReset> {
+  readonly usage: Usage;
+  readonly observedAtMs: number;
+  readonly freshness: "fresh" | "stale";
+}
 
-    const start = (
-      dependencies: WeeklySubscriptionUsageLifecycleSessionDependencies,
-    ) =>
-      Effect.gen(function* () {
-        const id = yield* Effect.sync(() => ++nextSessionId);
-        const candidate = yield* transitionGate.withPermits(1)(
-          Effect.gen(function* () {
-            yield* closeSession(session);
-            if (id !== nextSessionId) return undefined;
+/** Owns one provider's fresh, stale, and expired usage progression. */
+export function createWeeklySubscriptionUsageLifecycle<
+  Usage extends WeeklySubscriptionUsageWithReset,
+>(
+  policy: WeeklySubscriptionUsageLifecyclePolicy,
+): WeeklySubscriptionUsageLifecycle<Usage> {
+  let captured: CapturedUsage<Usage> | undefined;
 
-            const scope = yield* Scope.make();
-            let installed = false;
-            return yield* Effect.gen(function* () {
-              if (id !== nextSessionId) return undefined;
-              const statuses: Record<
-                MonitoredProviderName,
-                WeeklySubscriptionUsageStatus
-              > = {
-                Codex: { kind: "loading" },
-                Claude: { kind: "loading" },
-              };
-              const publish =
-                (providerName: MonitoredProviderName) =>
-                (status: WeeklySubscriptionUsageStatus) =>
-                  Effect.gen(function* () {
-                    if (session?.id !== id) return;
-                    const now = yield* dependencies.now;
-                    if (session?.id !== id) return;
-                    statuses[providerName] = status;
-                    yield* dependencies.present(statuses, now);
-                  });
-              const monitorLayers = Layer.merge(
-                codexProviderMonitorLayer({
-                  ...dependencies.codex,
-                  publish: publish("Codex"),
-                }),
-                claudeProviderMonitorLayer({
-                  ...dependencies.makeClaudeDependencies(),
-                  publish: publish("Claude"),
-                }),
-              );
-              const services = yield* Layer.buildWithScope(
-                monitorLayers,
-                scope,
-              );
-              if (id !== nextSessionId) return undefined;
-              const created = {
-                id,
-                scope,
-                codexMonitor: Context.get(services, ProviderMonitorService),
-                claudeMonitor: Context.get(
-                  services,
-                  ClaudeProviderMonitorService,
-                ),
-              };
-              session = created;
-              installed = true;
-              return created;
-            }).pipe(
-              Effect.ensuring(
-                Effect.suspend(() =>
-                  installed ? Effect.void : Scope.close(scope, Exit.void),
-                ),
-              ),
-            );
-          }),
-        );
-        if (candidate === undefined) return;
-        yield* runInSessionScope(
-          candidate,
-          Effect.all(
-            [candidate.codexMonitor.start, candidate.claudeMonitor.start].map(
-              (start) => start.pipe(Effect.catchAllCause(() => Effect.void)),
-            ),
-            { concurrency: "unbounded" },
-          ).pipe(Effect.asVoid),
-        );
-      });
+  const staleExpirationAtMs = (usage: CapturedUsage<Usage>) =>
+    Math.min(
+      usage.usage.resetsAtMs,
+      policy.staleRetentionMs === undefined
+        ? usage.usage.resetsAtMs
+        : usage.observedAtMs + policy.staleRetentionMs,
+    );
 
-    const withCurrentSession = (
-      operation: (candidate: Session) => Effect.Effect<void>,
-    ) =>
-      Effect.suspend(() => {
-        const candidate = session;
-        return candidate === undefined
-          ? Effect.void
-          : runInSessionScope(candidate, operation(candidate));
-      });
-
-    return {
-      start,
-      observeCodexResponse: (responseHeaders) =>
-        withCurrentSession((candidate) =>
-          candidate.codexMonitor.observeResponse(responseHeaders),
-        ),
-      refreshAfterActivity: (providerName) =>
-        withCurrentSession((candidate) =>
-          providerName === "Codex"
-            ? candidate.codexMonitor.refreshAfterActivity
-            : candidate.claudeMonitor.refreshAfterActivity,
-        ),
-      refreshForAccountChange: withCurrentSession((candidate) =>
-        Effect.all(
-          [
-            candidate.codexMonitor.refreshForAccountChange,
-            candidate.claudeMonitor.refreshForAccountChange,
-          ].map((refresh) =>
-            refresh.pipe(Effect.catchAllCause(() => Effect.void)),
-          ),
-          { concurrency: "unbounded" },
-        ).pipe(Effect.asVoid),
-      ),
-      shutdown: Effect.gen(function* () {
-        yield* Effect.sync(() => {
-          nextSessionId += 1;
-        });
-        yield* transitionGate.withPermits(1)(closeSession(session));
-      }),
-    } satisfies WeeklySubscriptionUsageLifecycle;
+  const current = (): WeeklySubscriptionUsageLifecycleState<Usage> => ({
+    observation:
+      captured === undefined
+        ? { kind: "none" }
+        : {
+            kind: "usage",
+            usage: captured.usage,
+            freshness: captured.freshness,
+          },
+    staleExpirationAtMs:
+      captured?.freshness === "stale"
+        ? staleExpirationAtMs(captured)
+        : undefined,
   });
+  const reaction = (
+    publication: "preserve" | "replace",
+  ): WeeklySubscriptionUsageLifecycleReaction<Usage> => ({
+    ...current(),
+    publication,
+  });
+
+  return {
+    current,
+    advance: (event) => {
+      switch (event.kind) {
+        case "observed":
+          captured = {
+            usage: event.usage,
+            observedAtMs: event.observedAtMs,
+            freshness: "fresh",
+          };
+          return reaction("replace");
+        case "temporarily-unavailable": {
+          if (captured === undefined) return reaction("replace");
+          if (event.nowMs >= staleExpirationAtMs(captured)) {
+            captured = undefined;
+            return reaction("replace");
+          }
+          captured = { ...captured, freshness: "stale" };
+          return reaction("replace");
+        }
+        case "stale-expiration-reached": {
+          if (
+            captured?.freshness !== "stale" ||
+            staleExpirationAtMs(captured) !== event.deadlineMs ||
+            event.nowMs < event.deadlineMs
+          ) {
+            return reaction("preserve");
+          }
+          captured = undefined;
+          return reaction("replace");
+        }
+        case "invalidated": {
+          const hadUsage = captured !== undefined;
+          captured = undefined;
+          return reaction(hadUsage ? "replace" : "preserve");
+        }
+        case "session-ended":
+          captured = undefined;
+          return reaction("preserve");
+      }
+    },
+  };
 }

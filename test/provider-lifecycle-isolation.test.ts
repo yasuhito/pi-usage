@@ -61,10 +61,10 @@ it.scoped("polls providers independently while one provider is delayed", () =>
     claudeAcquisition = Deferred.await(claudeGate).pipe(
       Effect.as(claudeSubscriptionUsage),
     );
+    yield* TestClock.adjust("15 minutes");
+    assert.deepEqual([codexReads, claudeReads], [16, 2]);
     yield* TestClock.adjust("1 minute");
-    assert.deepEqual([codexReads, claudeReads], [2, 2]);
-    yield* TestClock.adjust("1 minute");
-    assert.deepEqual([codexReads, claudeReads], [3, 2]);
+    assert.deepEqual([codexReads, claudeReads], [17, 2]);
     assert.deepEqual(codexStatuses.at(-1), {
       kind: "available",
       usedPercent: 20,
@@ -118,7 +118,7 @@ it.scoped("one provider's retry deadline does not delay the other", () =>
       concurrency: "unbounded",
     });
     yield* TestClock.adjust("2 minutes");
-    assert.deepEqual([codexReads, claudeReads], [1, 3]);
+    assert.deepEqual([codexReads, claudeReads], [1, 1]);
     assert.deepEqual(claudeStatuses.at(-1), {
       kind: "available",
       usedPercent: 80,
@@ -129,6 +129,8 @@ it.scoped("one provider's retry deadline does not delay the other", () =>
     assert.equal(codexReads, 1);
     yield* TestClock.adjust("1 millis");
     assert.equal(codexReads, 2);
+    yield* TestClock.adjust("750 seconds");
+    assert.equal(claudeReads, 2);
   }),
 );
 
@@ -174,7 +176,7 @@ it.scoped("a Codex defect does not stop or alter Claude", () =>
       stale: false,
       weeklyWindowResetsAtMs: 2_000_000,
     });
-    yield* TestClock.adjust("1 minute");
+    yield* TestClock.adjust("15 minutes");
     assert.equal(claudeReads, 2);
     assert.deepEqual(claudeStatuses.at(-1), {
       kind: "available",

@@ -49,6 +49,41 @@ request and should not be added to the minimum contract without a separate
 reason. The result establishes only current behavior of an undocumented
 endpoint, not a compatibility guarantee.
 
+## Subsequent Claude Code compatibility update
+
+The minimum contract above records what succeeded during the prototype; it does
+not guarantee that every request receives the same rate-limit treatment.
+Subsequent reports against the Claude Code repository demonstrated the same
+OAuth usage request returning `429` without a Claude Code `User-Agent` and
+`200` with one. A Pi maintainer also confirmed that OAuth requests which bypass
+Pi's normal Anthropic client must reproduce its Claude Code identity headers.
+
+Pi Usage therefore uses the fixed Claude Code-compatible header set in its
+isolated experimental adapter:
+
+- `Accept: application/json` identifies the expected response representation;
+- `User-Agent: claude-cli/<compatibility-version>` selects the observed Claude
+  Code client treatment;
+- `anthropic-beta: oauth-2025-04-20` identifies the OAuth contract;
+- `anthropic-dangerous-direct-browser-access: true` and `x-app: cli` reproduce
+  the first-party client identity expected by Pi's Anthropic integration.
+
+The pinned compatibility version is not a claim about the locally installed
+Claude Code version. Update it only after the acquisition contract test and a
+manual endpoint check succeed with the new value. The adapter retains Bearer
+authentication because that transport was verified specifically for
+`/api/oauth/usage`; reports about `/v1/messages` do not override this endpoint's
+prototype result.
+
+Evidence:
+
+- [Anthropic Claude Code issue #30930](https://github.com/anthropics/claude-code/issues/30930)
+  includes a same-token comparison of requests with and without the Claude Code
+  `User-Agent`.
+- [Pi issue #2751](https://github.com/earendil-works/pi/issues/2751) records the
+  identity header set and maintainer guidance that callers bypassing Pi's
+  defaults must reproduce it.
+
 ## Sanitized response shape
 
 Only allowlisted field names and runtime types were emitted by the spike. The
@@ -143,7 +178,8 @@ ADR 0002. It should:
 1. resolve `anthropic` authentication at acquisition time;
 2. proceed only when `AuthResult.source === "OAuth"` and
    `auth.apiKey` is a non-empty string;
-3. send only that token as `Authorization: Bearer` to the fixed endpoint;
+3. send that token only as `Authorization: Bearer` and reproduce the fixed
+   Claude Code-compatible identity headers documented above;
 4. use `GET /api/oauth/usage` with no query parameters;
 5. reject redirects, apply a short timeout, and bound the response body;
 6. parse only allowlisted fields and accept optional or null sibling windows;

@@ -74,20 +74,26 @@ it.scoped("publishes Claude weekly subscription usage", () =>
   }),
 );
 
-it.scoped("debounces activity for exactly 30 seconds", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture();
-    yield* f.monitor.start;
-    yield* TestClock.adjust("29999 millis");
-    yield* f.monitor.refreshAfterActivity;
-    assert.equal(f.reads(), 1);
-    yield* TestClock.adjust("1 millis");
-    yield* f.monitor.refreshAfterActivity;
-    assert.equal(f.reads(), 2);
-  }),
+it.scoped(
+  "limits activity refreshes to three minutes and polls every fifteen",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.monitor.start;
+      yield* TestClock.adjust("179999 millis");
+      yield* f.monitor.refreshAfterActivity;
+      assert.equal(f.reads(), 1);
+      yield* TestClock.adjust("1 millis");
+      yield* f.monitor.refreshAfterActivity;
+      assert.equal(f.reads(), 2);
+      yield* TestClock.adjust("719999 millis");
+      assert.equal(f.reads(), 2);
+      yield* TestClock.adjust("1 millis");
+      assert.equal(f.reads(), 3);
+    }),
 );
 
-it.scoped("keeps temporary failures stale for at most ten minutes", () =>
+it.scoped("keeps temporary failures stale until the reported reset", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
     yield* f.monitor.start;
@@ -99,7 +105,9 @@ it.scoped("keeps temporary failures stale for at most ten minutes", () =>
     yield* f.monitor.refreshForAccountChange;
     const stale = f.statuses.at(-1);
     assert.equal(stale?.kind === "available" && stale.stale, true);
-    yield* TestClock.adjust("10 minutes");
+    yield* TestClock.adjust("1999999 millis");
+    assert.equal(f.statuses.at(-1)?.kind, "available");
+    yield* TestClock.adjust("1 millis");
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
   }),
 );
@@ -170,7 +178,7 @@ it.scoped("does not disguise acquisition defects as retryable failures", () =>
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
     yield* TestClock.adjust("1 second");
     assert.equal(f.reads(), 2);
-    yield* TestClock.adjust("59 seconds");
+    yield* TestClock.adjust("899 seconds");
     assert.equal(f.reads(), 3);
   }),
 );
@@ -211,7 +219,7 @@ it.scoped("keeps checking for credentials while unavailable", () =>
         credentialFingerprint: "fingerprint-2",
       }),
     );
-    yield* TestClock.adjust("1 minute");
+    yield* TestClock.adjust("15 minutes");
     assert.equal(f.reads(), 1);
     assert.equal(f.statuses.at(-1)?.kind, "available");
   }),

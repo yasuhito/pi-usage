@@ -58,7 +58,7 @@ The `↻N` suffix is the provider-reported number of available **limit reset cre
 
 ## How it works
 
-The extension runs independent Codex and Claude monitor lifecycles. Codex usage comes from the ChatGPT usage endpoint and opportunistic `x-codex-*` response headers. Claude usage comes from the experimental first-party OAuth usage endpoint and is requested only with Pi-resolved OAuth authentication. Each monitor refreshes at startup, after relevant activity, and every minute.
+The extension runs independent Codex and Claude monitor lifecycles. Codex usage comes from the ChatGPT usage endpoint and opportunistic `x-codex-*` response headers. Claude usage comes from the experimental first-party OAuth usage endpoint and is requested only with Pi-resolved OAuth authentication. Each monitor refreshes at startup and after relevant activity. Codex polls every minute. Claude limits activity refreshes to every three minutes, polls every fifteen minutes, and keeps a failed refresh's last successful observation marked stale until its reported reset time.
 
 Internally, session-scoped Effect monitors independently own acquisition,
 polling, backoff, stale expiration, and interruption. Provider-specific

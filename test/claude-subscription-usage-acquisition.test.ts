@@ -206,7 +206,7 @@ it.effect(
     }),
 );
 
-it.effect("uses only the fixed, minimal OAuth request contract", () =>
+it.effect("uses the fixed Claude Code OAuth request contract", () =>
   Effect.gen(function* () {
     let request: [RequestInfo | URL, RequestInit | undefined] | undefined;
     yield* acquire(async (input, init) => {
@@ -217,7 +217,12 @@ it.effect("uses only the fixed, minimal OAuth request contract", () =>
     assert.equal(request?.[1]?.method, "GET");
     assert.equal(request?.[1]?.redirect, "manual");
     assert.deepEqual(request?.[1]?.headers, {
+      Accept: "application/json",
       Authorization: "Bearer secret",
+      "User-Agent": "claude-cli/2.1.251",
+      "anthropic-beta": "oauth-2025-04-20",
+      "anthropic-dangerous-direct-browser-access": "true",
+      "x-app": "cli",
     });
     assert.ok(request?.[1]?.signal instanceof AbortSignal);
   }),
@@ -233,9 +238,10 @@ it.effect("re-resolves OAuth and retries authentication rejection once", () =>
     }));
     const usage = yield* acquire(async (_input, init) => {
       requests += 1;
-      assert.deepEqual(init?.headers, {
-        Authorization: `Bearer secret-${requests}`,
-      });
+      assert.equal(
+        (init?.headers as Record<string, string> | undefined)?.Authorization,
+        `Bearer secret-${requests}`,
+      );
       return requests === 1
         ? new Response(null, { status: 401 })
         : new Response(JSON.stringify(goodBody));
@@ -319,9 +325,11 @@ it.effect(
         acquire(
           async (_input, init) => {
             requests += 1;
-            assert.deepEqual(init?.headers, {
-              Authorization: "Bearer oauth-secret",
-            });
+            assert.equal(
+              (init?.headers as Record<string, string> | undefined)
+                ?.Authorization,
+              "Bearer oauth-secret",
+            );
             return new Response("rate-limit-raw-secret", { status: 429 });
           },
           Effect.sync(() => {
@@ -399,23 +407,30 @@ it.effect("keeps every unsuccessful exchange outcome secret-safe", () =>
   }),
 );
 
-it.effect("honors valid Retry-After instructions", () =>
+it.effect("applies a fifteen-minute floor to 429 retry instructions", () =>
   Effect.gen(function* () {
-    const exit = yield* Effect.exit(
-      acquire(
-        async () =>
-          new Response(null, {
-            status: 429,
-            headers: { "retry-after": "7" },
-          }),
-      ),
-    );
-    assert.equal(
-      Exit.isFailure(exit) && exit.cause._tag === "Fail"
-        ? Reflect.get(exit.cause.error, "retryAtMs")
-        : undefined,
-      7_000,
-    );
+    for (const [retryAfter, expectedRetryAtMs] of [
+      ["0", 900_000],
+      ["7", 900_000],
+      ["300", 900_000],
+      ["1200", 1_200_000],
+    ] as const) {
+      const exit = yield* Effect.exit(
+        acquire(
+          async () =>
+            new Response(null, {
+              status: 429,
+              headers: { "retry-after": retryAfter },
+            }),
+        ),
+      );
+      assert.equal(
+        Exit.isFailure(exit) && exit.cause._tag === "Fail"
+          ? Reflect.get(exit.cause.error, "retryAtMs")
+          : undefined,
+        expectedRetryAtMs,
+      );
+    }
   }),
 );
 

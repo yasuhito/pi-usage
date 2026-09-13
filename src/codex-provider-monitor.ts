@@ -312,7 +312,7 @@ function makeCodexProviderMonitorAdapter(
         }
         return adaptChange(
           reconciliation.advance(
-            { kind: "stale-usage-expiration-reached" },
+            { kind: "stale-usage-expiration-reached", deadlineMs: deadline },
             now,
           ),
         );
@@ -321,6 +321,7 @@ function makeCodexProviderMonitorAdapter(
       credentialAvailable = false;
       currentAccountId = undefined;
       expectedStaleExpirationAtMs = undefined;
+      reconciliation.advance({ kind: "session-ended" }, 0);
     }),
   };
 }

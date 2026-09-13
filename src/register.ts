@@ -13,7 +13,7 @@ import type {
   CodexCredential,
 } from "./dedicated-weekly-quota-acquisition.ts";
 import { presentProviderSubscriptionUsage } from "./presentation.ts";
-import { makeWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-usage-lifecycle.ts";
+import { makeWeeklySubscriptionUsageSession } from "./weekly-subscription-usage-session.ts";
 
 const STATUS_KEY = "pi-usage";
 
@@ -104,18 +104,18 @@ export function registerWeeklySubscriptionUsage(
   pi: ExtensionAPI,
   dependencies: WeeklySubscriptionUsageDependencies,
 ): void {
-  const lifecycle = Effect.runSync(makeWeeklySubscriptionUsageLifecycle());
+  const session = Effect.runSync(makeWeeklySubscriptionUsageSession());
   const now = dependencies.now ?? Clock.currentTimeMillis;
   const run = (effect: Effect.Effect<void>) => Effect.runPromise(effect);
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") {
-      await run(lifecycle.shutdown);
+      await run(session.shutdown);
       return;
     }
     let lastRendered: string | undefined;
     await run(
-      lifecycle.start({
+      session.start({
         now,
         present: (statuses, currentTime) =>
           Effect.sync(() => {
@@ -155,24 +155,24 @@ export function registerWeeklySubscriptionUsage(
 
   pi.on("after_provider_response", async (event, ctx) => {
     if (ctx.mode !== "tui" || ctx.model?.provider !== "openai-codex") return;
-    await run(lifecycle.observeCodexResponse(event.headers));
+    await run(session.observeCodexResponse(event.headers));
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     if (ctx.model?.provider === "openai-codex") {
-      await run(lifecycle.refreshAfterActivity("Codex"));
+      await run(session.refreshAfterActivity("Codex"));
     } else if (ctx.model?.provider === "anthropic") {
-      await run(lifecycle.refreshAfterActivity("Claude"));
+      await run(session.refreshAfterActivity("Claude"));
     }
   });
 
   pi.on("model_select", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
-    await run(lifecycle.refreshForAccountChange);
+    await run(session.refreshForAccountChange);
   });
 
   pi.on("session_shutdown", async () => {
-    await run(lifecycle.shutdown);
+    await run(session.shutdown);
   });
 }

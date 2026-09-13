@@ -19,9 +19,10 @@ import {
   providerAcquisitionDefect,
   type WeeklySubscriptionUsageChange,
 } from "./provider-monitor.ts";
+import { createWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-usage-lifecycle.ts";
 
-const REFRESH_DEBOUNCE_MS = 30_000;
-const STALE_AFTER_MS = 10 * 60_000;
+const ACTIVITY_REFRESH_INTERVAL_MS = 3 * 60_000;
+const POLL_INTERVAL_MS = 15 * 60_000;
 
 export class ClaudeProviderMonitorService extends Context.Tag(
   "ClaudeProviderMonitor",
@@ -49,12 +50,6 @@ type AcquisitionResult =
   | { readonly kind: "authentication-unavailable" }
   | { readonly kind: "terminal" }
   | Extract<ProviderAcquisitionDisposition, { readonly kind: "defect" }>;
-
-interface CapturedUsage {
-  readonly usage: AcquiredClaudeSubscriptionUsage;
-  readonly capturedAtMs: number;
-  readonly stale: boolean;
-}
 
 type InspectedIdentity = ProviderCredentialInspection<string>;
 
@@ -92,40 +87,39 @@ function makeClaudeProviderMonitorAdapter(
   dependencies: ClaudeProviderMonitorDependencies,
 ): ProviderMonitorAdapter {
   let identityFingerprint: string | undefined;
-  let usage: CapturedUsage | undefined;
-
-  const staleExpirationAtMs = () =>
-    usage?.stale === true
-      ? Math.min(usage.capturedAtMs + STALE_AFTER_MS, usage.usage.resetsAtMs)
-      : undefined;
-
+  let lastObservedAtMs: number | undefined;
+  const usageLifecycle =
+    createWeeklySubscriptionUsageLifecycle<AcquiredClaudeSubscriptionUsage>({});
   const change = (
     publication: WeeklySubscriptionUsageStatus | undefined,
     acquire = false,
   ): WeeklySubscriptionUsageChange => {
-    const deadline = staleExpirationAtMs();
+    const { staleExpirationAtMs } = usageLifecycle.current();
     return {
       publication,
       staleExpiration:
-        deadline === undefined
+        staleExpirationAtMs === undefined
           ? { kind: "clear" }
-          : { kind: "arm", atMs: deadline },
+          : { kind: "arm", atMs: staleExpirationAtMs },
       acquire,
     };
   };
 
-  const usageStatus = (): WeeklySubscriptionUsageStatus =>
-    usage === undefined
+  const usageStatus = (): WeeklySubscriptionUsageStatus => {
+    const observation = usageLifecycle.current().observation;
+    return observation.kind === "none"
       ? { kind: "unavailable" }
       : {
           kind: "available",
-          usedPercent: usage.usage.usedPercent,
-          stale: usage.stale,
-          weeklyWindowResetsAtMs: usage.usage.resetsAtMs,
+          usedPercent: observation.usage.usedPercent,
+          stale: observation.freshness === "stale",
+          weeklyWindowResetsAtMs: observation.usage.resetsAtMs,
         };
+  };
 
   const clearUsage = (publish: boolean) => {
-    usage = undefined;
+    lastObservedAtMs = undefined;
+    usageLifecycle.advance({ kind: "invalidated" });
     return change(publish ? usageStatus() : undefined);
   };
 
@@ -144,7 +138,8 @@ function makeClaudeProviderMonitorAdapter(
         };
       }
       if (identityFingerprint !== resolution.fingerprint) {
-        const replacingUsage = usage !== undefined;
+        const replacingUsage =
+          usageLifecycle.current().observation.kind === "usage";
         identityFingerprint = resolution.fingerprint;
         return {
           continuity: "changed",
@@ -183,7 +178,12 @@ function makeClaudeProviderMonitorAdapter(
       ) {
         const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
         if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
-        usage = { usage: result.usage, capturedAtMs: now, stale: false };
+        lastObservedAtMs = now;
+        usageLifecycle.advance({
+          kind: "observed",
+          usage: result.usage,
+          observedAtMs: now,
+        });
         return {
           continuity: currentIdentity.continuity,
           changes: [currentIdentity.change, change(usageStatus())],
@@ -209,8 +209,17 @@ function makeClaudeProviderMonitorAdapter(
             changes: [currentIdentity.change],
             disposition: { kind: "completed" },
           };
-        case "temporary":
-          if (usage !== undefined) usage = { ...usage, stale: true };
+        case "temporary": {
+          const now = yield* Effect.clockWith(
+            (clock) => clock.currentTimeMillis,
+          );
+          const lifecycleReaction = usageLifecycle.advance({
+            kind: "temporarily-unavailable",
+            nowMs: now,
+          });
+          if (lifecycleReaction.observation.kind === "none") {
+            lastObservedAtMs = undefined;
+          }
           return {
             continuity: currentIdentity.continuity,
             changes: [currentIdentity.change, change(usageStatus())],
@@ -219,6 +228,7 @@ function makeClaudeProviderMonitorAdapter(
               retryAtMs: result.retryAtMs,
             },
           };
+        }
         case "authentication-unavailable":
           return {
             continuity: currentIdentity.continuity,
@@ -266,21 +276,27 @@ function makeClaudeProviderMonitorAdapter(
       Effect.sync(() =>
         change(
           undefined,
-          usage === undefined ||
-            now - usage.capturedAtMs >= REFRESH_DEBOUNCE_MS,
+          lastObservedAtMs === undefined ||
+            now - lastObservedAtMs >= ACTIVITY_REFRESH_INTERVAL_MS,
         ),
       ),
-    staleExpirationReached: (deadline) =>
+    staleExpirationReached: (deadline, now) =>
       Effect.sync(() => {
-        if (!usage?.stale || staleExpirationAtMs() !== deadline) {
+        const lifecycleReaction = usageLifecycle.advance({
+          kind: "stale-expiration-reached",
+          deadlineMs: deadline,
+          nowMs: now,
+        });
+        if (lifecycleReaction.publication === "preserve") {
           return change(undefined);
         }
-        usage = undefined;
-        return change({ kind: "unavailable" });
+        lastObservedAtMs = undefined;
+        return change(usageStatus());
       }),
     finalize: Effect.sync(() => {
       identityFingerprint = undefined;
-      usage = undefined;
+      lastObservedAtMs = undefined;
+      usageLifecycle.advance({ kind: "session-ended" });
     }),
   };
 }
@@ -289,10 +305,10 @@ function makeClaudeProviderMonitorAdapter(
 export function makeClaudeProviderMonitor(
   dependencies: ClaudeProviderMonitorDependencies,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
-  return makeProviderMonitor(
-    makeClaudeProviderMonitorAdapter(dependencies),
-    dependencies,
-  );
+  return makeProviderMonitor(makeClaudeProviderMonitorAdapter(dependencies), {
+    ...dependencies,
+    pollIntervalMs: POLL_INTERVAL_MS,
+  });
 }
 
 export const claudeProviderMonitorLayer = (

@@ -17,7 +17,7 @@ A provider-reported subscription allowance window whose duration is exactly seve
 _Avoid_: Secondary window
 
 **Stale usage**:
-The last successfully observed weekly subscription usage when a newer observation temporarily cannot be obtained. It remains presentable for at most ten minutes and never beyond its reported reset time.
+The last successfully observed weekly subscription usage when a newer observation temporarily cannot be obtained. Its retention period is provider-specific and never extends beyond its reported reset time. Codex retains it for at most ten minutes from observation; Claude retains it until reset.
 _Avoid_: Cached usage, current usage
 
 **Claude subscription usage**:
@@ -39,6 +39,10 @@ _Avoid_: Weekly credit, usage credit
 **Weekly subscription usage lifecycle**:
 The progression of a provider's weekly subscription usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end. Each monitored provider progresses independently.
 _Avoid_: Weekly quota usage lifecycle, usage cache lifecycle
+
+**Weekly subscription usage session**:
+The session-scoped ownership of all monitored providers’ weekly subscription usage, including startup, replacement, event routing, and shutdown. It coordinates independent provider lifecycles but does not define their fresh, stale, or expired transitions.
+_Avoid_: Weekly subscription usage lifecycle, provider monitor session
 
 **Passive weekly quota observation**:
 A weekly quota usage observation obtained from information accompanying normal provider activity rather than from a dedicated quota request.

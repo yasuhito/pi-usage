@@ -155,6 +155,7 @@ interface ProviderMonitorDependencies {
   readonly publish: (
     status: WeeklySubscriptionUsageStatus,
   ) => Effect.Effect<void>;
+  readonly pollIntervalMs?: number;
   readonly random?: Effect.Effect<number>;
 }
 
@@ -443,7 +444,7 @@ export function makeProviderMonitor(
     );
 
     yield* Effect.forkIn(
-      Stream.tick(POLL_INTERVAL_MS).pipe(
+      Stream.tick(dependencies.pollIntervalMs ?? POLL_INTERVAL_MS).pipe(
         Stream.drop(1),
         Stream.runForEach(() =>
           Effect.suspend(() => triggerRefresh("ordinary")).pipe(Effect.asVoid),
