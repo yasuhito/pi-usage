@@ -12,6 +12,7 @@ import {
   TemporaryClaudeSubscriptionUsageFailure,
 } from "../src/claude-subscription-usage-acquisition.ts";
 import type { WeeklySubscriptionUsageStatus } from "../src/presentation.ts";
+import { immediateAcquisitionCoordinator } from "./fixtures/immediate-acquisition-coordinator.ts";
 
 function fixture() {
   return Effect.gen(function* () {
@@ -75,6 +76,28 @@ it.scoped("publishes Claude weekly subscription usage", () =>
 );
 
 it.scoped(
+  "keeps a shared observation's original three-minute freshness boundary",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.setAcquisition(
+        Effect.succeed({
+          usedPercent: 63.4,
+          resetsAtMs: 2_000_000,
+          credentialFingerprint: "fingerprint-1",
+          observedAtMs: 0,
+        }),
+      );
+      yield* TestClock.adjust("179 seconds");
+      yield* f.monitor.start;
+      yield* TestClock.adjust("1 second");
+      yield* f.monitor.refreshAfterActivity;
+
+      assert.equal(f.reads(), 2);
+    }),
+);
+
+it.scoped(
   "limits activity refreshes to three minutes and polls every fifteen",
   () =>
     Effect.gen(function* () {
@@ -110,6 +133,55 @@ it.scoped("keeps temporary failures stale until the reported reset", () =>
     yield* TestClock.adjust("1 millis");
     assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
   }),
+);
+
+it.scoped("presents a shared preceding observation as stale on startup", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setAcquisition(
+      Effect.fail(
+        new TemporaryClaudeSubscriptionUsageFailure({
+          retryAtMs: 900_000,
+          staleUsage: {
+            usedPercent: 27,
+            resetsAtMs: 2_000_000,
+            observedAtMs: 1_000,
+            credentialFingerprint: "fingerprint-1",
+          },
+        }),
+      ),
+    );
+
+    yield* f.monitor.start;
+
+    assert.deepEqual(f.statuses.at(-1), {
+      kind: "available",
+      usedPercent: 27,
+      stale: true,
+      weeklyWindowResetsAtMs: 2_000_000,
+    });
+  }),
+);
+
+it.scoped(
+  "clears prior usage when shared suppression must not preserve it",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.monitor.start;
+      f.setAcquisition(
+        Effect.fail(
+          new TemporaryClaudeSubscriptionUsageFailure({
+            retryAtMs: 900_000,
+            preserveUsage: false,
+          }),
+        ),
+      );
+
+      yield* f.monitor.refreshForAccountChange;
+
+      assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+    }),
 );
 
 it.scoped("does not let stale expiration clear newly acquired usage", () =>
@@ -266,6 +338,7 @@ it.scoped("publishes a successful acquisition made with refreshed OAuth", () =>
     const acquireClaudeSubscriptionUsage = createAcquireClaudeSubscriptionUsage(
       {
         resolveAuthentication: Effect.sync(authentication),
+        acquisitionCoordinator: immediateAcquisitionCoordinator,
         fetch: async () => {
           requests += 1;
           if (requests === 1) {

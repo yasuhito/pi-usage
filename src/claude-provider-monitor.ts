@@ -46,8 +46,16 @@ type AcquisitionResult =
       readonly kind: "acquired";
       readonly usage: AcquiredClaudeSubscriptionUsage;
     }
-  | { readonly kind: "temporary"; readonly retryAtMs: number | undefined }
+  | {
+      readonly kind: "temporary";
+      readonly retryAtMs: number | undefined;
+      readonly staleUsage?: AcquiredClaudeSubscriptionUsage & {
+        readonly observedAtMs: number;
+      };
+      readonly preserveUsage: boolean;
+    }
   | { readonly kind: "authentication-unavailable" }
+  | { readonly kind: "suppressed"; readonly retryAtMs: number }
   | { readonly kind: "terminal" }
   | Extract<ProviderAcquisitionDisposition, { readonly kind: "defect" }>;
 
@@ -70,14 +78,33 @@ function acquisitionResultFromExit(
     case "failed":
       switch (result.error._tag) {
         case "TemporaryClaudeSubscriptionUsageFailure":
-          return { kind: "temporary", retryAtMs: result.error.retryAtMs };
+          return {
+            kind: "temporary",
+            retryAtMs: result.error.retryAtMs,
+            preserveUsage: result.error.preserveUsage !== false,
+            ...(result.error.staleUsage === undefined
+              ? {}
+              : { staleUsage: result.error.staleUsage }),
+          };
         case "MalformedClaudeSubscriptionUsage":
-          return { kind: "temporary", retryAtMs: undefined };
+          return {
+            kind: "temporary",
+            retryAtMs: result.error.retryAtMs,
+            preserveUsage: true,
+            ...(result.error.staleUsage === undefined
+              ? {}
+              : { staleUsage: result.error.staleUsage }),
+          };
         case "ClaudeAuthenticationUnavailable":
-        case "ClaudeAuthenticationRejected":
           return { kind: "authentication-unavailable" };
+        case "ClaudeAuthenticationRejected":
+          return result.error.retryAtMs === undefined
+            ? { kind: "authentication-unavailable" }
+            : { kind: "suppressed", retryAtMs: result.error.retryAtMs };
         case "PermanentClaudeSubscriptionUsageFailure":
-          return { kind: "terminal" };
+          return result.error.retryAtMs === undefined
+            ? { kind: "terminal" }
+            : { kind: "suppressed", retryAtMs: result.error.retryAtMs };
       }
   }
 }
@@ -178,11 +205,12 @@ function makeClaudeProviderMonitorAdapter(
       ) {
         const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
         if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
-        lastObservedAtMs = now;
+        const observedAtMs = result.usage.observedAtMs ?? now;
+        lastObservedAtMs = observedAtMs;
         usageLifecycle.advance({
           kind: "observed",
           usage: result.usage,
-          observedAtMs: now,
+          observedAtMs,
         });
         return {
           continuity: currentIdentity.continuity,
@@ -213,6 +241,23 @@ function makeClaudeProviderMonitorAdapter(
           const now = yield* Effect.clockWith(
             (clock) => clock.currentTimeMillis,
           );
+          if (!result.preserveUsage) {
+            lastObservedAtMs = undefined;
+            usageLifecycle.advance({ kind: "invalidated" });
+          }
+          if (
+            result.preserveUsage &&
+            result.staleUsage !== undefined &&
+            result.staleUsage.credentialFingerprint === acquisitionIdentity &&
+            result.staleUsage.resetsAtMs > now
+          ) {
+            lastObservedAtMs = result.staleUsage.observedAtMs;
+            usageLifecycle.advance({
+              kind: "observed",
+              usage: result.staleUsage,
+              observedAtMs: result.staleUsage.observedAtMs,
+            });
+          }
           const lifecycleReaction = usageLifecycle.advance({
             kind: "temporarily-unavailable",
             nowMs: now,
@@ -234,6 +279,12 @@ function makeClaudeProviderMonitorAdapter(
             continuity: currentIdentity.continuity,
             changes: [currentIdentity.change, clearUsage(true)],
             disposition: { kind: "completed" },
+          };
+        case "suppressed":
+          return {
+            continuity: currentIdentity.continuity,
+            changes: [currentIdentity.change, clearUsage(true)],
+            disposition: { kind: "retry", retryAtMs: result.retryAtMs },
           };
         case "terminal":
           return {

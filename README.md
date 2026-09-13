@@ -34,6 +34,8 @@ Sign in to Pi's `openai-codex` and `anthropic` providers with `/login`. Codex an
 
 Claude subscription usage requires the OAuth authentication that Pi resolves after a Claude Pro or Max login. An ordinary Anthropic API key is not suitable and is never sent to the subscription usage endpoint. The extension asks Pi to resolve authentication at request time; it does not read Pi or Claude Code credential files.
 
+Cross-process Claude acquisition currently requires Linux and a private, user-owned `XDG_RUNTIME_DIR` (normally `/run/user/<uid>` with mode `0700`). Without that secure runtime location, Claude remains `unavailable` and the TUI warns once per Pi process. macOS and Windows coordination are not yet supported.
+
 ## Display
 
 | State | Status |
@@ -60,6 +62,8 @@ The `↻N` suffix is the provider-reported number of available **limit reset cre
 
 The extension runs independent Codex and Claude monitor lifecycles. Codex usage comes from the ChatGPT usage endpoint and opportunistic `x-codex-*` response headers. Claude usage comes from the experimental first-party OAuth usage endpoint and is requested only with Pi-resolved OAuth authentication. Each monitor refreshes at startup and after relevant activity. Codex polls every minute. Claude limits activity refreshes to every three minutes, polls every fifteen minutes, and keeps a failed refresh's last successful observation marked stale until its reported reset time.
 
+Claude acquisitions are coordinated across `/reload`, `/new`, and concurrent Pi processes. A successful observation is reused for three minutes. Temporary failures share their retry deadline; a `429` observes `Retry-After` with a fifteen-minute floor. This prevents each loaded extension instance from independently repeating the same request.
+
 Internally, session-scoped Effect monitors independently own acquisition,
 polling, backoff, stale expiration, and interruption. Provider-specific
 decoding stays behind small Effect interfaces; Pi event handlers are the only
@@ -67,7 +71,9 @@ runtime boundary.
 
 ### Security posture
 
-Authenticated requests are restricted to fixed HTTPS origins: `https://chatgpt.com` for Codex and `https://api.anthropic.com` for Claude. Redirects are rejected, requests time out, and response bodies are bounded before schema validation. Credentials, usage observations, and raw provider responses are neither logged nor persisted.
+Authenticated requests are restricted to fixed HTTPS origins: `https://chatgpt.com` for Codex and `https://api.anthropic.com` for Claude. Redirects are rejected, requests time out, and response bodies are bounded before schema validation. Credentials and raw provider responses are neither logged nor persisted.
+
+To coordinate Claude requests, sanitized usage percentages, reset timestamps, and retry scheduling metadata are stored only in the OS-managed user-runtime `XDG_RUNTIME_DIR`; they are never written to durable package or project storage. Entries are partitioned by an HMAC of the OAuth credential using an ephemeral runtime secret, so neither the credential nor its plain fingerprint is stored. Runtime entries untouched for twenty-four hours are removed best-effort.
 
 The extension does not spawn provider CLIs or estimate quota from local token history.
 

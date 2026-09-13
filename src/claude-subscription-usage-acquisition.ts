@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
-import { Clock, Data, Effect, Schema } from "effect";
+import { Cause, Clock, Data, Effect, Schema } from "effect";
 import {
   readBoundedResponseBody,
   withFinalizedResponseBody,
 } from "./bounded-response-body.ts";
+import type {
+  CoordinatedAcquisitionAttempt,
+  CoordinatedAcquisitionOutcome,
+  ProviderAcquisitionCoordinator,
+} from "./provider-acquisition-coordinator.ts";
 
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -36,6 +41,7 @@ export interface AcquiredClaudeSubscriptionUsage {
   readonly usedPercent: number;
   readonly resetsAtMs: number;
   readonly credentialFingerprint: string;
+  readonly observedAtMs?: number;
 }
 
 export class ClaudeAuthenticationUnavailable extends Data.TaggedError(
@@ -43,16 +49,46 @@ export class ClaudeAuthenticationUnavailable extends Data.TaggedError(
 ) {}
 export class ClaudeAuthenticationRejected extends Data.TaggedError(
   "ClaudeAuthenticationRejected",
-) {}
+)<{ readonly retryAtMs?: number }> {
+  constructor(options: { readonly retryAtMs?: number } = {}) {
+    super(options);
+  }
+}
 export class TemporaryClaudeSubscriptionUsageFailure extends Data.TaggedError(
   "TemporaryClaudeSubscriptionUsageFailure",
-)<{ readonly retryAtMs: number | undefined }> {}
+)<{
+  readonly retryAtMs: number | undefined;
+  readonly staleUsage?: AcquiredClaudeSubscriptionUsage & {
+    readonly observedAtMs: number;
+  };
+  readonly preserveUsage?: boolean;
+}> {}
 export class PermanentClaudeSubscriptionUsageFailure extends Data.TaggedError(
   "PermanentClaudeSubscriptionUsageFailure",
-) {}
+)<{ readonly retryAtMs?: number }> {
+  constructor(options: { readonly retryAtMs?: number } = {}) {
+    super(options);
+  }
+}
 export class MalformedClaudeSubscriptionUsage extends Data.TaggedError(
   "MalformedClaudeSubscriptionUsage",
-) {}
+)<{
+  readonly retryAtMs?: number;
+  readonly staleUsage?: AcquiredClaudeSubscriptionUsage & {
+    readonly observedAtMs: number;
+  };
+}> {
+  constructor(
+    options: {
+      readonly retryAtMs?: number;
+      readonly staleUsage?: AcquiredClaudeSubscriptionUsage & {
+        readonly observedAtMs: number;
+      };
+    } = {},
+  ) {
+    super(options);
+  }
+}
 
 export type ClaudeSubscriptionUsageAcquisitionError =
   | ClaudeAuthenticationUnavailable
@@ -69,6 +105,13 @@ export type AcquireClaudeSubscriptionUsage = () => Effect.Effect<
 export interface ClaudeSubscriptionUsageAcquisitionDependencies {
   readonly fetch: typeof fetch;
   readonly resolveAuthentication: ResolveClaudeAuthentication;
+  readonly acquisitionCoordinator: ProviderAcquisitionCoordinator;
+  readonly onCoordinationUnavailable?: (reason: string) => void;
+}
+
+interface SharedClaudeSubscriptionUsage {
+  readonly usedPercent: number;
+  readonly resetsAtMs: number;
 }
 
 const ISO_INSTANT_PATTERN =
@@ -276,13 +319,154 @@ export function createAcquireClaudeSubscriptionUsage(
       }),
     );
 
+  const coordinator = dependencies.acquisitionCoordinator;
+
+  const decodeSharedUsage = (
+    value: unknown,
+  ): SharedClaudeSubscriptionUsage | undefined => {
+    if (typeof value !== "object" || value === null) return undefined;
+    const usedPercent = Reflect.get(value, "usedPercent");
+    const resetsAtMs = Reflect.get(value, "resetsAtMs");
+    return typeof usedPercent === "number" &&
+      Number.isFinite(usedPercent) &&
+      usedPercent >= 0 &&
+      usedPercent <= 100 &&
+      Number.isSafeInteger(resetsAtMs) &&
+      resetsAtMs > 0 &&
+      resetsAtMs <= 8_640_000_000_000_000
+      ? { usedPercent, resetsAtMs }
+      : undefined;
+  };
+
+  const coordinateExchange = (key: string) =>
+    coordinator
+      .coordinate<SharedClaudeSubscriptionUsage>({
+        provider: "claude-subscription-usage",
+        credential: key,
+        decode: decodeSharedUsage,
+        reusableUntilMs: (usage, observedAtMs) =>
+          Math.min(observedAtMs + 3 * 60_000, usage.resetsAtMs),
+        acquire: Effect.exit(exchange(key)).pipe(
+          Effect.flatMap((exit) => {
+            if (exit._tag === "Success") {
+              return Effect.succeed<
+                CoordinatedAcquisitionAttempt<SharedClaudeSubscriptionUsage>
+              >({
+                kind: "success",
+                value: {
+                  usedPercent: exit.value.usedPercent,
+                  resetsAtMs: exit.value.resetsAtMs,
+                },
+              });
+            }
+            const failure = Cause.failureOption(exit.cause);
+            if (failure._tag === "Some") {
+              switch (failure.value._tag) {
+                case "TemporaryClaudeSubscriptionUsageFailure":
+                  return Effect.succeed({
+                    kind: "temporary" as const,
+                    ...(failure.value.retryAtMs === undefined
+                      ? {}
+                      : { retryAtMs: failure.value.retryAtMs }),
+                  });
+                case "MalformedClaudeSubscriptionUsage":
+                  return Effect.succeed({ kind: "malformed" as const });
+                case "ClaudeAuthenticationUnavailable":
+                case "ClaudeAuthenticationRejected":
+                  return Effect.succeed({
+                    kind: "credential-rejected" as const,
+                  });
+                case "PermanentClaudeSubscriptionUsageFailure":
+                  return Effect.succeed({ kind: "terminal" as const });
+              }
+            }
+            const defects = Cause.keepDefects(exit.cause);
+            return defects._tag === "Some"
+              ? Effect.failCause(defects.value)
+              : Effect.interrupt;
+          }),
+        ),
+      })
+      .pipe(
+        Effect.tapError((error) =>
+          Effect.sync(() =>
+            dependencies.onCoordinationUnavailable?.(error.reason),
+          ),
+        ),
+        Effect.mapError(() => new ClaudeAuthenticationUnavailable()),
+      );
+
+  const usageFromOutcome = (
+    outcome: CoordinatedAcquisitionOutcome<SharedClaudeSubscriptionUsage>,
+    key: string,
+  ): Effect.Effect<
+    AcquiredClaudeSubscriptionUsage,
+    ClaudeSubscriptionUsageAcquisitionError
+  > =>
+    Effect.suspend<
+      AcquiredClaudeSubscriptionUsage,
+      ClaudeSubscriptionUsageAcquisitionError,
+      never
+    >(() => {
+      if (outcome.kind === "success") {
+        return Effect.succeed({
+          ...outcome.value,
+          observedAtMs: outcome.observedAtMs,
+          credentialFingerprint: fingerprintOAuthKey(key),
+        });
+      }
+      const staleUsage =
+        outcome.stale === undefined
+          ? undefined
+          : {
+              ...outcome.stale.value,
+              observedAtMs: outcome.stale.observedAtMs,
+              credentialFingerprint: fingerprintOAuthKey(key),
+            };
+      switch (outcome.reason) {
+        case "temporary":
+        case "follower-timeout":
+          return Effect.fail(
+            new TemporaryClaudeSubscriptionUsageFailure({
+              retryAtMs: outcome.retryAtMs,
+              preserveUsage: true,
+              ...(staleUsage === undefined ? {} : { staleUsage }),
+            }),
+          );
+        case "malformed":
+          return Effect.fail(
+            new MalformedClaudeSubscriptionUsage({
+              retryAtMs: outcome.retryAtMs,
+              ...(staleUsage === undefined ? {} : { staleUsage }),
+            }),
+          );
+        case "credential-rejected":
+          return Effect.fail(
+            new ClaudeAuthenticationRejected({
+              retryAtMs: outcome.retryAtMs,
+            }),
+          );
+        case "terminal":
+          return Effect.fail(
+            new PermanentClaudeSubscriptionUsageFailure({
+              retryAtMs: outcome.retryAtMs,
+            }),
+          );
+      }
+    });
+
   return () =>
     Effect.gen(function* () {
       const key = yield* resolveKey;
-      return yield* exchange(key).pipe(
-        Effect.catchTag("ClaudeAuthenticationRejected", () =>
-          resolveKey.pipe(Effect.flatMap(exchange)),
-        ),
-      );
+      let outcome = yield* coordinateExchange(key);
+      if (
+        outcome.kind === "deferred" &&
+        outcome.reason === "credential-rejected"
+      ) {
+        const refreshedKey = yield* resolveKey;
+        outcome = yield* coordinateExchange(refreshedKey);
+        return yield* usageFromOutcome(outcome, refreshedKey);
+      }
+      return yield* usageFromOutcome(outcome, key);
     });
 }

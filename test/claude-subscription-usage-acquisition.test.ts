@@ -7,6 +7,7 @@ import {
   createAcquireClaudeSubscriptionUsage,
   type ResolveClaudeAuthentication,
 } from "../src/claude-subscription-usage-acquisition.ts";
+import { immediateAcquisitionCoordinator } from "./fixtures/immediate-acquisition-coordinator.ts";
 
 const goodBody = {
   five_hour: null,
@@ -30,6 +31,7 @@ function acquire(
   return createAcquireClaudeSubscriptionUsage({
     fetch,
     resolveAuthentication,
+    acquisitionCoordinator: immediateAcquisitionCoordinator,
   })();
 }
 
@@ -41,6 +43,90 @@ function failureTag(exit: Exit.Exit<unknown, unknown>) {
     : undefined;
 }
 
+it.effect(
+  "uses a coordinated successful observation without another request",
+  () =>
+    Effect.gen(function* () {
+      let requests = 0;
+      const usage = yield* createAcquireClaudeSubscriptionUsage({
+        fetch: async () => {
+          requests += 1;
+          return new Response(JSON.stringify(goodBody));
+        },
+        resolveAuthentication: oauth(),
+        acquisitionCoordinator: {
+          coordinate: (request) => {
+            const value = request.decode({
+              usedPercent: 27,
+              resetsAtMs: Date.parse("2026-09-18T12:34:56.789Z"),
+            });
+            return value === undefined
+              ? Effect.die("test fixture failed to decode")
+              : Effect.succeed({
+                  kind: "success" as const,
+                  value,
+                  observedAtMs: 1_000,
+                });
+          },
+        },
+      })();
+
+      assert.equal(requests, 0);
+      assert.deepEqual(usage, {
+        usedPercent: 27,
+        resetsAtMs: Date.parse("2026-09-18T12:34:56.789Z"),
+        observedAtMs: 1_000,
+        credentialFingerprint: claudeCredentialFingerprint({
+          source: "OAuth",
+          auth: { apiKey: "secret" },
+        }),
+      });
+    }),
+);
+
+it.effect(
+  "carries a coordinated preceding observation through shared backoff",
+  () =>
+    Effect.gen(function* () {
+      const resetsAtMs = Date.parse("2026-09-18T12:34:56.789Z");
+      const exit = yield* Effect.exit(
+        createAcquireClaudeSubscriptionUsage({
+          fetch: async () => new Response(JSON.stringify(goodBody)),
+          resolveAuthentication: oauth(),
+          acquisitionCoordinator: {
+            coordinate: (request) => {
+              const value = request.decode({ usedPercent: 27, resetsAtMs });
+              return value === undefined
+                ? Effect.die("test fixture failed to decode")
+                : Effect.succeed({
+                    kind: "deferred" as const,
+                    reason: "temporary" as const,
+                    retryAtMs: 900_000,
+                    stale: { value, observedAtMs: 1_000 },
+                  });
+            },
+          },
+        })(),
+      );
+
+      assert.equal(Exit.isFailure(exit), true);
+      assert.deepEqual(
+        Exit.isFailure(exit) && exit.cause._tag === "Fail"
+          ? Reflect.get(exit.cause.error, "staleUsage")
+          : undefined,
+        {
+          usedPercent: 27,
+          resetsAtMs,
+          observedAtMs: 1_000,
+          credentialFingerprint: claudeCredentialFingerprint({
+            source: "OAuth",
+            auth: { apiKey: "secret" },
+          }),
+        },
+      );
+    }),
+);
+
 it.effect("decodes the allowlisted seven-day subscription window", () =>
   Effect.gen(function* () {
     const usage = yield* acquire(
@@ -49,6 +135,7 @@ it.effect("decodes the allowlisted seven-day subscription window", () =>
     assert.deepEqual(usage, {
       usedPercent: 63.4,
       resetsAtMs: Date.parse("2026-09-18T12:34:56.789Z"),
+      observedAtMs: 0,
       credentialFingerprint: claudeCredentialFingerprint({
         source: "OAuth",
         auth: { apiKey: "secret" },
