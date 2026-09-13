@@ -4,83 +4,114 @@ import { Cause, Deferred, Effect, Exit, Fiber, Scope, TestClock } from "effect";
 import type { WeeklySubscriptionUsageStatus } from "../src/presentation.ts";
 import {
   makeProviderMonitor,
-  type ProviderAcquisitionCompletion,
-  type ProviderCredentialContinuity,
+  type ProviderAcquisitionHealth,
   type ProviderMonitorAdapter,
-  type WeeklySubscriptionUsageChange,
+  type ProviderWeeklySubscriptionUsageFacts,
+  providerCredentialIdentity,
+  type ResolvedProviderCredential,
 } from "../src/provider-monitor.ts";
 
-const noChange = (): WeeklySubscriptionUsageChange => ({
-  publication: undefined,
-  staleExpiration: { kind: "preserve" },
-  acquire: false,
+interface AcquisitionOutcome {
+  readonly status?: WeeklySubscriptionUsageStatus;
+  readonly staleUsageExpiresAtMs?: number;
+  readonly evidence?: ProviderWeeklySubscriptionUsageFacts["observationEvidence"];
+  readonly health: ProviderAcquisitionHealth;
+}
+
+interface AcquisitionFailure {
+  readonly health: ProviderAcquisitionHealth;
+}
+
+const lifecycleFacts = (
+  overrides: Partial<ProviderWeeklySubscriptionUsageFacts> = {},
+): ProviderWeeklySubscriptionUsageFacts => ({
+  presentation: { kind: "preserve" },
+  staleUsageExpiresAtMs: undefined,
+  ...overrides,
 });
 
-const available = (usedPercent: number): WeeklySubscriptionUsageChange => ({
-  publication: { kind: "available", usedPercent, stale: false },
-  staleExpiration: { kind: "clear" },
-  acquire: false,
-});
-
-const completed = (usedPercent: number): ProviderAcquisitionCompletion => ({
-  changes: [available(usedPercent)],
-  disposition: { kind: "completed" },
+const completed = (usedPercent: number): AcquisitionOutcome => ({
+  status: { kind: "available", usedPercent, stale: false },
+  health: { kind: "healthy" },
 });
 
 const retry = (
-  retryAtMs: number | undefined,
-): ProviderAcquisitionCompletion => ({
-  changes: [noChange()],
-  disposition: { kind: "retry", retryAtMs },
-});
-
-const noopAdapter = (
-  overrides: Partial<ProviderMonitorAdapter>,
-): ProviderMonitorAdapter => ({
-  inspectAcquisition: () =>
-    Effect.succeed({
-      kind: "blocked",
-      continuity: "unavailable",
-      change: noChange(),
-    }),
-  observeActivity: () => Effect.succeed(noChange()),
-  staleExpirationReached: () => Effect.succeed(noChange()),
-  finalize: Effect.void,
-  ...overrides,
+  providerNotBeforeMs: number | undefined,
+): AcquisitionFailure => ({
+  health: { kind: "temporarily-unavailable", providerNotBeforeMs },
 });
 
 function fixture(random = 0.5) {
   return Effect.gen(function* () {
     let reads = 0;
-    let acquisition: Effect.Effect<ProviderAcquisitionCompletion> = Effect.sync(
-      () => completed(reads),
-    );
-    let staleExpirationChange = noChange();
-    let continuity: ProviderCredentialContinuity = "unchanged";
+    let identityCounter = 1;
+    let resolution: ResolvedProviderCredential<string> = {
+      kind: "available",
+      identity: providerCredentialIdentity(`account-${identityCounter}`),
+      credential: "credential",
+      acceptPassiveObservation: true,
+    };
+    let acquisition: Effect.Effect<AcquisitionOutcome, AcquisitionFailure> =
+      Effect.sync(() => completed(reads));
+    let staleExpirationFacts = lifecycleFacts();
+    let currentStaleDeadline: number | undefined;
     const statuses: WeeklySubscriptionUsageStatus[] = [];
-    const adapter: ProviderMonitorAdapter = {
-      inspectAcquisition: () => {
-        if (continuity === "unavailable") {
-          return Effect.succeed({
-            kind: "blocked" as const,
-            continuity,
-            change: noChange(),
-          });
-        }
-        return Effect.succeed({
-          kind: "ready" as const,
-          continuity,
-          change: noChange(),
-          acquire: Effect.suspend(() => {
-            reads += 1;
-            return acquisition;
-          }),
-          acquisitionDeferred: Effect.succeed(noChange()),
-        });
-      },
-      observeResponse: () => Effect.succeed(noChange()),
-      observeActivity: () => Effect.succeed({ ...noChange(), acquire: true }),
-      staleExpirationReached: () => Effect.succeed(staleExpirationChange),
+    const adapter: ProviderMonitorAdapter<
+      string,
+      AcquisitionOutcome,
+      AcquisitionFailure
+    > = {
+      credentialVerification: "before",
+      resolveCredential: Effect.sync(() => resolution),
+      acquire: () =>
+        Effect.suspend(() => {
+          reads += 1;
+          return acquisition;
+        }),
+      advance: (event) =>
+        Effect.sync(() => {
+          switch (event.kind) {
+            case "credential-observed":
+              return lifecycleFacts({
+                staleUsageExpiresAtMs: currentStaleDeadline,
+              });
+            case "acquisition-completed": {
+              if (event.exit.kind === "failed") {
+                return lifecycleFacts({
+                  staleUsageExpiresAtMs: currentStaleDeadline,
+                  acquisitionHealth: event.exit.error.health,
+                });
+              }
+              const outcome = event.exit.value;
+              currentStaleDeadline = outcome.staleUsageExpiresAtMs;
+              return lifecycleFacts({
+                presentation:
+                  outcome.status === undefined
+                    ? { kind: "preserve" }
+                    : { kind: "replace", status: outcome.status },
+                staleUsageExpiresAtMs: currentStaleDeadline,
+                observationEvidence: outcome.evidence ?? "adequate",
+                acquisitionHealth: outcome.health,
+              });
+            }
+            case "activity-observed":
+              return lifecycleFacts({
+                staleUsageExpiresAtMs: currentStaleDeadline,
+                observationEvidence: "inadequate",
+              });
+            case "stale-expiration-reached":
+              currentStaleDeadline = staleExpirationFacts.staleUsageExpiresAtMs;
+              return staleExpirationFacts;
+            case "session-ended":
+              currentStaleDeadline = undefined;
+              return lifecycleFacts();
+            case "passive-observation":
+            case "acquisition-deferred":
+              return lifecycleFacts({
+                staleUsageExpiresAtMs: currentStaleDeadline,
+              });
+          }
+        }),
       finalize: Effect.void,
     };
     const monitor = yield* makeProviderMonitor(adapter, {
@@ -94,14 +125,31 @@ function fixture(random = 0.5) {
       monitor,
       statuses,
       reads: () => reads,
-      setAcquisition: (value: Effect.Effect<ProviderAcquisitionCompletion>) => {
+      setAcquisition: (
+        value: Effect.Effect<AcquisitionOutcome, AcquisitionFailure>,
+      ) => {
         acquisition = value;
       },
-      setStaleExpirationChange: (value: WeeklySubscriptionUsageChange) => {
-        staleExpirationChange = value;
+      setStaleExpirationFacts: (
+        value: ProviderWeeklySubscriptionUsageFacts,
+      ) => {
+        staleExpirationFacts = value;
       },
-      setContinuity: (value: ProviderCredentialContinuity) => {
-        continuity = value;
+      setCredential: (kind: "unchanged" | "changed" | "unavailable") => {
+        if (kind === "unavailable") {
+          resolution = {
+            kind: "unavailable",
+            acceptPassiveObservation: false,
+          };
+          return;
+        }
+        if (kind === "changed") identityCounter += 1;
+        resolution = {
+          kind: "available",
+          identity: providerCredentialIdentity(`account-${identityCounter}`),
+          credential: "credential",
+          acceptPassiveObservation: true,
+        };
       },
     };
   });
@@ -147,7 +195,6 @@ it.scoped("coalesces ordinary refreshes", () =>
     const first = yield* Effect.fork(harness.monitor.refreshAfterActivity);
     const second = yield* Effect.fork(harness.monitor.refreshAfterActivity);
     while (harness.reads() < 2) yield* Effect.yieldNow();
-    assert.equal(harness.reads(), 2);
     yield* Deferred.succeed(gate, undefined);
     yield* Fiber.join(first);
     yield* Fiber.join(second);
@@ -189,7 +236,7 @@ it.scoped("propagates acquisition defects without scheduling retry", () =>
 it.scoped("honors a valid provider retry deadline", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setAcquisition(Effect.succeed(retry(5_000)));
+    harness.setAcquisition(Effect.fail(retry(5_000)));
     yield* harness.monitor.start;
     yield* TestClock.adjust("4999 millis");
     assert.equal(harness.reads(), 1);
@@ -198,49 +245,39 @@ it.scoped("honors a valid provider retry deadline", () =>
   }),
 );
 
-it.scoped("stops retry while credentials are unavailable", () =>
+it.scoped("rejects a non-finite provider retry deadline", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setAcquisition(Effect.succeed(retry(5_000)));
-    yield* harness.monitor.start;
-    harness.setContinuity("unavailable");
-    yield* harness.monitor.refreshAfterActivity;
-    yield* TestClock.adjust("5 seconds");
+    harness.setAcquisition(Effect.fail(retry(Number.NaN)));
+
+    const exit = yield* Effect.exit(harness.monitor.start);
+
+    assert.equal(Exit.isFailure(exit), true);
+    assert.equal(Exit.isFailure(exit) && Cause.defects(exit.cause).length, 1);
+    yield* TestClock.adjust("1 second");
     assert.equal(harness.reads(), 1);
-    harness.setContinuity("changed");
-    yield* harness.monitor.refreshAfterActivity;
-    assert.equal(harness.reads(), 2);
   }),
 );
 
-it.scoped("an unavailable completion preserves retry history", () =>
+it.scoped("stops retry while credentials are unavailable", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setAcquisition(Effect.succeed(retry(undefined)));
+    harness.setAcquisition(Effect.fail(retry(5_000)));
     yield* harness.monitor.start;
-    harness.setAcquisition(
-      Effect.succeed({
-        continuity: "unavailable",
-        changes: [noChange()],
-        disposition: { kind: "completed" },
-      }),
-    );
-    yield* TestClock.adjust("1 second");
-    assert.equal(harness.reads(), 2);
-
-    harness.setAcquisition(Effect.succeed(retry(undefined)));
+    harness.setCredential("unavailable");
     yield* harness.monitor.refreshAfterActivity;
-    yield* TestClock.adjust("1999 millis");
-    assert.equal(harness.reads(), 3);
-    yield* TestClock.adjust("1 millis");
-    assert.equal(harness.reads(), 4);
+    yield* TestClock.adjust("5 seconds");
+    assert.equal(harness.reads(), 1);
+    harness.setCredential("changed");
+    yield* harness.monitor.refreshAfterActivity;
+    assert.equal(harness.reads(), 2);
   }),
 );
 
 it.scoped("grows deterministic retry backoff and caps it at one minute", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setAcquisition(Effect.succeed(retry(undefined)));
+    harness.setAcquisition(Effect.fail(retry(undefined)));
     yield* harness.monitor.start;
     for (const [delay, expectedReads] of [
       [1, 2],
@@ -261,7 +298,7 @@ it.scoped("grows deterministic retry backoff and caps it at one minute", () =>
 it.scoped("applies deterministic retry jitter", () =>
   Effect.gen(function* () {
     const harness = yield* fixture(1);
-    harness.setAcquisition(Effect.succeed(retry(undefined)));
+    harness.setAcquisition(Effect.fail(retry(undefined)));
     yield* harness.monitor.start;
     yield* TestClock.adjust("1499 millis");
     assert.equal(harness.reads(), 1);
@@ -273,9 +310,9 @@ it.scoped("applies deterministic retry jitter", () =>
 it.scoped("forced refresh replaces an obsolete retry", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setAcquisition(Effect.succeed(retry(100_000)));
+    harness.setAcquisition(Effect.fail(retry(100_000)));
     yield* harness.monitor.start;
-    harness.setAcquisition(Effect.succeed(retry(undefined)));
+    harness.setAcquisition(Effect.fail(retry(undefined)));
     yield* harness.monitor.refreshForAccountChange;
     yield* TestClock.adjust("1999 millis");
     assert.equal(harness.reads(), 2);
@@ -287,12 +324,7 @@ it.scoped("forced refresh replaces an obsolete retry", () =>
 it.scoped("terminal results suppress polling until a forced refresh", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setAcquisition(
-      Effect.succeed({
-        changes: [noChange()],
-        disposition: { kind: "terminal" },
-      }),
-    );
+    harness.setAcquisition(Effect.succeed({ health: { kind: "terminal" } }));
     yield* harness.monitor.start;
     yield* TestClock.adjust("1 minute");
     assert.equal(harness.reads(), 1);
@@ -301,34 +333,13 @@ it.scoped("terminal results suppress polling until a forced refresh", () =>
   }),
 );
 
-it.scoped("unavailable credentials do not clear terminal history", () =>
-  Effect.gen(function* () {
-    const harness = yield* fixture();
-    harness.setAcquisition(
-      Effect.succeed({
-        changes: [noChange()],
-        disposition: { kind: "terminal" },
-      }),
-    );
-    yield* harness.monitor.start;
-    harness.setContinuity("unavailable");
-    yield* TestClock.adjust("1 minute");
-    harness.setContinuity("unchanged");
-    yield* harness.monitor.refreshAfterActivity;
-    assert.equal(harness.reads(), 1);
-  }),
-);
-
-it.scoped("coalesces acquisition demand emitted by completion", () =>
+it.scoped("coalesces inadequate evidence emitted by completion", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
     harness.setAcquisition(
       Effect.sync(() =>
         harness.reads() === 1
-          ? {
-              changes: [{ ...noChange(), acquire: true }],
-              disposition: { kind: "completed" },
-            }
+          ? { ...completed(1), evidence: "inadequate" }
           : completed(2),
       ),
     );
@@ -340,27 +351,19 @@ it.scoped("coalesces acquisition demand emitted by completion", () =>
   }),
 );
 
-it.scoped("publishes completion changes before applying retry", () =>
+it.scoped("publishes acquisition facts before applying retry", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
     harness.setAcquisition(
-      Effect.succeed({
-        changes: [
-          {
-            ...noChange(),
-            publication: { kind: "unavailable" },
-          },
-          available(40),
-        ],
-        disposition: { kind: "retry", retryAtMs: 5_000 },
+      Effect.fail({
+        health: {
+          kind: "temporarily-unavailable",
+          providerNotBeforeMs: 5_000,
+        },
       }),
     );
     yield* harness.monitor.start;
-    assert.deepEqual(harness.statuses, [
-      { kind: "loading" },
-      { kind: "unavailable" },
-      { kind: "available", usedPercent: 40, stale: false },
-    ]);
+    assert.deepEqual(harness.statuses, [{ kind: "loading" }]);
     yield* TestClock.adjust("4999 millis");
     assert.equal(harness.reads(), 1);
     yield* TestClock.adjust("1 millis");
@@ -371,25 +374,16 @@ it.scoped("publishes completion changes before applying retry", () =>
 it.scoped("runs provider stale expiration at its deadline", () =>
   Effect.gen(function* () {
     const harness = yield* fixture();
-    harness.setStaleExpirationChange({
-      publication: { kind: "unavailable" },
-      staleExpiration: { kind: "clear" },
-      acquire: false,
-    });
+    harness.setStaleExpirationFacts(
+      lifecycleFacts({
+        presentation: { kind: "replace", status: { kind: "unavailable" } },
+      }),
+    );
     harness.setAcquisition(
       Effect.succeed({
-        changes: [
-          {
-            publication: {
-              kind: "available",
-              usedPercent: 50,
-              stale: true,
-            },
-            staleExpiration: { kind: "arm", atMs: 10_000 },
-            acquire: false,
-          },
-        ],
-        disposition: { kind: "completed" },
+        status: { kind: "available", usedPercent: 50, stale: true },
+        staleUsageExpiresAtMs: 10_000,
+        health: { kind: "healthy" },
       }),
     );
     yield* harness.monitor.start;
@@ -404,30 +398,32 @@ it("scope closure interrupts active acquisition", () =>
   Effect.gen(function* () {
     const scope = yield* Scope.make();
     let interrupted = false;
-    const adapter = noopAdapter({
-      inspectAcquisition: () =>
-        Effect.succeed({
-          kind: "ready",
-          continuity: "unchanged",
-          change: noChange(),
-          acquire: Effect.never.pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                interrupted = true;
-              }),
-            ),
+    const adapter: ProviderMonitorAdapter<string, void, never> = {
+      credentialVerification: "before",
+      resolveCredential: Effect.succeed({
+        kind: "available",
+        identity: providerCredentialIdentity("account-1"),
+        credential: "credential",
+        acceptPassiveObservation: false,
+      }),
+      acquire: () =>
+        Effect.never.pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              interrupted = true;
+            }),
           ),
-        }),
-    });
+        ),
+      advance: () => Effect.succeed(lifecycleFacts()),
+      finalize: Effect.void,
+    };
     const monitor = yield* makeProviderMonitor(adapter, {
       publish: () => Effect.void,
     }).pipe(Effect.provideService(Scope.Scope, scope));
     const start = yield* Effect.fork(monitor.start);
     yield* Effect.yieldNow();
-
     yield* Scope.close(scope, Exit.void);
     yield* Fiber.await(start);
-
     assert.equal(interrupted, true);
   }));
 
@@ -436,21 +432,31 @@ it("scope closure cancels polling and retry work", () =>
     const scope = yield* Scope.make();
     let reads = 0;
     let finalized = false;
-    const adapter = noopAdapter({
-      inspectAcquisition: () =>
-        Effect.succeed({
-          kind: "ready",
-          continuity: "unchanged",
-          change: noChange(),
-          acquire: Effect.sync(() => {
-            reads += 1;
-            return retry(undefined);
-          }),
-        }),
+    const adapter: ProviderMonitorAdapter<string, void, AcquisitionFailure> = {
+      credentialVerification: "before",
+      resolveCredential: Effect.succeed({
+        kind: "available",
+        identity: providerCredentialIdentity("account-1"),
+        credential: "credential",
+        acceptPassiveObservation: false,
+      }),
+      acquire: () =>
+        Effect.sync(() => {
+          reads += 1;
+        }).pipe(Effect.andThen(Effect.fail(retry(undefined)))),
+      advance: (event) =>
+        Effect.sync(() =>
+          lifecycleFacts(
+            event.kind === "acquisition-completed" &&
+              event.exit.kind === "failed"
+              ? { acquisitionHealth: event.exit.error.health }
+              : {},
+          ),
+        ),
       finalize: Effect.sync(() => {
         finalized = true;
       }),
-    });
+    };
     const monitor = yield* makeProviderMonitor(adapter, {
       publish: () => Effect.void,
       random: Effect.succeed(0.5),

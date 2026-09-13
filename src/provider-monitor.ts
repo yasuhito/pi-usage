@@ -14,9 +14,9 @@ import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
-const POLL_INTERVAL_MS = 60_000;
+const DEFAULT_POLL_INTERVAL_MS = 60_000;
 
-/** The complete session-scoped interface exposed to the Pi adapter. */
+/** The complete session-scoped interface exposed to the Pi event adapter. */
 export interface ProviderMonitor {
   readonly start: Effect.Effect<void>;
   readonly observeResponse: (
@@ -31,123 +31,108 @@ export class ProviderMonitorService extends Context.Tag("ProviderMonitor")<
   ProviderMonitor
 >() {}
 
-type ProviderStaleExpiration =
-  | { readonly kind: "preserve" }
-  | { readonly kind: "clear" }
-  | { readonly kind: "arm"; readonly atMs: number };
-
-/** Presentation and observation demand produced by one provider event. */
-export interface WeeklySubscriptionUsageChange {
-  readonly publication: WeeklySubscriptionUsageStatus | undefined;
-  readonly staleExpiration: ProviderStaleExpiration;
-  readonly acquire: boolean;
-}
-
 export type ProviderCredentialContinuity =
   | "unchanged"
   | "changed"
   | "unavailable";
 
-export type ProviderCredentialInspection<Credential> =
+declare const providerCredentialIdentityBrand: unique symbol;
+
+/** A stable, non-secret identity used only for credential continuity. */
+export type ProviderCredentialIdentity = string & {
+  readonly [providerCredentialIdentityBrand]: true;
+};
+
+export function providerCredentialIdentity(
+  value: string,
+): ProviderCredentialIdentity {
+  return value as ProviderCredentialIdentity;
+}
+
+export type ResolvedProviderCredential<Credential> =
   | {
-      readonly continuity: "unavailable";
-      readonly credential: undefined;
-      readonly change: WeeklySubscriptionUsageChange;
-    }
-  | {
-      readonly continuity: "unchanged" | "changed";
+      readonly kind: "available";
+      readonly identity: ProviderCredentialIdentity;
       readonly credential: Credential;
-      readonly change: WeeklySubscriptionUsageChange;
-    };
-
-export type ClassifiedProviderAcquisitionExit<A, E> =
-  | { readonly kind: "acquired"; readonly value: A }
-  | { readonly kind: "failed"; readonly error: E }
-  | { readonly kind: "interrupted" }
-  | { readonly kind: "defect"; readonly cause: Cause.Cause<never> };
-
-export function classifyProviderAcquisitionExit<A, E>(
-  exit: Exit.Exit<A, E>,
-): ClassifiedProviderAcquisitionExit<A, E> {
-  if (Exit.isSuccess(exit)) return { kind: "acquired", value: exit.value };
-  if (Cause.isInterruptedOnly(exit.cause)) return { kind: "interrupted" };
-  const defects = Cause.keepDefects(exit.cause);
-  if (defects._tag === "Some") {
-    return { kind: "defect", cause: defects.value };
-  }
-  const failure = Cause.failureOption(exit.cause);
-  return failure._tag === "Some"
-    ? { kind: "failed", error: failure.value }
-    : { kind: "interrupted" };
-}
-
-export type ProviderAcquisitionDisposition =
-  | { readonly kind: "completed" }
-  | { readonly kind: "retry"; readonly retryAtMs: number | undefined }
-  | { readonly kind: "terminal" }
-  | { readonly kind: "defect"; readonly cause: Cause.Cause<never> };
-
-export interface ProviderAcquisitionCompletion {
-  /** Changes are committed in provider-domain order before disposition. */
-  readonly changes: ReadonlyArray<WeeklySubscriptionUsageChange>;
-  readonly disposition: ProviderAcquisitionDisposition;
-  readonly continuity?: ProviderCredentialContinuity;
-}
-
-export function providerAcquisitionDefect(
-  cause: Cause.Cause<never>,
-): ProviderAcquisitionCompletion {
-  return {
-    changes: [
-      {
-        publication: { kind: "unavailable" },
-        staleExpiration: { kind: "clear" },
-        acquire: false,
-      },
-    ],
-    disposition: { kind: "defect", cause },
-  };
-}
-
-export interface ProviderMonitorContext {
-  /** True only while the owning refresh generation may commit provider state. */
-  readonly isCurrent: Effect.Effect<boolean>;
-  /** Suppresses passive observations caused by credential resolution. */
-  readonly withoutPassiveObservation: <A, E, R>(
-    effect: Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E, R>;
-}
-
-export type ProviderAcquisitionInspection =
-  | {
-      readonly kind: "blocked";
-      readonly continuity: "unavailable";
-      readonly change: WeeklySubscriptionUsageChange;
+      readonly acceptPassiveObservation: boolean;
     }
   | {
-      readonly kind: "ready";
-      readonly continuity: "unchanged" | "changed";
-      readonly change: WeeklySubscriptionUsageChange;
-      readonly acquire: Effect.Effect<ProviderAcquisitionCompletion>;
-      readonly acquisitionDeferred?: Effect.Effect<WeeklySubscriptionUsageChange>;
+      readonly kind: "unavailable";
+      readonly acceptPassiveObservation: boolean;
     };
+
+export type ProviderAcquisitionExit<Acquired, Failure> =
+  | { readonly kind: "acquired"; readonly value: Acquired }
+  | { readonly kind: "failed"; readonly error: Failure };
+
+export type ProviderWeeklySubscriptionUsageEvent<Acquired, Failure> =
+  | {
+      readonly kind: "credential-observed";
+      readonly continuity: ProviderCredentialContinuity;
+      readonly credentialAvailable: boolean;
+      readonly nowMs: number;
+    }
+  | {
+      readonly kind: "acquisition-completed";
+      readonly exit: ProviderAcquisitionExit<Acquired, Failure>;
+      readonly startedIdentity: ProviderCredentialIdentity;
+      readonly currentIdentity: ProviderCredentialIdentity | undefined;
+      readonly authenticationRefreshUsed: boolean;
+      readonly nowMs: number;
+    }
+  | {
+      readonly kind: "passive-observation";
+      readonly fields: Readonly<Record<string, unknown>>;
+      readonly nowMs: number;
+    }
+  | { readonly kind: "activity-observed"; readonly nowMs: number }
+  | { readonly kind: "acquisition-deferred"; readonly nowMs: number }
+  | {
+      readonly kind: "stale-expiration-reached";
+      readonly deadlineMs: number;
+      readonly nowMs: number;
+    }
+  | { readonly kind: "session-ended" };
+
+export type ProviderPresentation =
+  | { readonly kind: "preserve" }
+  | {
+      readonly kind: "replace";
+      readonly status: WeeklySubscriptionUsageStatus;
+    };
+
+/** A provider-domain fact; only inadequate evidence creates acquisition demand. */
+export type WeeklySubscriptionUsageEvidence = "adequate" | "inadequate";
+
+/** Provider acquisition meaning, without retry or terminal scheduling work. */
+export type ProviderAcquisitionHealth =
+  | { readonly kind: "healthy" }
+  | {
+      readonly kind: "temporarily-unavailable";
+      readonly providerNotBeforeMs: number | undefined;
+    }
+  | { readonly kind: "credential-rejected" }
+  | { readonly kind: "terminal" };
+
+export interface ProviderWeeklySubscriptionUsageFacts {
+  readonly presentation: ProviderPresentation;
+  readonly staleUsageExpiresAtMs: number | undefined;
+  readonly observationEvidence?: WeeklySubscriptionUsageEvidence;
+  readonly acquisitionHealth?: ProviderAcquisitionHealth;
+}
 
 /** Provider-specific policy at the acquisition seam. */
-export interface ProviderMonitorAdapter {
-  readonly inspectAcquisition: (
-    context: ProviderMonitorContext,
-  ) => Effect.Effect<ProviderAcquisitionInspection>;
-  readonly observeResponse?: (
-    fields: Readonly<Record<string, unknown>>,
-    nowMs: number,
-  ) => Effect.Effect<WeeklySubscriptionUsageChange>;
-  readonly observeActivity: (
-    nowMs: number,
-  ) => Effect.Effect<WeeklySubscriptionUsageChange>;
-  readonly staleExpirationReached: (
-    deadlineMs: number,
-    nowMs: number,
-  ) => Effect.Effect<WeeklySubscriptionUsageChange>;
+export interface ProviderMonitorAdapter<Credential, Acquired, Failure> {
+  readonly credentialVerification: "before" | "before-and-after";
+  readonly resolveCredential: Effect.Effect<
+    ResolvedProviderCredential<Credential>
+  >;
+  readonly acquire: (
+    credential: Credential,
+  ) => Effect.Effect<Acquired, Failure>;
+  readonly advance: (
+    event: ProviderWeeklySubscriptionUsageEvent<Acquired, Failure>,
+  ) => Effect.Effect<ProviderWeeklySubscriptionUsageFacts>;
   readonly finalize: Effect.Effect<void>;
 }
 
@@ -159,18 +144,20 @@ interface ProviderMonitorDependencies {
   readonly random?: Effect.Effect<number>;
 }
 
-const emptyChange = (): WeeklySubscriptionUsageChange => ({
-  publication: undefined,
-  staleExpiration: { kind: "preserve" },
-  acquire: false,
-});
+const continuityOf = <Credential>(
+  previousIdentity: ProviderCredentialIdentity | undefined,
+  resolution: ResolvedProviderCredential<Credential>,
+): ProviderCredentialContinuity => {
+  if (resolution.kind === "unavailable") return "unavailable";
+  return previousIdentity === resolution.identity ? "unchanged" : "changed";
+};
 
 /**
- * Builds one deep provider monitor in the caller's session Scope. Polling,
- * retry, supersession, stale expiration, and cleanup stay behind this seam.
+ * Builds one deep provider monitor in the caller's session Scope. Provider
+ * adapters report domain facts; scheduling remains behind this seam.
  */
-export function makeProviderMonitor(
-  adapter: ProviderMonitorAdapter,
+export function makeProviderMonitor<Credential, Acquired, Failure>(
+  adapter: ProviderMonitorAdapter<Credential, Acquired, Failure>,
   dependencies: ProviderMonitorDependencies,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
   return Effect.gen(function* () {
@@ -187,6 +174,8 @@ export function makeProviderMonitor(
     let acquisitionDemanded = false;
     let observationSuppressionsInFlight = 0;
     let accountChangeRefreshesInFlight = 0;
+    let currentIdentity: ProviderCredentialIdentity | undefined;
+    let acceptPassiveObservation = false;
     type RefreshMode = "ordinary" | "account-change";
 
     let triggerRefresh: (
@@ -218,20 +207,22 @@ export function makeProviderMonitor(
       return Effect.void;
     };
 
-    const applyChange = (
-      change: WeeklySubscriptionUsageChange,
+    const applyFacts = (
+      facts: ProviderWeeklySubscriptionUsageFacts,
       generationSnapshot: number,
-      followUpDemand = false,
+      followUpEvidence = false,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (!isCurrent(generationSnapshot)) return;
-
-        const requestedDeadline =
-          change.staleExpiration.kind === "preserve"
-            ? staleDeadline
-            : change.staleExpiration.kind === "arm"
-              ? change.staleExpiration.atMs
-              : undefined;
+        const requestedDeadline = facts.staleUsageExpiresAtMs;
+        if (
+          requestedDeadline !== undefined &&
+          !Number.isFinite(requestedDeadline)
+        ) {
+          return yield* Effect.die(
+            new TypeError("provider stale expiration must be finite"),
+          );
+        }
         if (requestedDeadline !== staleDeadline) {
           if (staleFiber !== undefined) yield* Fiber.interrupt(staleFiber);
           staleFiber = undefined;
@@ -244,40 +235,71 @@ export function makeProviderMonitor(
           isCurrent(generationSnapshot)
         ) {
           const deadline = requestedDeadline;
-          const staleExpirationFiber = yield* Effect.forkIn(
+          const expirationFiber = yield* Effect.forkIn(
             Effect.gen(function* () {
               const now = yield* Clock.currentTimeMillis;
               yield* Effect.sleep(Math.max(0, deadline - now));
-              if (
-                staleDeadline !== deadline ||
-                staleFiber !== staleExpirationFiber
-              )
+              if (staleDeadline !== deadline || staleFiber !== expirationFiber)
                 return;
               staleFiber = undefined;
               staleDeadline = undefined;
               const atExpiration = yield* Clock.currentTimeMillis;
-              const expirationChange = yield* adapter.staleExpirationReached(
-                deadline,
-                atExpiration,
-              );
-              yield* applyChange(expirationChange, refreshGeneration);
+              const expirationFacts = yield* adapter.advance({
+                kind: "stale-expiration-reached",
+                deadlineMs: deadline,
+                nowMs: atExpiration,
+              });
+              yield* applyFacts(expirationFacts, refreshGeneration);
               yield* drainAcquisitionDemand;
             }),
             scope,
           );
-          staleFiber = staleExpirationFiber;
+          staleFiber = expirationFiber;
         }
-
-        if (change.publication !== undefined) {
-          yield* dependencies.publish(change.publication);
+        if (facts.presentation.kind === "replace") {
+          yield* dependencies.publish(facts.presentation.status);
         }
         if (
-          change.acquire &&
-          isCurrent(generationSnapshot) &&
-          (followUpDemand || activeRefreshFiber === undefined)
+          facts.observationEvidence === "inadequate" &&
+          (followUpEvidence || activeRefreshFiber === undefined)
         ) {
           acquisitionDemanded = true;
         }
+      });
+
+    const resolveCredential = (generationSnapshot: number) =>
+      Effect.gen(function* () {
+        observationSuppressionsInFlight += 1;
+        const resolution = yield* adapter.resolveCredential.pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              observationSuppressionsInFlight -= 1;
+            }),
+          ),
+        );
+        if (!isCurrent(generationSnapshot)) return yield* Effect.interrupt;
+        if (
+          resolution.kind === "available" &&
+          resolution.identity.trim() === ""
+        ) {
+          return yield* Effect.die(
+            new TypeError("provider credential identity must not be empty"),
+          );
+        }
+        const continuity = continuityOf(currentIdentity, resolution);
+        currentIdentity =
+          resolution.kind === "available" ? resolution.identity : undefined;
+        acceptPassiveObservation = resolution.acceptPassiveObservation;
+        const now = yield* Clock.currentTimeMillis;
+        const facts = yield* adapter.advance({
+          kind: "credential-observed",
+          continuity,
+          credentialAvailable: resolution.kind === "available",
+          nowMs: now,
+        });
+        yield* applyContinuity(continuity);
+        yield* applyFacts(facts, generationSnapshot);
+        return { resolution, continuity };
       });
 
     const scheduleRetry = (generationSnapshot: number, now: number) =>
@@ -293,25 +315,28 @@ export function makeProviderMonitor(
         );
       });
 
-    const applyDisposition = (
-      disposition: ProviderAcquisitionDisposition,
+    const applyHealth = (
+      health: ProviderAcquisitionHealth | undefined,
       generationSnapshot: number,
     ) =>
       Effect.gen(function* () {
-        if (!isCurrent(generationSnapshot)) return;
-        if (disposition.kind === "defect") {
-          return yield* Effect.failCause(disposition.cause);
-        }
+        if (!isCurrent(generationSnapshot) || health === undefined) return;
+        if (health.kind === "credential-rejected") return;
         const now = yield* Clock.currentTimeMillis;
-        if (disposition.kind === "retry") {
+        if (health.kind === "temporarily-unavailable") {
           terminal = false;
           consecutiveFailures += 1;
+          const providerDeadline = health.providerNotBeforeMs;
           if (
-            disposition.retryAtMs !== undefined &&
-            Number.isFinite(disposition.retryAtMs) &&
-            disposition.retryAtMs > now
+            providerDeadline !== undefined &&
+            !Number.isFinite(providerDeadline)
           ) {
-            nextAttemptAt = disposition.retryAtMs;
+            return yield* Effect.die(
+              new TypeError("provider acquisition deadline must be finite"),
+            );
+          }
+          if (providerDeadline !== undefined && providerDeadline > now) {
+            nextAttemptAt = providerDeadline;
           } else {
             const base = Math.min(
               MAX_BACKOFF_MS,
@@ -328,59 +353,109 @@ export function makeProviderMonitor(
           return;
         }
         yield* resetSchedule;
-        terminal = disposition.kind === "terminal";
+        terminal = health.kind === "terminal";
       });
 
-    const applyCompletion = (
-      completion: ProviderAcquisitionCompletion,
+    const acquire = (
+      started: Extract<
+        ResolvedProviderCredential<Credential>,
+        { readonly kind: "available" }
+      >,
       generationSnapshot: number,
-    ) =>
+      authenticationRefreshUsed: boolean,
+    ): Effect.Effect<void> =>
       Effect.gen(function* () {
+        const acquisitionExit = yield* Effect.exit(
+          adapter.acquire(started.credential),
+        );
         if (!isCurrent(generationSnapshot)) return;
-        for (const change of completion.changes) {
-          yield* applyChange(change, generationSnapshot, true);
+        if (
+          Exit.isFailure(acquisitionExit) &&
+          Cause.isInterruptedOnly(acquisitionExit.cause)
+        ) {
+          return;
         }
-        if (completion.continuity !== undefined) {
-          yield* applyContinuity(completion.continuity);
+
+        if (adapter.credentialVerification === "before-and-after") {
+          yield* resolveCredential(generationSnapshot);
+          if (!isCurrent(generationSnapshot)) return;
         }
-        if (completion.continuity !== "unavailable") {
-          yield* applyDisposition(completion.disposition, generationSnapshot);
+
+        if (Exit.isFailure(acquisitionExit)) {
+          const defects = Cause.keepDefects(acquisitionExit.cause);
+          if (defects._tag === "Some") {
+            if (
+              adapter.credentialVerification === "before-and-after" &&
+              currentIdentity !== started.identity
+            ) {
+              return;
+            }
+            yield* applyFacts(
+              {
+                presentation: {
+                  kind: "replace",
+                  status: { kind: "unavailable" },
+                },
+                staleUsageExpiresAtMs: undefined,
+              },
+              generationSnapshot,
+            );
+            return yield* Effect.failCause(defects.value);
+          }
         }
+
+        const exit: ProviderAcquisitionExit<Acquired, Failure> = Exit.isSuccess(
+          acquisitionExit,
+        )
+          ? { kind: "acquired", value: acquisitionExit.value }
+          : (() => {
+              const failure = Cause.failureOption(acquisitionExit.cause);
+              if (failure._tag === "None") {
+                throw new TypeError("provider acquisition had no failure");
+              }
+              return { kind: "failed" as const, error: failure.value };
+            })();
+        const now = yield* Clock.currentTimeMillis;
+        const facts = yield* adapter.advance({
+          kind: "acquisition-completed",
+          exit,
+          startedIdentity: started.identity,
+          currentIdentity,
+          authenticationRefreshUsed,
+          nowMs: now,
+        });
+        yield* applyFacts(facts, generationSnapshot, true);
+        if (facts.acquisitionHealth?.kind === "credential-rejected") {
+          if (authenticationRefreshUsed) {
+            return yield* Effect.die(
+              new TypeError("provider requested repeated credential refresh"),
+            );
+          }
+          const refreshed = yield* resolveCredential(generationSnapshot);
+          if (refreshed.resolution.kind === "available") {
+            yield* acquire(refreshed.resolution, generationSnapshot, true);
+          }
+          return;
+        }
+        yield* applyHealth(facts.acquisitionHealth, generationSnapshot);
       });
 
     const performRefresh = (generationSnapshot: number, mode: RefreshMode) =>
       Effect.gen(function* () {
-        const context: ProviderMonitorContext = {
-          isCurrent: Effect.sync(() => isCurrent(generationSnapshot)),
-          withoutPassiveObservation: (effect) =>
-            Effect.suspend(() => {
-              observationSuppressionsInFlight += 1;
-              return effect.pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    observationSuppressionsInFlight -= 1;
-                  }),
-                ),
-              );
-            }),
-        };
-        const inspection = yield* adapter.inspectAcquisition(context);
+        const inspected = yield* resolveCredential(generationSnapshot);
         if (!isCurrent(generationSnapshot)) return;
-        yield* applyContinuity(inspection.continuity);
-        yield* applyChange(inspection.change, generationSnapshot);
-        if (inspection.kind === "blocked") return;
+        if (inspected.resolution.kind === "unavailable") return;
         if (terminal && mode === "ordinary") return;
         const now = yield* Clock.currentTimeMillis;
         if (mode === "ordinary" && now < nextAttemptAt) {
-          if (inspection.acquisitionDeferred !== undefined) {
-            const change = yield* inspection.acquisitionDeferred;
-            yield* applyChange(change, generationSnapshot);
-          }
+          const facts = yield* adapter.advance({
+            kind: "acquisition-deferred",
+            nowMs: now,
+          });
+          yield* applyFacts(facts, generationSnapshot);
           return;
         }
-
-        const completion = yield* inspection.acquire;
-        yield* applyCompletion(completion, generationSnapshot);
+        yield* acquire(inspected.resolution, generationSnapshot, false);
       });
 
     triggerRefresh = (mode: RefreshMode) =>
@@ -439,12 +514,15 @@ export function makeProviderMonitor(
         acquisitionDemanded = false;
         observationSuppressionsInFlight = 0;
         accountChangeRefreshesInFlight = 0;
+        currentIdentity = undefined;
+        acceptPassiveObservation = false;
+        yield* adapter.advance({ kind: "session-ended" });
         yield* adapter.finalize;
       }),
     );
 
     yield* Effect.forkIn(
-      Stream.tick(dependencies.pollIntervalMs ?? POLL_INTERVAL_MS).pipe(
+      Stream.tick(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS).pipe(
         Stream.drop(1),
         Stream.runForEach(() =>
           Effect.suspend(() => triggerRefresh("ordinary")).pipe(Effect.asVoid),
@@ -461,6 +539,7 @@ export function makeProviderMonitor(
       observeResponse: (fields) =>
         Effect.suspend(() => {
           if (
+            !acceptPassiveObservation ||
             observationSuppressionsInFlight > 0 ||
             accountChangeRefreshesInFlight > 0
           ) {
@@ -468,23 +547,27 @@ export function makeProviderMonitor(
           }
           const generationSnapshot = refreshGeneration;
           return Effect.gen(function* () {
-            if (adapter.observeResponse === undefined) return;
             const now = yield* Clock.currentTimeMillis;
-            const change = yield* adapter.observeResponse(fields, now);
-            yield* applyChange(change, generationSnapshot);
+            const facts = yield* adapter.advance({
+              kind: "passive-observation",
+              fields,
+              nowMs: now,
+            });
+            yield* applyFacts(facts, generationSnapshot);
             yield* drainAcquisitionDemand;
           });
         }),
       refreshAfterActivity: Effect.gen(function* () {
         const generationSnapshot = refreshGeneration;
         const now = yield* Clock.currentTimeMillis;
-        const change = yield* adapter.observeActivity(now);
-        yield* applyChange(change, generationSnapshot);
+        const facts = yield* adapter.advance({
+          kind: "activity-observed",
+          nowMs: now,
+        });
+        yield* applyFacts(facts, generationSnapshot);
         yield* drainAcquisitionDemand;
       }),
       refreshForAccountChange: refresh("account-change"),
     } satisfies ProviderMonitor;
   });
 }
-
-export const noWeeklySubscriptionUsageChange = emptyChange;

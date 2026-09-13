@@ -424,6 +424,69 @@ it.scoped("does not publish an acquisition after its identity changes", () =>
   }),
 );
 
+it.scoped("rechecks identity before handling an acquisition defect", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    const pending = yield* Deferred.make<void>();
+    f.setAcquisition(
+      Deferred.await(pending).pipe(
+        Effect.andThen(Effect.die("old identity defect")),
+      ),
+    );
+    const refresh = yield* Effect.fork(f.monitor.refreshForAccountChange);
+    while (f.reads() < 2) yield* Effect.yieldNow();
+    f.setIdentity("fingerprint-2");
+    yield* Deferred.succeed(pending, undefined);
+    yield* Fiber.join(refresh);
+
+    f.setAcquisition(
+      Effect.succeed({
+        usedPercent: 20,
+        resetsAtMs: 2_000_000,
+        credentialFingerprint: "fingerprint-2",
+      }),
+    );
+    yield* f.monitor.refreshAfterActivity;
+
+    assert.equal(f.reads(), 3);
+    const latest = f.statuses.at(-1);
+    assert.equal(latest?.kind === "available" && latest.usedPercent, 20);
+  }),
+);
+
+it.scoped("does not restore stale usage after its identity changes", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    const pending = yield* Deferred.make<void>();
+    f.setAcquisition(
+      Deferred.await(pending).pipe(
+        Effect.andThen(
+          Effect.fail(
+            new TemporaryClaudeSubscriptionUsageFailure({
+              retryAtMs: undefined,
+              staleUsage: {
+                usedPercent: 63.4,
+                resetsAtMs: 2_000_000,
+                credentialFingerprint: "fingerprint-1",
+                observedAtMs: 0,
+              },
+            }),
+          ),
+        ),
+      ),
+    );
+    const refresh = yield* Effect.fork(f.monitor.refreshForAccountChange);
+    while (f.reads() < 2) yield* Effect.yieldNow();
+    f.setIdentity("fingerprint-2");
+    yield* Deferred.succeed(pending, undefined);
+    yield* Fiber.join(refresh);
+
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+  }),
+);
+
 it.scoped("coalesces ordinary refreshes and supersedes old identities", () =>
   Effect.gen(function* () {
     const f = yield* fixture();

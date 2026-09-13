@@ -1,4 +1,4 @@
-import { Context, Effect, type Exit, Layer, type Scope } from "effect";
+import { Context, Effect, Layer, type Scope } from "effect";
 
 import type {
   AcquireClaudeSubscriptionUsage,
@@ -7,17 +7,12 @@ import type {
 } from "./claude-subscription-usage-acquisition.ts";
 import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 import {
-  classifyProviderAcquisitionExit,
   makeProviderMonitor,
-  type ProviderAcquisitionCompletion,
-  type ProviderAcquisitionDisposition,
-  type ProviderAcquisitionInspection,
-  type ProviderCredentialInspection,
+  type ProviderAcquisitionHealth,
   type ProviderMonitor,
   type ProviderMonitorAdapter,
-  type ProviderMonitorContext,
-  providerAcquisitionDefect,
-  type WeeklySubscriptionUsageChange,
+  type ProviderWeeklySubscriptionUsageFacts,
+  providerCredentialIdentity,
 } from "./provider-monitor.ts";
 import { createWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-usage-lifecycle.ts";
 
@@ -41,96 +36,17 @@ export interface ClaudeProviderMonitorDependencies {
   readonly random?: Effect.Effect<number>;
 }
 
-type AcquisitionResult =
-  | {
-      readonly kind: "acquired";
-      readonly usage: AcquiredClaudeSubscriptionUsage;
-    }
-  | {
-      readonly kind: "temporary";
-      readonly retryAtMs: number | undefined;
-      readonly staleUsage?: AcquiredClaudeSubscriptionUsage & {
-        readonly observedAtMs: number;
-      };
-      readonly preserveUsage: boolean;
-    }
-  | { readonly kind: "authentication-unavailable" }
-  | { readonly kind: "suppressed"; readonly retryAtMs: number }
-  | { readonly kind: "terminal" }
-  | Extract<ProviderAcquisitionDisposition, { readonly kind: "defect" }>;
-
-type InspectedIdentity = ProviderCredentialInspection<string>;
-
-function acquisitionResultFromExit(
-  exit: Exit.Exit<
-    AcquiredClaudeSubscriptionUsage,
-    ClaudeSubscriptionUsageAcquisitionError
-  >,
-): AcquisitionResult | undefined {
-  const result = classifyProviderAcquisitionExit(exit);
-  switch (result.kind) {
-    case "acquired":
-      return { kind: "acquired", usage: result.value };
-    case "interrupted":
-      return undefined;
-    case "defect":
-      return result;
-    case "failed":
-      switch (result.error._tag) {
-        case "TemporaryClaudeSubscriptionUsageFailure":
-          return {
-            kind: "temporary",
-            retryAtMs: result.error.retryAtMs,
-            preserveUsage: result.error.preserveUsage !== false,
-            ...(result.error.staleUsage === undefined
-              ? {}
-              : { staleUsage: result.error.staleUsage }),
-          };
-        case "MalformedClaudeSubscriptionUsage":
-          return {
-            kind: "temporary",
-            retryAtMs: result.error.retryAtMs,
-            preserveUsage: true,
-            ...(result.error.staleUsage === undefined
-              ? {}
-              : { staleUsage: result.error.staleUsage }),
-          };
-        case "ClaudeAuthenticationUnavailable":
-          return { kind: "authentication-unavailable" };
-        case "ClaudeAuthenticationRejected":
-          return result.error.retryAtMs === undefined
-            ? { kind: "authentication-unavailable" }
-            : { kind: "suppressed", retryAtMs: result.error.retryAtMs };
-        case "PermanentClaudeSubscriptionUsageFailure":
-          return result.error.retryAtMs === undefined
-            ? { kind: "terminal" }
-            : { kind: "suppressed", retryAtMs: result.error.retryAtMs };
-      }
-  }
-}
-
 /** Builds one Claude policy adapter; scheduling stays in provider-monitor. */
 function makeClaudeProviderMonitorAdapter(
   dependencies: ClaudeProviderMonitorDependencies,
-): ProviderMonitorAdapter {
-  let identityFingerprint: string | undefined;
+): ProviderMonitorAdapter<
+  string,
+  AcquiredClaudeSubscriptionUsage,
+  ClaudeSubscriptionUsageAcquisitionError
+> {
   let lastObservedAtMs: number | undefined;
   const usageLifecycle =
     createWeeklySubscriptionUsageLifecycle<AcquiredClaudeSubscriptionUsage>({});
-  const change = (
-    publication: WeeklySubscriptionUsageStatus | undefined,
-    acquire = false,
-  ): WeeklySubscriptionUsageChange => {
-    const { staleExpirationAtMs } = usageLifecycle.current();
-    return {
-      publication,
-      staleExpiration:
-        staleExpirationAtMs === undefined
-          ? { kind: "clear" }
-          : { kind: "arm", atMs: staleExpirationAtMs },
-      acquire,
-    };
-  };
 
   const usageStatus = (): WeeklySubscriptionUsageStatus => {
     const observation = usageLifecycle.current().observation;
@@ -144,211 +60,192 @@ function makeClaudeProviderMonitorAdapter(
         };
   };
 
+  const weeklySubscriptionUsageFacts = (
+    publish: boolean,
+    observationEvidence?: ProviderWeeklySubscriptionUsageFacts["observationEvidence"],
+    acquisitionHealth?: ProviderAcquisitionHealth,
+  ): ProviderWeeklySubscriptionUsageFacts => ({
+    presentation: publish
+      ? { kind: "replace", status: usageStatus() }
+      : { kind: "preserve" },
+    staleUsageExpiresAtMs: usageLifecycle.current().staleExpirationAtMs,
+    ...(observationEvidence === undefined ? {} : { observationEvidence }),
+    ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
+  });
+
   const clearUsage = (publish: boolean) => {
     lastObservedAtMs = undefined;
     usageLifecycle.advance({ kind: "invalidated" });
-    return change(publish ? usageStatus() : undefined);
+    return weeklySubscriptionUsageFacts(publish);
   };
 
-  const applyIdentity = (
-    resolution: ClaudeCredentialIdentityResolution,
-    context: ProviderMonitorContext,
-  ): Effect.Effect<InspectedIdentity> =>
-    Effect.gen(function* () {
-      if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
-      if (resolution.kind === "missing") {
-        identityFingerprint = undefined;
-        return {
-          continuity: "unavailable",
-          credential: undefined,
-          change: clearUsage(true),
-        };
-      }
-      if (identityFingerprint !== resolution.fingerprint) {
-        const replacingUsage =
-          usageLifecycle.current().observation.kind === "usage";
-        identityFingerprint = resolution.fingerprint;
-        return {
-          continuity: "changed",
-          credential: resolution.fingerprint,
-          change: clearUsage(replacingUsage),
-        };
-      }
-      return {
-        continuity: "unchanged",
-        credential: resolution.fingerprint,
-        change: change(undefined),
-      };
+  const temporaryFailure = (
+    error: Extract<
+      ClaudeSubscriptionUsageAcquisitionError,
+      | { readonly _tag: "TemporaryClaudeSubscriptionUsageFailure" }
+      | { readonly _tag: "MalformedClaudeSubscriptionUsage" }
+    >,
+    startedIdentity: string,
+    nowMs: number,
+  ): ProviderWeeklySubscriptionUsageFacts => {
+    if (
+      error._tag === "TemporaryClaudeSubscriptionUsageFailure" &&
+      error.preserveUsage === false
+    ) {
+      lastObservedAtMs = undefined;
+      usageLifecycle.advance({ kind: "invalidated" });
+    }
+    if (
+      error.staleUsage !== undefined &&
+      error.staleUsage.credentialFingerprint === startedIdentity &&
+      error.staleUsage.resetsAtMs > nowMs &&
+      !(
+        error._tag === "TemporaryClaudeSubscriptionUsageFailure" &&
+        error.preserveUsage === false
+      )
+    ) {
+      lastObservedAtMs = error.staleUsage.observedAtMs;
+      usageLifecycle.advance({
+        kind: "observed",
+        usage: error.staleUsage,
+        observedAtMs: error.staleUsage.observedAtMs,
+      });
+    }
+    const reaction = usageLifecycle.advance({
+      kind: "temporarily-unavailable",
+      nowMs,
     });
-
-  const inspectIdentity = (context: ProviderMonitorContext) =>
-    context.withoutPassiveObservation(
-      dependencies.resolveCredentialIdentity.pipe(
-        Effect.flatMap((resolution) => applyIdentity(resolution, context)),
-      ),
-    );
-
-  const acquire = (
-    acquisitionIdentity: string,
-    context: ProviderMonitorContext,
-  ): Effect.Effect<ProviderAcquisitionCompletion> =>
-    Effect.gen(function* () {
-      const result = acquisitionResultFromExit(
-        yield* Effect.exit(dependencies.acquireClaudeSubscriptionUsage()),
-      );
-      if (result === undefined) return yield* Effect.interrupt;
-
-      const currentIdentity = yield* inspectIdentity(context);
-      if (
-        result.kind === "acquired" &&
-        currentIdentity.credential === result.usage.credentialFingerprint
-      ) {
-        const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-        if (!(yield* context.isCurrent)) return yield* Effect.interrupt;
-        const observedAtMs = result.usage.observedAtMs ?? now;
-        lastObservedAtMs = observedAtMs;
-        usageLifecycle.advance({
-          kind: "observed",
-          usage: result.usage,
-          observedAtMs,
-        });
-        return {
-          continuity: currentIdentity.continuity,
-          changes: [currentIdentity.change, change(usageStatus())],
-          disposition: { kind: "completed" },
-        };
-      }
-
-      if (
-        currentIdentity.credential === undefined ||
-        currentIdentity.credential !== acquisitionIdentity
-      ) {
-        return {
-          continuity: currentIdentity.continuity,
-          changes: [currentIdentity.change],
-          disposition: { kind: "completed" },
-        };
-      }
-
-      switch (result.kind) {
-        case "acquired":
-          return {
-            continuity: currentIdentity.continuity,
-            changes: [currentIdentity.change],
-            disposition: { kind: "completed" },
-          };
-        case "temporary": {
-          const now = yield* Effect.clockWith(
-            (clock) => clock.currentTimeMillis,
-          );
-          if (!result.preserveUsage) {
-            lastObservedAtMs = undefined;
-            usageLifecycle.advance({ kind: "invalidated" });
-          }
-          if (
-            result.preserveUsage &&
-            result.staleUsage !== undefined &&
-            result.staleUsage.credentialFingerprint === acquisitionIdentity &&
-            result.staleUsage.resetsAtMs > now
-          ) {
-            lastObservedAtMs = result.staleUsage.observedAtMs;
-            usageLifecycle.advance({
-              kind: "observed",
-              usage: result.staleUsage,
-              observedAtMs: result.staleUsage.observedAtMs,
-            });
-          }
-          const lifecycleReaction = usageLifecycle.advance({
-            kind: "temporarily-unavailable",
-            nowMs: now,
-          });
-          if (lifecycleReaction.observation.kind === "none") {
-            lastObservedAtMs = undefined;
-          }
-          return {
-            continuity: currentIdentity.continuity,
-            changes: [currentIdentity.change, change(usageStatus())],
-            disposition: {
-              kind: "retry",
-              retryAtMs: result.retryAtMs,
-            },
-          };
-        }
-        case "authentication-unavailable":
-          return {
-            continuity: currentIdentity.continuity,
-            changes: [currentIdentity.change, clearUsage(true)],
-            disposition: { kind: "completed" },
-          };
-        case "suppressed":
-          return {
-            continuity: currentIdentity.continuity,
-            changes: [currentIdentity.change, clearUsage(true)],
-            disposition: { kind: "retry", retryAtMs: result.retryAtMs },
-          };
-        case "terminal":
-          return {
-            continuity: currentIdentity.continuity,
-            changes: [currentIdentity.change, clearUsage(true)],
-            disposition: { kind: "terminal" },
-          };
-        case "defect": {
-          const defect = providerAcquisitionDefect(result.cause);
-          return {
-            ...defect,
-            continuity: currentIdentity.continuity,
-            changes: [currentIdentity.change, ...defect.changes],
-          };
-        }
-      }
+    if (reaction.observation.kind === "none") lastObservedAtMs = undefined;
+    return weeklySubscriptionUsageFacts(true, undefined, {
+      kind: "temporarily-unavailable",
+      providerNotBeforeMs: error.retryAtMs,
     });
+  };
 
   return {
-    inspectAcquisition: (
-      context,
-    ): Effect.Effect<ProviderAcquisitionInspection> =>
-      Effect.gen(function* () {
-        const identity = yield* inspectIdentity(context);
-        if (identity.credential === undefined) {
-          return {
-            kind: "blocked",
-            continuity: "unavailable",
-            change: identity.change,
-          };
-        }
-        return {
-          kind: "ready",
-          continuity: identity.continuity,
-          change: identity.change,
-          acquire: acquire(identity.credential, context),
-        };
-      }),
-    observeActivity: (now) =>
-      Effect.sync(() =>
-        change(
-          undefined,
-          lastObservedAtMs === undefined ||
-            now - lastObservedAtMs >= ACTIVITY_REFRESH_INTERVAL_MS,
-        ),
+    credentialVerification: "before-and-after",
+    resolveCredential: dependencies.resolveCredentialIdentity.pipe(
+      Effect.map((resolution) =>
+        resolution.kind === "missing"
+          ? {
+              kind: "unavailable" as const,
+              acceptPassiveObservation: false,
+            }
+          : {
+              kind: "available" as const,
+              identity: providerCredentialIdentity(resolution.fingerprint),
+              credential: resolution.fingerprint,
+              acceptPassiveObservation: false,
+            },
       ),
-    staleExpirationReached: (deadline, now) =>
+    ),
+    acquire: () => dependencies.acquireClaudeSubscriptionUsage(),
+    advance: (event) =>
       Effect.sync(() => {
-        const lifecycleReaction = usageLifecycle.advance({
-          kind: "stale-expiration-reached",
-          deadlineMs: deadline,
-          nowMs: now,
-        });
-        if (lifecycleReaction.publication === "preserve") {
-          return change(undefined);
+        switch (event.kind) {
+          case "credential-observed": {
+            if (event.continuity === "unchanged")
+              return weeklySubscriptionUsageFacts(false);
+            const replacingUsage =
+              usageLifecycle.current().observation.kind === "usage";
+            return clearUsage(!event.credentialAvailable || replacingUsage);
+          }
+          case "acquisition-completed": {
+            if (event.exit.kind === "acquired") {
+              if (
+                event.currentIdentity !== event.exit.value.credentialFingerprint
+              ) {
+                return weeklySubscriptionUsageFacts(false, undefined, {
+                  kind: "healthy",
+                });
+              }
+              const observedAtMs = event.exit.value.observedAtMs ?? event.nowMs;
+              lastObservedAtMs = observedAtMs;
+              usageLifecycle.advance({
+                kind: "observed",
+                usage: event.exit.value,
+                observedAtMs,
+              });
+              return weeklySubscriptionUsageFacts(true, "adequate", {
+                kind: "healthy",
+              });
+            }
+            if (
+              event.currentIdentity === undefined ||
+              event.currentIdentity !== event.startedIdentity
+            ) {
+              return weeklySubscriptionUsageFacts(false, undefined, {
+                kind: "healthy",
+              });
+            }
+            const error = event.exit.error;
+            switch (error._tag) {
+              case "TemporaryClaudeSubscriptionUsageFailure":
+              case "MalformedClaudeSubscriptionUsage":
+                return temporaryFailure(
+                  error,
+                  event.startedIdentity,
+                  event.nowMs,
+                );
+              case "ClaudeAuthenticationUnavailable":
+                return {
+                  ...clearUsage(true),
+                  acquisitionHealth: { kind: "healthy" },
+                };
+              case "ClaudeAuthenticationRejected":
+                return {
+                  ...clearUsage(true),
+                  acquisitionHealth:
+                    error.retryAtMs === undefined
+                      ? { kind: "healthy" }
+                      : {
+                          kind: "temporarily-unavailable",
+                          providerNotBeforeMs: error.retryAtMs,
+                        },
+                };
+              case "PermanentClaudeSubscriptionUsageFailure":
+                return {
+                  ...clearUsage(true),
+                  acquisitionHealth:
+                    error.retryAtMs === undefined
+                      ? { kind: "terminal" }
+                      : {
+                          kind: "temporarily-unavailable",
+                          providerNotBeforeMs: error.retryAtMs,
+                        },
+                };
+            }
+            throw new TypeError("unknown Claude acquisition failure");
+          }
+          case "activity-observed":
+            return weeklySubscriptionUsageFacts(
+              false,
+              lastObservedAtMs === undefined ||
+                event.nowMs - lastObservedAtMs >= ACTIVITY_REFRESH_INTERVAL_MS
+                ? "inadequate"
+                : "adequate",
+            );
+          case "passive-observation":
+          case "acquisition-deferred":
+            return weeklySubscriptionUsageFacts(false);
+          case "stale-expiration-reached": {
+            const reaction = usageLifecycle.advance({
+              kind: "stale-expiration-reached",
+              deadlineMs: event.deadlineMs,
+              nowMs: event.nowMs,
+            });
+            if (reaction.publication === "preserve")
+              return weeklySubscriptionUsageFacts(false);
+            lastObservedAtMs = undefined;
+            return weeklySubscriptionUsageFacts(true);
+          }
+          case "session-ended":
+            lastObservedAtMs = undefined;
+            usageLifecycle.advance({ kind: "session-ended" });
+            return weeklySubscriptionUsageFacts(false);
         }
-        lastObservedAtMs = undefined;
-        return change(usageStatus());
       }),
-    finalize: Effect.sync(() => {
-      identityFingerprint = undefined;
-      lastObservedAtMs = undefined;
-      usageLifecycle.advance({ kind: "session-ended" });
-    }),
+    finalize: Effect.void,
   };
 }
 
