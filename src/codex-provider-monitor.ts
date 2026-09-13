@@ -11,10 +11,10 @@ import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 import {
   makeProviderMonitor,
   type ProviderAcquisitionHealth,
+  type ProviderCapacityFacts,
   type ProviderMonitor,
   type ProviderMonitorAdapter,
   ProviderMonitorService,
-  type ProviderWeeklySubscriptionUsageFacts,
   providerCredentialIdentity,
 } from "./provider-monitor.ts";
 import {
@@ -90,17 +90,18 @@ function makeCodexProviderMonitorAdapter(
 ): ProviderMonitorAdapter<
   CodexCredential,
   AcquiredWeeklyQuotaUsage,
-  DedicatedWeeklyQuotaAcquisitionError
+  DedicatedWeeklyQuotaAcquisitionError,
+  WeeklySubscriptionUsageStatus
 > {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   let expectedStaleExpirationAtMs: number | undefined;
 
   const factsFromReconciliation = (
     reaction: WeeklyQuotaObservationReaction,
-    observationEvidence?: ProviderWeeklySubscriptionUsageFacts["observationEvidence"],
+    observationEvidence?: ProviderCapacityFacts<WeeklySubscriptionUsageStatus>["observationEvidence"],
     acquisitionHealth?: ProviderAcquisitionHealth,
     forceUnavailable = false,
-  ): ProviderWeeklySubscriptionUsageFacts => {
+  ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => {
     expectedStaleExpirationAtMs = reaction.staleExpirationAtMs;
     const publication = publicationFromReaction(reaction);
     return {
@@ -111,7 +112,7 @@ function makeCodexProviderMonitorAdapter(
               kind: "replace",
               status: publication ?? { kind: "unavailable" },
             },
-      staleUsageExpiresAtMs: reaction.staleExpirationAtMs,
+      staleCapacityExpiresAtMs: reaction.staleExpirationAtMs,
       ...(observationEvidence === undefined ? {} : { observationEvidence }),
       ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
     };
@@ -119,9 +120,9 @@ function makeCodexProviderMonitorAdapter(
 
   const preservedFacts = (
     acquisitionHealth?: ProviderAcquisitionHealth,
-  ): ProviderWeeklySubscriptionUsageFacts => ({
+  ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => ({
     presentation: { kind: "preserve" },
-    staleUsageExpiresAtMs: expectedStaleExpirationAtMs,
+    staleCapacityExpiresAtMs: expectedStaleExpirationAtMs,
     ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
   });
 
@@ -244,10 +245,12 @@ function makeCodexProviderMonitorAdapter(
 export function makeCodexProviderMonitor(
   dependencies: CodexProviderMonitorDependencies,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
-  return makeProviderMonitor(
-    makeCodexProviderMonitorAdapter(dependencies),
-    dependencies,
-  );
+  return makeProviderMonitor<
+    CodexCredential,
+    AcquiredWeeklyQuotaUsage,
+    DedicatedWeeklyQuotaAcquisitionError,
+    WeeklySubscriptionUsageStatus
+  >(makeCodexProviderMonitorAdapter(dependencies), dependencies);
 }
 
 /** A session-scoped Layer that hides Codex acquisition and reconciliation. */

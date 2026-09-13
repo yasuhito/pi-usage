@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, type Scope } from "effect";
+import { Effect, Layer, type Scope } from "effect";
 
 import type {
   AcquireClaudeSubscriptionUsage,
@@ -9,19 +9,16 @@ import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
 import {
   makeProviderMonitor,
   type ProviderAcquisitionHealth,
+  type ProviderCapacityFacts,
   type ProviderMonitor,
   type ProviderMonitorAdapter,
-  type ProviderWeeklySubscriptionUsageFacts,
+  ProviderMonitorService,
   providerCredentialIdentity,
 } from "./provider-monitor.ts";
 import { createWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-usage-lifecycle.ts";
 
 const ACTIVITY_REFRESH_INTERVAL_MS = 3 * 60_000;
 const POLL_INTERVAL_MS = 15 * 60_000;
-
-export class ClaudeProviderMonitorService extends Context.Tag(
-  "ClaudeProviderMonitor",
-)<ClaudeProviderMonitorService, ProviderMonitor>() {}
 
 export type ClaudeCredentialIdentityResolution =
   | { readonly kind: "missing" }
@@ -42,7 +39,8 @@ function makeClaudeProviderMonitorAdapter(
 ): ProviderMonitorAdapter<
   string,
   AcquiredClaudeSubscriptionUsage,
-  ClaudeSubscriptionUsageAcquisitionError
+  ClaudeSubscriptionUsageAcquisitionError,
+  WeeklySubscriptionUsageStatus
 > {
   let lastObservedAtMs: number | undefined;
   const usageLifecycle =
@@ -62,13 +60,13 @@ function makeClaudeProviderMonitorAdapter(
 
   const weeklySubscriptionUsageFacts = (
     publish: boolean,
-    observationEvidence?: ProviderWeeklySubscriptionUsageFacts["observationEvidence"],
+    observationEvidence?: ProviderCapacityFacts<WeeklySubscriptionUsageStatus>["observationEvidence"],
     acquisitionHealth?: ProviderAcquisitionHealth,
-  ): ProviderWeeklySubscriptionUsageFacts => ({
+  ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => ({
     presentation: publish
       ? { kind: "replace", status: usageStatus() }
       : { kind: "preserve" },
-    staleUsageExpiresAtMs: usageLifecycle.current().staleExpirationAtMs,
+    staleCapacityExpiresAtMs: usageLifecycle.current().staleExpirationAtMs,
     ...(observationEvidence === undefined ? {} : { observationEvidence }),
     ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
   });
@@ -87,7 +85,7 @@ function makeClaudeProviderMonitorAdapter(
     >,
     startedIdentity: string,
     nowMs: number,
-  ): ProviderWeeklySubscriptionUsageFacts => {
+  ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => {
     if (
       error._tag === "TemporaryClaudeSubscriptionUsageFailure" &&
       error.preserveUsage === false
@@ -253,7 +251,12 @@ function makeClaudeProviderMonitorAdapter(
 export function makeClaudeProviderMonitor(
   dependencies: ClaudeProviderMonitorDependencies,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
-  return makeProviderMonitor(makeClaudeProviderMonitorAdapter(dependencies), {
+  return makeProviderMonitor<
+    string,
+    AcquiredClaudeSubscriptionUsage,
+    ClaudeSubscriptionUsageAcquisitionError,
+    WeeklySubscriptionUsageStatus
+  >(makeClaudeProviderMonitorAdapter(dependencies), {
     ...dependencies,
     pollIntervalMs: POLL_INTERVAL_MS,
   });
@@ -262,7 +265,4 @@ export function makeClaudeProviderMonitor(
 export const claudeProviderMonitorLayer = (
   dependencies: ClaudeProviderMonitorDependencies,
 ) =>
-  Layer.scoped(
-    ClaudeProviderMonitorService,
-    makeClaudeProviderMonitor(dependencies),
-  );
+  Layer.scoped(ProviderMonitorService, makeClaudeProviderMonitor(dependencies));

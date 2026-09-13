@@ -4,7 +4,7 @@ import { Effect } from "effect";
 import { createAcquireClaudeSubscriptionUsage } from "./src/claude-subscription-usage-acquisition.ts";
 import { createAcquireDedicatedWeeklyQuotaUsage } from "./src/dedicated-weekly-quota-acquisition.ts";
 import { createFileProviderAcquisitionCoordinator } from "./src/provider-acquisition-coordinator.ts";
-import { registerWeeklySubscriptionUsage } from "./src/register.ts";
+import { registerMonitoredProviderCapacity } from "./src/register.ts";
 
 const COORDINATION_WARNING_SHOWN = Symbol.for(
   "@yasuhito/pi-usage/coordination-warning-shown",
@@ -21,7 +21,7 @@ function showCoordinationWarningOnce(notify: () => void): void {
 
 export default function piUsage(pi: ExtensionAPI): void {
   const acquisitionCoordinator = createFileProviderAcquisitionCoordinator();
-  registerWeeklySubscriptionUsage(pi, {
+  registerMonitoredProviderCapacity(pi, {
     acquireDedicatedWeeklyQuotaUsage: createAcquireDedicatedWeeklyQuotaUsage({
       fetch,
     }),

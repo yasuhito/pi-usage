@@ -3,21 +3,31 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
+import { claudeProviderMonitorLayer } from "./claude-provider-monitor.ts";
 import {
   type AcquireClaudeSubscriptionUsage,
   claudeCredentialFingerprint,
 } from "./claude-subscription-usage-acquisition.ts";
-import type { CodexCredentialResolution } from "./codex-provider-monitor.ts";
+import {
+  type CodexCredentialResolution,
+  codexProviderMonitorLayer,
+} from "./codex-provider-monitor.ts";
 import type {
   AcquireDedicatedWeeklyQuotaUsage,
   CodexCredential,
 } from "./dedicated-weekly-quota-acquisition.ts";
-import { presentProviderSubscriptionUsage } from "./presentation.ts";
-import { makeWeeklySubscriptionUsageSession } from "./weekly-subscription-usage-session.ts";
+import {
+  defineMonitoredProvider,
+  makeMonitoredProviderCapacitySession,
+} from "./monitored-provider-capacity-session.ts";
+import {
+  presentProviderSubscriptionUsage,
+  type WeeklySubscriptionUsageStatus,
+} from "./presentation.ts";
 
 const STATUS_KEY = "pi-usage";
 
-export interface WeeklySubscriptionUsageDependencies {
+export interface MonitoredProviderCapacityDependencies {
   readonly acquireDedicatedWeeklyQuotaUsage: AcquireDedicatedWeeklyQuotaUsage;
   readonly acquireClaudeSubscriptionUsage: (
     ctx: ExtensionContext,
@@ -100,11 +110,11 @@ function credentialResolution(ctx: ExtensionContext) {
   );
 }
 
-export function registerWeeklySubscriptionUsage(
+export function registerMonitoredProviderCapacity(
   pi: ExtensionAPI,
-  dependencies: WeeklySubscriptionUsageDependencies,
+  dependencies: MonitoredProviderCapacityDependencies,
 ): void {
-  const session = Effect.runSync(makeWeeklySubscriptionUsageSession());
+  const session = Effect.runSync(makeMonitoredProviderCapacitySession());
   const now = dependencies.now ?? Clock.currentTimeMillis;
   const run = (effect: Effect.Effect<void>) => Effect.runPromise(effect);
 
@@ -117,54 +127,65 @@ export function registerWeeklySubscriptionUsage(
     await run(
       session.start({
         now,
-        present: (statuses, currentTime) =>
+        present: (presentations) =>
           Effect.sync(() => {
-            const rendered = (["Codex", "Claude"] as const)
-              .map((name) => {
-                const presentation = presentProviderSubscriptionUsage(
-                  name,
-                  statuses[name],
-                  currentTime,
-                );
-                return `${ctx.ui.theme.fg("accent", presentation.providerName)} ${ctx.ui.theme.fg(presentation.color, presentation.detail)}`;
-              })
+            const rendered = presentations
+              .map(
+                ({ presentation }) =>
+                  `${ctx.ui.theme.fg("accent", presentation.providerName)} ${ctx.ui.theme.fg(presentation.color, presentation.detail)}`,
+              )
               .join(" ");
             if (rendered === lastRendered) return;
             lastRendered = rendered;
             ctx.ui.setStatus(STATUS_KEY, rendered);
           }),
-        codex: {
-          resolveCredential: credentialResolution(ctx),
-          acquireDedicatedWeeklyQuotaUsage:
-            dependencies.acquireDedicatedWeeklyQuotaUsage,
-          ...(dependencies.random === undefined
-            ? {}
-            : { random: dependencies.random }),
-        },
-        makeClaudeDependencies: () => ({
-          resolveCredentialIdentity: claudeCredentialIdentityResolution(ctx),
-          acquireClaudeSubscriptionUsage:
-            dependencies.acquireClaudeSubscriptionUsage(ctx),
-          ...(dependencies.random === undefined
-            ? {}
-            : { random: dependencies.random }),
-        }),
+        providers: [
+          defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
+            piProviderId: "openai-codex",
+            makeLayer: (publish) =>
+              codexProviderMonitorLayer({
+                resolveCredential: credentialResolution(ctx),
+                acquireDedicatedWeeklyQuotaUsage:
+                  dependencies.acquireDedicatedWeeklyQuotaUsage,
+                publish,
+                ...(dependencies.random === undefined
+                  ? {}
+                  : { random: dependencies.random }),
+              }),
+            present: (status, currentTime) =>
+              presentProviderSubscriptionUsage("Codex", status, currentTime),
+          }),
+          defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
+            piProviderId: "anthropic",
+            makeLayer: (publish) =>
+              claudeProviderMonitorLayer({
+                resolveCredentialIdentity:
+                  claudeCredentialIdentityResolution(ctx),
+                acquireClaudeSubscriptionUsage:
+                  dependencies.acquireClaudeSubscriptionUsage(ctx),
+                publish,
+                ...(dependencies.random === undefined
+                  ? {}
+                  : { random: dependencies.random }),
+              }),
+            present: (status, currentTime) =>
+              presentProviderSubscriptionUsage("Claude", status, currentTime),
+          }),
+        ],
       }),
     );
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
-    if (ctx.mode !== "tui" || ctx.model?.provider !== "openai-codex") return;
-    await run(session.observeCodexResponse(event.headers));
+    const piProviderId = ctx.model?.provider;
+    if (ctx.mode !== "tui" || piProviderId === undefined) return;
+    await run(session.observeResponse(piProviderId, event.headers));
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
-    if (ctx.model?.provider === "openai-codex") {
-      await run(session.refreshAfterActivity("Codex"));
-    } else if (ctx.model?.provider === "anthropic") {
-      await run(session.refreshAfterActivity("Claude"));
-    }
+    const piProviderId = ctx.model?.provider;
+    if (ctx.mode !== "tui" || piProviderId === undefined) return;
+    await run(session.refreshAfterActivity(piProviderId));
   });
 
   pi.on("model_select", async (_event, ctx) => {

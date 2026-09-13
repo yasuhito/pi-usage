@@ -16,9 +16,9 @@ _Avoid_: Weekly subscription usage, weekly token usage, weekly token limit
 A provider-reported subscription allowance window whose duration is exactly seven days. Provider-specific position or name alone does not identify it.
 _Avoid_: Secondary window
 
-**Stale usage**:
-The last successfully observed weekly subscription usage when a newer observation temporarily cannot be obtained. Its retention period is provider-specific and never extends beyond its reported reset time. Codex retains it for at most ten minutes from observation; Claude retains it until reset.
-_Avoid_: Cached usage, current usage
+**Stale capacity**:
+The last successfully observed provider capacity information when a newer observation temporarily cannot be obtained. Its retention period is provider-specific and never extends beyond a provider-reported reset or expiration. Codex and OpenRouter retain it for at most ten minutes from observation; Claude retains it until reset.
+_Avoid_: Stale usage, cached usage, current usage
 
 **Claude subscription usage**:
 The provider-reported utilization of a Claude Pro or Max account's rolling usage windows, including five-hour and seven-day windows when available. It is distinct from Anthropic API-key rate limits and organization billing usage.
@@ -36,13 +36,17 @@ _Avoid_: Credit expiry, reset credit countdown
 A provider-granted, consumable credit that resets a Codex rate-limit window. It is separate from weekly quota usage and paid extra-usage balances. The footer reports the provider's available count.
 _Avoid_: Weekly credit, usage credit
 
+**OpenRouter key remaining spend**:
+The provider-reported US-dollar amount remaining under the authenticated OpenRouter API key’s configured spending limit. It is scoped to that key, not the OpenRouter account’s purchased-credit balance. When the key has no configured limit, no remaining amount exists and the key is presented as having no limit rather than as unavailable.
+_Avoid_: OpenRouter account balance, OpenRouter credits, weekly subscription usage
+
 **Weekly subscription usage lifecycle**:
 The progression of a provider's weekly subscription usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end. Each monitored provider progresses independently.
 _Avoid_: Weekly quota usage lifecycle, usage cache lifecycle
 
-**Weekly subscription usage session**:
-The session-scoped ownership of all monitored providers’ weekly subscription usage, including startup, replacement, event routing, and shutdown. It coordinates independent provider lifecycles but does not define their fresh, stale, or expired transitions.
-_Avoid_: Weekly subscription usage lifecycle, provider monitor session
+**Monitored provider capacity session**:
+The session-scoped ownership of all monitored providers’ capacity information, including startup, replacement, event routing, presentation, and shutdown. It coordinates independent provider lifecycles without treating unlike capacity measures, such as weekly subscription usage and OpenRouter key remaining spend, as the same quantity.
+_Avoid_: Weekly subscription usage session, provider monitor session
 
 **Passive weekly quota observation**:
 A weekly quota usage observation obtained from information accompanying normal provider activity rather than from a dedicated quota request.

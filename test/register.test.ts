@@ -17,7 +17,7 @@ import type {
   CodexCredential,
   DedicatedWeeklyQuotaAcquisitionError,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
-import { registerWeeklySubscriptionUsage } from "../src/register.ts";
+import { registerMonitoredProviderCapacity } from "../src/register.ts";
 
 function accessTokenFor(accountId: string): string {
   const payload = Buffer.from(
@@ -77,7 +77,7 @@ function registerFixture() {
     credentialFingerprint: anthropicCredentialFingerprint(),
   });
 
-  registerWeeklySubscriptionUsage(pi, {
+  registerMonitoredProviderCapacity(pi, {
     now: Effect.suspend(() => now),
     random: Effect.succeed(0.5),
     acquireDedicatedWeeklyQuotaUsage: (credential) => {

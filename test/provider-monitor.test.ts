@@ -1,20 +1,20 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import { Cause, Deferred, Effect, Exit, Fiber, Scope, TestClock } from "effect";
-import type { WeeklySubscriptionUsageStatus } from "../src/presentation.ts";
+import type { ProviderCapacityStatus } from "../src/presentation.ts";
 import {
   makeProviderMonitor,
   type ProviderAcquisitionHealth,
+  type ProviderCapacityFacts,
   type ProviderMonitorAdapter,
-  type ProviderWeeklySubscriptionUsageFacts,
   providerCredentialIdentity,
   type ResolvedProviderCredential,
 } from "../src/provider-monitor.ts";
 
 interface AcquisitionOutcome {
-  readonly status?: WeeklySubscriptionUsageStatus;
-  readonly staleUsageExpiresAtMs?: number;
-  readonly evidence?: ProviderWeeklySubscriptionUsageFacts["observationEvidence"];
+  readonly status?: ProviderCapacityStatus;
+  readonly staleCapacityExpiresAtMs?: number;
+  readonly evidence?: ProviderCapacityFacts["observationEvidence"];
   readonly health: ProviderAcquisitionHealth;
 }
 
@@ -23,10 +23,10 @@ interface AcquisitionFailure {
 }
 
 const lifecycleFacts = (
-  overrides: Partial<ProviderWeeklySubscriptionUsageFacts> = {},
-): ProviderWeeklySubscriptionUsageFacts => ({
+  overrides: Partial<ProviderCapacityFacts> = {},
+): ProviderCapacityFacts => ({
   presentation: { kind: "preserve" },
-  staleUsageExpiresAtMs: undefined,
+  staleCapacityExpiresAtMs: undefined,
   ...overrides,
 });
 
@@ -55,7 +55,7 @@ function fixture(random = 0.5) {
       Effect.sync(() => completed(reads));
     let staleExpirationFacts = lifecycleFacts();
     let currentStaleDeadline: number | undefined;
-    const statuses: WeeklySubscriptionUsageStatus[] = [];
+    const statuses: ProviderCapacityStatus[] = [];
     const adapter: ProviderMonitorAdapter<
       string,
       AcquisitionOutcome,
@@ -73,34 +73,35 @@ function fixture(random = 0.5) {
           switch (event.kind) {
             case "credential-observed":
               return lifecycleFacts({
-                staleUsageExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiresAtMs: currentStaleDeadline,
               });
             case "acquisition-completed": {
               if (event.exit.kind === "failed") {
                 return lifecycleFacts({
-                  staleUsageExpiresAtMs: currentStaleDeadline,
+                  staleCapacityExpiresAtMs: currentStaleDeadline,
                   acquisitionHealth: event.exit.error.health,
                 });
               }
               const outcome = event.exit.value;
-              currentStaleDeadline = outcome.staleUsageExpiresAtMs;
+              currentStaleDeadline = outcome.staleCapacityExpiresAtMs;
               return lifecycleFacts({
                 presentation:
                   outcome.status === undefined
                     ? { kind: "preserve" }
                     : { kind: "replace", status: outcome.status },
-                staleUsageExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiresAtMs: currentStaleDeadline,
                 observationEvidence: outcome.evidence ?? "adequate",
                 acquisitionHealth: outcome.health,
               });
             }
             case "activity-observed":
               return lifecycleFacts({
-                staleUsageExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiresAtMs: currentStaleDeadline,
                 observationEvidence: "inadequate",
               });
             case "stale-expiration-reached":
-              currentStaleDeadline = staleExpirationFacts.staleUsageExpiresAtMs;
+              currentStaleDeadline =
+                staleExpirationFacts.staleCapacityExpiresAtMs;
               return staleExpirationFacts;
             case "session-ended":
               currentStaleDeadline = undefined;
@@ -108,7 +109,7 @@ function fixture(random = 0.5) {
             case "passive-observation":
             case "acquisition-deferred":
               return lifecycleFacts({
-                staleUsageExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiresAtMs: currentStaleDeadline,
               });
           }
         }),
@@ -130,9 +131,7 @@ function fixture(random = 0.5) {
       ) => {
         acquisition = value;
       },
-      setStaleExpirationFacts: (
-        value: ProviderWeeklySubscriptionUsageFacts,
-      ) => {
+      setStaleExpirationFacts: (value: ProviderCapacityFacts) => {
         staleExpirationFacts = value;
       },
       setCredential: (kind: "unchanged" | "changed" | "unavailable") => {
@@ -167,6 +166,30 @@ it.scoped("starts immediately and polls every minute", () =>
     assert.equal(harness.reads(), 1);
     yield* TestClock.adjust("1 millis");
     assert.equal(harness.reads(), 2);
+  }),
+);
+
+it.scoped("publishes non-weekly provider capacity", () =>
+  Effect.gen(function* () {
+    const harness = yield* fixture();
+    harness.setAcquisition(
+      Effect.succeed({
+        status: {
+          kind: "openrouter-key-remaining-spend",
+          remainingUsd: 12.34,
+          stale: false,
+        },
+        health: { kind: "healthy" },
+      }),
+    );
+
+    yield* harness.monitor.start;
+
+    assert.deepEqual(harness.statuses.at(-1), {
+      kind: "openrouter-key-remaining-spend",
+      remainingUsd: 12.34,
+      stale: false,
+    });
   }),
 );
 
@@ -382,7 +405,7 @@ it.scoped("runs provider stale expiration at its deadline", () =>
     harness.setAcquisition(
       Effect.succeed({
         status: { kind: "available", usedPercent: 50, stale: true },
-        staleUsageExpiresAtMs: 10_000,
+        staleCapacityExpiresAtMs: 10_000,
         health: { kind: "healthy" },
       }),
     );

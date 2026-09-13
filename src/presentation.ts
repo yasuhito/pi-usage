@@ -1,6 +1,9 @@
-export type WeeklySubscriptionUsageStatus =
+export type CapacityAcquisitionStatus =
   | { readonly kind: "loading" }
-  | { readonly kind: "unavailable" }
+  | { readonly kind: "unavailable" };
+
+export type WeeklySubscriptionUsageStatus =
+  | CapacityAcquisitionStatus
   | {
       readonly kind: "available";
       readonly usedPercent: number;
@@ -9,10 +12,23 @@ export type WeeklySubscriptionUsageStatus =
       readonly availableLimitResetCredits?: number;
     };
 
-export type MonitoredProviderName = "Codex" | "Claude";
+export type OpenRouterKeyCapacityStatus =
+  | CapacityAcquisitionStatus
+  | {
+      readonly kind: "openrouter-key-remaining-spend";
+      readonly remainingUsd: number;
+      readonly stale: boolean;
+    }
+  | { readonly kind: "openrouter-key-no-limit" };
 
-export interface ProviderSubscriptionUsagePresentation {
-  readonly providerName: MonitoredProviderName;
+export type ProviderCapacityStatus =
+  | WeeklySubscriptionUsageStatus
+  | OpenRouterKeyCapacityStatus;
+export type WeeklySubscriptionProviderName = "Codex" | "Claude";
+export type ProviderName = WeeklySubscriptionProviderName | "OpenRouter";
+
+export interface ProviderCapacityPresentation {
+  readonly providerName: ProviderName;
   readonly detail: string;
   readonly color: "dim" | "warning" | "error";
 }
@@ -36,10 +52,10 @@ function formatWeeklyResetCountdown(remainingMs: number): string {
 }
 
 export function presentProviderSubscriptionUsage(
-  providerName: MonitoredProviderName,
+  providerName: WeeklySubscriptionProviderName,
   status: WeeklySubscriptionUsageStatus,
   nowMs = Date.now(),
-): ProviderSubscriptionUsagePresentation {
+): ProviderCapacityPresentation {
   if (status.kind !== "available") {
     return {
       providerName,

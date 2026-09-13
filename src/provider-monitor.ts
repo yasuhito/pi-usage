@@ -10,7 +10,10 @@ import {
   Stream,
 } from "effect";
 
-import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
+import type {
+  CapacityAcquisitionStatus,
+  ProviderCapacityStatus,
+} from "./presentation.ts";
 
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
@@ -65,7 +68,7 @@ export type ProviderAcquisitionExit<Acquired, Failure> =
   | { readonly kind: "acquired"; readonly value: Acquired }
   | { readonly kind: "failed"; readonly error: Failure };
 
-export type ProviderWeeklySubscriptionUsageEvent<Acquired, Failure> =
+export type ProviderCapacityEvent<Acquired, Failure> =
   | {
       readonly kind: "credential-observed";
       readonly continuity: ProviderCredentialContinuity;
@@ -94,15 +97,21 @@ export type ProviderWeeklySubscriptionUsageEvent<Acquired, Failure> =
     }
   | { readonly kind: "session-ended" };
 
-export type ProviderPresentation =
+type ProviderMonitorStatus<Status extends ProviderCapacityStatus> =
+  | CapacityAcquisitionStatus
+  | Status;
+
+export type ProviderPresentation<
+  Status extends ProviderCapacityStatus = ProviderCapacityStatus,
+> =
   | { readonly kind: "preserve" }
   | {
       readonly kind: "replace";
-      readonly status: WeeklySubscriptionUsageStatus;
+      readonly status: ProviderMonitorStatus<Status>;
     };
 
 /** A provider-domain fact; only inadequate evidence creates acquisition demand. */
-export type WeeklySubscriptionUsageEvidence = "adequate" | "inadequate";
+export type ProviderCapacityEvidence = "adequate" | "inadequate";
 
 /** Provider acquisition meaning, without retry or terminal scheduling work. */
 export type ProviderAcquisitionHealth =
@@ -114,15 +123,22 @@ export type ProviderAcquisitionHealth =
   | { readonly kind: "credential-rejected" }
   | { readonly kind: "terminal" };
 
-export interface ProviderWeeklySubscriptionUsageFacts {
-  readonly presentation: ProviderPresentation;
-  readonly staleUsageExpiresAtMs: number | undefined;
-  readonly observationEvidence?: WeeklySubscriptionUsageEvidence;
+export interface ProviderCapacityFacts<
+  Status extends ProviderCapacityStatus = ProviderCapacityStatus,
+> {
+  readonly presentation: ProviderPresentation<Status>;
+  readonly staleCapacityExpiresAtMs: number | undefined;
+  readonly observationEvidence?: ProviderCapacityEvidence;
   readonly acquisitionHealth?: ProviderAcquisitionHealth;
 }
 
 /** Provider-specific policy at the acquisition seam. */
-export interface ProviderMonitorAdapter<Credential, Acquired, Failure> {
+export interface ProviderMonitorAdapter<
+  Credential,
+  Acquired,
+  Failure,
+  Status extends ProviderCapacityStatus = ProviderCapacityStatus,
+> {
   readonly credentialVerification: "before" | "before-and-after";
   readonly resolveCredential: Effect.Effect<
     ResolvedProviderCredential<Credential>
@@ -131,14 +147,14 @@ export interface ProviderMonitorAdapter<Credential, Acquired, Failure> {
     credential: Credential,
   ) => Effect.Effect<Acquired, Failure>;
   readonly advance: (
-    event: ProviderWeeklySubscriptionUsageEvent<Acquired, Failure>,
-  ) => Effect.Effect<ProviderWeeklySubscriptionUsageFacts>;
+    event: ProviderCapacityEvent<Acquired, Failure>,
+  ) => Effect.Effect<ProviderCapacityFacts<Status>>;
   readonly finalize: Effect.Effect<void>;
 }
 
-interface ProviderMonitorDependencies {
+interface ProviderMonitorDependencies<Status extends ProviderCapacityStatus> {
   readonly publish: (
-    status: WeeklySubscriptionUsageStatus,
+    status: ProviderMonitorStatus<Status>,
   ) => Effect.Effect<void>;
   readonly pollIntervalMs?: number;
   readonly random?: Effect.Effect<number>;
@@ -156,9 +172,14 @@ const continuityOf = <Credential>(
  * Builds one deep provider monitor in the caller's session Scope. Provider
  * adapters report domain facts; scheduling remains behind this seam.
  */
-export function makeProviderMonitor<Credential, Acquired, Failure>(
-  adapter: ProviderMonitorAdapter<Credential, Acquired, Failure>,
-  dependencies: ProviderMonitorDependencies,
+export function makeProviderMonitor<
+  Credential,
+  Acquired,
+  Failure,
+  Status extends ProviderCapacityStatus,
+>(
+  adapter: ProviderMonitorAdapter<Credential, Acquired, Failure, Status>,
+  dependencies: ProviderMonitorDependencies<Status>,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
   return Effect.gen(function* () {
     const scope = yield* Effect.scope;
@@ -208,13 +229,13 @@ export function makeProviderMonitor<Credential, Acquired, Failure>(
     };
 
     const applyFacts = (
-      facts: ProviderWeeklySubscriptionUsageFacts,
+      facts: ProviderCapacityFacts<Status>,
       generationSnapshot: number,
       followUpEvidence = false,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (!isCurrent(generationSnapshot)) return;
-        const requestedDeadline = facts.staleUsageExpiresAtMs;
+        const requestedDeadline = facts.staleCapacityExpiresAtMs;
         if (
           requestedDeadline !== undefined &&
           !Number.isFinite(requestedDeadline)
@@ -396,7 +417,7 @@ export function makeProviderMonitor<Credential, Acquired, Failure>(
                   kind: "replace",
                   status: { kind: "unavailable" },
                 },
-                staleUsageExpiresAtMs: undefined,
+                staleCapacityExpiresAtMs: undefined,
               },
               generationSnapshot,
             );
