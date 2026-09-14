@@ -261,6 +261,36 @@ it.scoped(
     }),
 );
 
+it.scoped(
+  "ignores acquisition health from an account superseded during acquisition",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const acquisitionGate = yield* Deferred.make<void>();
+      f.setAcquisition(
+        Deferred.await(acquisitionGate).pipe(
+          Effect.andThen(Effect.fail(new PermanentAcquisitionFailure())),
+        ),
+      );
+      const started = yield* Effect.fork(f.monitor.start);
+      while (f.reads() < 1) yield* Effect.yieldNow();
+
+      f.setResolution({
+        kind: "available",
+        credential: credential("account-2"),
+      });
+      yield* f.monitor.observeResponse({
+        "x-codex-primary-used-percent": "50",
+      });
+      f.setAcquisition(Effect.succeed(goodUsage));
+      yield* Deferred.succeed(acquisitionGate, undefined);
+      yield* Fiber.join(started);
+
+      assert.deepEqual(f.credentials.at(-1), credential("account-2"));
+      assert.equal(f.statuses.at(-1)?.kind, "available");
+    }),
+);
+
 it.scoped("isolates passive evidence from a silently changed account", () =>
   Effect.gen(function* () {
     const f = yield* fixture();

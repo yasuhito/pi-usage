@@ -96,6 +96,7 @@ function makeCodexProviderMonitorAdapter(
 > {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   let staleExpiration: StaleCapacityDeadline | undefined;
+  let credentialEpoch: number | undefined;
 
   const factsFromReconciliation = (
     reaction: WeeklyQuotaObservationReaction,
@@ -148,6 +149,7 @@ function makeCodexProviderMonitorAdapter(
       Effect.sync(() => {
         switch (event.kind) {
           case "credential-observed": {
+            credentialEpoch = event.credentialEpoch;
             if (event.continuity === "unchanged") return preservedFacts();
             const reaction = reconciliation.advance(
               {
@@ -165,7 +167,10 @@ function makeCodexProviderMonitorAdapter(
               event.exit.kind === "acquired"
                 ? { kind: "acquired" as const, usage: event.exit.value }
                 : acquisitionResultFromError(event.exit.error);
+            const currentCredential =
+              event.provenance.credentialEpoch === credentialEpoch;
             if (
+              currentCredential &&
               result.kind === "authentication-rejected" &&
               !event.authenticationRefreshUsed
             ) {
@@ -186,7 +191,7 @@ function makeCodexProviderMonitorAdapter(
                 : result.kind === "acquired"
                   ? "adequate"
                   : undefined,
-              healthFromResult(result),
+              currentCredential ? healthFromResult(result) : undefined,
             );
           }
           case "passive-observation": {
