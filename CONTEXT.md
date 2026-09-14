@@ -67,3 +67,7 @@ _Avoid_: Provider acquisition, coordinated acquisition
 **Weekly quota observation reconciliation**:
 The process of combining dedicated and passive observations into coherent weekly quota usage while preserving or discarding incomplete observation evidence as account and acquisition outcomes require.
 _Avoid_: Usage merging, observation cache
+
+**Weekly quota observation provenance**:
+The session-local causal order and account-continuity interval associated with dedicated or passive weekly quota evidence. Reconciliation accepts evidence only within its continuity interval and does not let older evidence replace newer evidence; the provenance contains no credential, account identifier, or provider data.
+_Avoid_: Observation timestamp, account identifier, completion order

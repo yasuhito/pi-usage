@@ -154,6 +154,7 @@ function makeCodexProviderMonitorAdapter(
                 kind: event.credentialAvailable
                   ? "account-selection-invalidated"
                   : "account-selection-unavailable",
+                credentialEpoch: event.credentialEpoch,
               },
               event.nowMs,
             );
@@ -171,7 +172,11 @@ function makeCodexProviderMonitorAdapter(
               return preservedFacts({ kind: "credential-rejected" });
             }
             const reaction = reconciliation.advance(
-              { kind: "dedicated-weekly-quota-acquisition", result },
+              {
+                kind: "dedicated-weekly-quota-acquisition",
+                result,
+                provenance: event.provenance,
+              },
               event.nowMs,
             );
             return factsFromReconciliation(
@@ -185,6 +190,7 @@ function makeCodexProviderMonitorAdapter(
               {
                 kind: "passive-weekly-quota-observation",
                 fields: event.fields,
+                provenance: event.provenance,
               },
               event.nowMs,
             );

@@ -5,6 +5,16 @@ import type { AcquiredWeeklyQuotaUsage } from "../src/dedicated-weekly-quota-acq
 import { createWeeklyQuotaObservationReconciliation } from "../src/weekly-quota-observation-reconciliation.ts";
 
 const NOW = 1_000_000;
+const nextSequenceByReconciliation = new WeakMap<object, number>();
+
+function provenanceFor(
+  reconciliation: ReturnType<typeof createWeeklyQuotaObservationReconciliation>,
+  credentialEpoch = 1,
+) {
+  const sequence = (nextSequenceByReconciliation.get(reconciliation) ?? 0) + 1;
+  nextSequenceByReconciliation.set(reconciliation, sequence);
+  return { credentialEpoch, sequence };
+}
 
 function observeDedicated(
   reconciliation: ReturnType<typeof createWeeklyQuotaObservationReconciliation>,
@@ -19,6 +29,7 @@ function observeDedicated(
     {
       kind: "dedicated-weekly-quota-acquisition",
       result: { kind: "acquired", usage },
+      provenance: provenanceFor(reconciliation),
     },
     nowMs,
   );
@@ -28,9 +39,14 @@ function observePassive(
   reconciliation: ReturnType<typeof createWeeklyQuotaObservationReconciliation>,
   fields: Readonly<Record<string, unknown>>,
   nowMs = NOW,
+  credentialEpoch = 1,
 ) {
   return reconciliation.advance(
-    { kind: "passive-weekly-quota-observation", fields },
+    {
+      kind: "passive-weekly-quota-observation",
+      fields,
+      provenance: provenanceFor(reconciliation, credentialEpoch),
+    },
     nowMs,
   );
 }
@@ -103,6 +119,7 @@ test("malformed dedicated evidence clears all observation evidence", () => {
     {
       kind: "dedicated-weekly-quota-acquisition",
       result: { kind: "malformed-observation" },
+      provenance: provenanceFor(reconciliation),
     },
     NOW,
   );
@@ -273,6 +290,47 @@ test("a dedicated observation replaces sparse passive evidence", () => {
   assert.equal(reaction.publication, "preserve");
 });
 
+test("obsolete dedicated evidence leaves newer sparse passive evidence intact", () => {
+  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  reconciliation.advance(
+    {
+      kind: "passive-weekly-quota-observation",
+      fields: { "x-codex-primary-window-minutes": "10080" },
+      provenance: { credentialEpoch: 1, sequence: 2 },
+    },
+    NOW + 1,
+  );
+  reconciliation.advance(
+    {
+      kind: "dedicated-weekly-quota-acquisition",
+      result: {
+        kind: "acquired",
+        usage: {
+          usedPercent: 63,
+          resetsAtMs: 4_000_000,
+          windowPosition: "secondary",
+        },
+      },
+      provenance: { credentialEpoch: 1, sequence: 1 },
+    },
+    NOW + 2,
+  );
+
+  const completed = reconciliation.advance(
+    {
+      kind: "passive-weekly-quota-observation",
+      fields: {
+        "x-codex-primary-used-percent": "74",
+        "x-codex-primary-reset-at": "4000",
+      },
+      provenance: { credentialEpoch: 1, sequence: 3 },
+    },
+    NOW + 3,
+  );
+
+  assert.deepEqual(completed.observation, usageState(74, "fresh", "primary"));
+});
+
 test("temporary acquisition failure publishes stale capacity and its deadline", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   observeDedicated(reconciliation);
@@ -281,6 +339,7 @@ test("temporary acquisition failure publishes stale capacity and its deadline", 
     {
       kind: "dedicated-weekly-quota-acquisition",
       result: { kind: "temporary-failure", retryAtMs: undefined },
+      provenance: provenanceFor(reconciliation),
     },
     NOW + 1,
   );
@@ -312,6 +371,7 @@ test("stale capacity expires while sparse passive evidence survives", () => {
     {
       kind: "dedicated-weekly-quota-acquisition",
       result: { kind: "temporary-failure", retryAtMs: undefined },
+      provenance: provenanceFor(reconciliation),
     },
     NOW + 1,
   );
@@ -352,7 +412,11 @@ for (const result of [
     });
 
     reconciliation.advance(
-      { kind: "dedicated-weekly-quota-acquisition", result },
+      {
+        kind: "dedicated-weekly-quota-acquisition",
+        result,
+        provenance: provenanceFor(reconciliation),
+      },
       NOW + 1,
     );
     const completed = observePassive(reconciliation, {
@@ -372,17 +436,50 @@ test("account selection invalidation publishes usage removal and discards sparse
   });
 
   const changed = reconciliation.advance(
-    { kind: "account-selection-invalidated" },
+    { kind: "account-selection-invalidated", credentialEpoch: 2 },
     NOW + 1,
   );
-  const remainder = observePassive(reconciliation, {
-    "x-codex-primary-used-percent": "74",
-    "x-codex-primary-reset-at": "4000",
-  });
+  const remainder = observePassive(
+    reconciliation,
+    {
+      "x-codex-primary-used-percent": "74",
+      "x-codex-primary-reset-at": "4000",
+    },
+    NOW,
+    2,
+  );
 
   assert.deepEqual(changed.observation, { kind: "none" });
   assert.equal(changed.publication, "replace");
   assert.deepEqual(remainder.observation, { kind: "none" });
+});
+
+test("ignores delayed evidence from a previous credential epoch", () => {
+  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  observeDedicated(reconciliation);
+  reconciliation.advance(
+    { kind: "account-selection-invalidated", credentialEpoch: 2 },
+    NOW + 1,
+  );
+
+  const delayed = reconciliation.advance(
+    {
+      kind: "dedicated-weekly-quota-acquisition",
+      result: {
+        kind: "acquired",
+        usage: {
+          usedPercent: 99,
+          resetsAtMs: 4_000_000,
+          windowPosition: "secondary",
+        },
+      },
+      provenance: { credentialEpoch: 1, sequence: 2 },
+    },
+    NOW + 2,
+  );
+
+  assert.deepEqual(delayed.observation, { kind: "none" });
+  assert.equal(delayed.publication, "preserve");
 });
 
 test("non-finite time throws before changing observation evidence", () => {
@@ -391,7 +488,10 @@ test("non-finite time throws before changing observation evidence", () => {
 
   assert.throws(
     () =>
-      reconciliation.advance({ kind: "account-selection-invalidated" }, NaN),
+      reconciliation.advance(
+        { kind: "account-selection-invalidated", credentialEpoch: 2 },
+        NaN,
+      ),
     RangeError,
   );
   assert.deepEqual(
