@@ -10,10 +10,14 @@ import {
   providerCredentialIdentity,
   type ResolvedProviderCredential,
 } from "../src/provider-monitor.ts";
+import {
+  createStaleCapacityLifecycle,
+  type StaleCapacityDeadline,
+} from "../src/stale-capacity-lifecycle.ts";
 
 interface AcquisitionOutcome {
   readonly status?: ProviderCapacityStatus;
-  readonly staleCapacityExpiresAtMs?: number;
+  readonly staleCapacityExpiration?: StaleCapacityDeadline;
   readonly evidence?: ProviderCapacityFacts["observationEvidence"];
   readonly health: ProviderAcquisitionHealth;
 }
@@ -26,9 +30,22 @@ const lifecycleFacts = (
   overrides: Partial<ProviderCapacityFacts> = {},
 ): ProviderCapacityFacts => ({
   presentation: { kind: "preserve" },
-  staleCapacityExpiresAtMs: undefined,
+  staleCapacityExpiration: undefined,
   ...overrides,
 });
+
+const staleExpirationAt = (expiresAtMs: number): StaleCapacityDeadline => {
+  const lifecycle = createStaleCapacityLifecycle<null>({
+    staleExpiresAtMs: () => expiresAtMs,
+  });
+  lifecycle.advance({ kind: "observed", capacity: null, observedAtMs: 0 });
+  const deadline = lifecycle.advance({
+    kind: "temporarily-unavailable",
+    nowMs: expiresAtMs - 1,
+  }).staleExpiration;
+  if (deadline === undefined) throw new TypeError("expected stale expiration");
+  return deadline;
+};
 
 const completed = (usedPercent: number): AcquisitionOutcome => ({
   status: { kind: "available", usedPercent, stale: false },
@@ -54,7 +71,7 @@ function fixture(random = 0.5) {
     let acquisition: Effect.Effect<AcquisitionOutcome, AcquisitionFailure> =
       Effect.sync(() => completed(reads));
     let staleExpirationFacts = lifecycleFacts();
-    let currentStaleDeadline: number | undefined;
+    let currentStaleExpiration: StaleCapacityDeadline | undefined;
     const statuses: ProviderCapacityStatus[] = [];
     const adapter: ProviderMonitorAdapter<
       string,
@@ -73,43 +90,43 @@ function fixture(random = 0.5) {
           switch (event.kind) {
             case "credential-observed":
               return lifecycleFacts({
-                staleCapacityExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiration: currentStaleExpiration,
               });
             case "acquisition-completed": {
               if (event.exit.kind === "failed") {
                 return lifecycleFacts({
-                  staleCapacityExpiresAtMs: currentStaleDeadline,
+                  staleCapacityExpiration: currentStaleExpiration,
                   acquisitionHealth: event.exit.error.health,
                 });
               }
               const outcome = event.exit.value;
-              currentStaleDeadline = outcome.staleCapacityExpiresAtMs;
+              currentStaleExpiration = outcome.staleCapacityExpiration;
               return lifecycleFacts({
                 presentation:
                   outcome.status === undefined
                     ? { kind: "preserve" }
                     : { kind: "replace", status: outcome.status },
-                staleCapacityExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiration: currentStaleExpiration,
                 observationEvidence: outcome.evidence ?? "adequate",
                 acquisitionHealth: outcome.health,
               });
             }
             case "activity-observed":
               return lifecycleFacts({
-                staleCapacityExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiration: currentStaleExpiration,
                 observationEvidence: "inadequate",
               });
             case "stale-expiration-reached":
-              currentStaleDeadline =
-                staleExpirationFacts.staleCapacityExpiresAtMs;
+              currentStaleExpiration =
+                staleExpirationFacts.staleCapacityExpiration;
               return staleExpirationFacts;
             case "session-ended":
-              currentStaleDeadline = undefined;
+              currentStaleExpiration = undefined;
               return lifecycleFacts();
             case "passive-observation":
             case "acquisition-deferred":
               return lifecycleFacts({
-                staleCapacityExpiresAtMs: currentStaleDeadline,
+                staleCapacityExpiration: currentStaleExpiration,
               });
           }
         }),
@@ -405,7 +422,7 @@ it.scoped("runs provider stale expiration at its deadline", () =>
     harness.setAcquisition(
       Effect.succeed({
         status: { kind: "available", usedPercent: 50, stale: true },
-        staleCapacityExpiresAtMs: 10_000,
+        staleCapacityExpiration: staleExpirationAt(10_000),
         health: { kind: "healthy" },
       }),
     );

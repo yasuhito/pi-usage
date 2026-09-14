@@ -524,7 +524,7 @@ it.scoped("rechecks identity before handling an acquisition defect", () =>
   }),
 );
 
-it.scoped("does not restore stale usage after its identity changes", () =>
+it.scoped("does not restore stale capacity after its identity changes", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
     yield* f.monitor.start;

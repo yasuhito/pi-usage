@@ -20,6 +20,10 @@ _Avoid_: Secondary window
 The last successfully observed provider capacity information when a newer observation temporarily cannot be obtained. Its retention period is provider-specific: Codex and OpenRouter retain it for at most ten minutes from observation, while Claude retains it until reset; a provider-reported reset or expiration shortens retention when one exists.
 _Avoid_: Stale usage, cached usage, current usage
 
+**Stale capacity lifecycle**:
+The progression of observed provider capacity from fresh information through temporary staleness to provider-specific expiration, invalidation, or session end. It applies across unlike capacity measures without treating them as the same quantity.
+_Avoid_: Usage cache lifecycle, weekly usage lifecycle
+
 **Claude subscription usage**:
 The provider-reported utilization of a Claude Pro or Max account's rolling usage windows, including five-hour and seven-day windows when available. It is distinct from Anthropic API-key rate limits and organization billing usage.
 _Avoid_: Anthropic API usage, Claude API rate limit
@@ -43,10 +47,6 @@ _Avoid_: OpenRouter account credit balance, OpenRouter credits, weekly subscript
 **OpenRouter account credit balance**:
 The OpenRouter account’s total purchased credits minus its total usage, obtained with a Management Key. It is account-scoped and distinct from an individual API key’s configured spending limit.
 _Avoid_: OpenRouter key remaining spend, OpenRouter key limit, weekly subscription usage
-
-**Weekly subscription usage lifecycle**:
-The progression of a provider's weekly subscription usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end. Each monitored provider progresses independently.
-_Avoid_: Weekly quota usage lifecycle, usage cache lifecycle
 
 **Monitored provider capacity session**:
 The session-scoped ownership of all monitored providers’ capacity information, including startup, replacement, event routing, presentation, and shutdown. It coordinates independent provider lifecycles without treating unlike capacity measures, such as weekly subscription usage and OpenRouter account credit balance, as the same quantity.

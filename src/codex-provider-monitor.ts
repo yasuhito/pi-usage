@@ -17,6 +17,7 @@ import {
   ProviderMonitorService,
   providerCredentialIdentity,
 } from "./provider-monitor.ts";
+import type { StaleCapacityDeadline } from "./stale-capacity-lifecycle.ts";
 import {
   createWeeklyQuotaObservationReconciliation,
   type WeeklyQuotaObservationReaction,
@@ -56,7 +57,7 @@ function publicationFromReaction(
 ): WeeklySubscriptionUsageStatus | undefined {
   if (reaction.publication !== "replace") return undefined;
   if (reaction.observation.kind === "none") return { kind: "unavailable" };
-  const usage = reaction.observation.usage;
+  const usage = reaction.observation.capacity;
   return {
     kind: "available",
     usedPercent: usage.usedPercent,
@@ -94,25 +95,21 @@ function makeCodexProviderMonitorAdapter(
   WeeklySubscriptionUsageStatus
 > {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
-  let expectedStaleExpirationAtMs: number | undefined;
+  let staleExpiration: StaleCapacityDeadline | undefined;
 
   const factsFromReconciliation = (
     reaction: WeeklyQuotaObservationReaction,
     observationEvidence?: ProviderCapacityFacts<WeeklySubscriptionUsageStatus>["observationEvidence"],
     acquisitionHealth?: ProviderAcquisitionHealth,
-    forceUnavailable = false,
   ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => {
-    expectedStaleExpirationAtMs = reaction.staleExpirationAtMs;
+    staleExpiration = reaction.staleExpiration;
     const publication = publicationFromReaction(reaction);
     return {
       presentation:
-        publication === undefined && !forceUnavailable
+        publication === undefined
           ? { kind: "preserve" }
-          : {
-              kind: "replace",
-              status: publication ?? { kind: "unavailable" },
-            },
-      staleCapacityExpiresAtMs: reaction.staleExpirationAtMs,
+          : { kind: "replace", status: publication },
+      staleCapacityExpiration: reaction.staleExpiration,
       ...(observationEvidence === undefined ? {} : { observationEvidence }),
       ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
     };
@@ -122,7 +119,7 @@ function makeCodexProviderMonitorAdapter(
     acquisitionHealth?: ProviderAcquisitionHealth,
   ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => ({
     presentation: { kind: "preserve" },
-    staleCapacityExpiresAtMs: expectedStaleExpirationAtMs,
+    staleCapacityExpiration: staleExpiration,
     ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
   });
 
@@ -153,15 +150,14 @@ function makeCodexProviderMonitorAdapter(
           case "credential-observed": {
             if (event.continuity === "unchanged") return preservedFacts();
             const reaction = reconciliation.advance(
-              { kind: "account-selection-invalidated" },
+              {
+                kind: event.credentialAvailable
+                  ? "account-selection-invalidated"
+                  : "account-selection-unavailable",
+              },
               event.nowMs,
             );
-            return factsFromReconciliation(
-              reaction,
-              undefined,
-              undefined,
-              !event.credentialAvailable && reaction.publication !== "replace",
-            );
+            return factsFromReconciliation(reaction);
           }
           case "acquisition-completed": {
             const result =
@@ -215,20 +211,17 @@ function makeCodexProviderMonitorAdapter(
               ),
             );
           case "stale-expiration-reached":
-            if (expectedStaleExpirationAtMs !== event.deadlineMs) {
-              return preservedFacts();
-            }
             return factsFromReconciliation(
               reconciliation.advance(
                 {
-                  kind: "stale-usage-expiration-reached",
-                  deadlineMs: event.deadlineMs,
+                  kind: "stale-capacity-expiration-reached",
+                  deadline: event.deadline,
                 },
                 event.nowMs,
               ),
             );
           case "session-ended":
-            expectedStaleExpirationAtMs = undefined;
+            staleExpiration = undefined;
             return factsFromReconciliation(
               reconciliation.advance({ kind: "session-ended" }, 0),
             );

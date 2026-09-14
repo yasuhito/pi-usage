@@ -20,6 +20,10 @@ import {
   ProviderMonitorService,
   providerCredentialIdentity,
 } from "./provider-monitor.ts";
+import {
+  createStaleCapacityLifecycle,
+  type StaleCapacityLifecycleReaction,
+} from "./stale-capacity-lifecycle.ts";
 
 const STALE_RETENTION_MS = 10 * 60_000;
 
@@ -32,12 +36,6 @@ export interface OpenRouterProviderMonitorDependencies {
   readonly random?: Effect.Effect<number>;
 }
 
-interface CapturedBalance {
-  readonly balance: AcquiredOpenRouterAccountCreditBalance;
-  readonly observedAtMs: number;
-  readonly stale: boolean;
-}
-
 function makeOpenRouterProviderMonitorAdapter(
   dependencies: OpenRouterProviderMonitorDependencies,
 ): ProviderMonitorAdapter<
@@ -46,54 +44,54 @@ function makeOpenRouterProviderMonitorAdapter(
   OpenRouterAccountCreditBalanceAcquisitionError,
   OpenRouterAccountCreditBalanceStatus
 > {
-  let captured: CapturedBalance | undefined;
+  const balanceLifecycle =
+    createStaleCapacityLifecycle<AcquiredOpenRouterAccountCreditBalance>({
+      staleExpiresAtMs: ({ observedAtMs }) => observedAtMs + STALE_RETENTION_MS,
+    });
 
-  const staleDeadline = () =>
-    captured?.stale === true
-      ? captured.observedAtMs + STALE_RETENTION_MS
-      : undefined;
-
-  const status = (): OpenRouterAccountCreditBalanceStatus =>
-    captured === undefined
-      ? { kind: "unavailable" }
-      : {
-          kind: "openrouter-account-credit-balance",
-          balanceUsd: captured.balance.balanceUsd,
-          stale: captured.stale,
-        };
+  const currentReaction =
+    (): StaleCapacityLifecycleReaction<AcquiredOpenRouterAccountCreditBalance> => ({
+      ...balanceLifecycle.current(),
+      publication: "preserve",
+    });
 
   const facts = (
-    publish: boolean,
+    reaction: StaleCapacityLifecycleReaction<AcquiredOpenRouterAccountCreditBalance>,
     observationEvidence?: ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus>["observationEvidence"],
     acquisitionHealth?: ProviderAcquisitionHealth,
-  ): ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus> => ({
-    presentation: publish
-      ? { kind: "replace", status: status() }
-      : { kind: "preserve" },
-    staleCapacityExpiresAtMs: staleDeadline(),
-    ...(observationEvidence === undefined ? {} : { observationEvidence }),
-    ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
-  });
-
-  const clear = (publish: boolean) => {
-    captured = undefined;
-    return facts(publish);
+  ): ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus> => {
+    const observation = reaction.observation;
+    const status: OpenRouterAccountCreditBalanceStatus =
+      observation.kind === "none"
+        ? { kind: "unavailable" }
+        : {
+            kind: "openrouter-account-credit-balance",
+            balanceUsd: observation.capacity.balanceUsd,
+            stale: observation.freshness === "stale",
+          };
+    return {
+      presentation:
+        reaction.publication === "replace"
+          ? { kind: "replace", status }
+          : { kind: "preserve" },
+      staleCapacityExpiration: reaction.staleExpiration,
+      ...(observationEvidence === undefined ? {} : { observationEvidence }),
+      ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
+    };
   };
+
+  const clear = (kind: "unavailable" | "invalidated") =>
+    facts(balanceLifecycle.advance({ kind }));
 
   const temporarilyUnavailable = (
     nowMs: number,
     providerNotBeforeMs?: number,
-  ): ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus> => {
-    if (captured !== undefined) {
-      captured = { ...captured, stale: true };
-      const deadline = staleDeadline();
-      if (deadline === undefined || nowMs >= deadline) captured = undefined;
-    }
-    return facts(true, undefined, {
-      kind: "trigger-deferred",
-      providerNotBeforeMs,
-    });
-  };
+  ): ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus> =>
+    facts(
+      balanceLifecycle.advance({ kind: "temporarily-unavailable", nowMs }),
+      undefined,
+      { kind: "trigger-deferred", providerNotBeforeMs },
+    );
 
   return {
     credentialVerification: "before",
@@ -119,24 +117,29 @@ function makeOpenRouterProviderMonitorAdapter(
       Effect.sync(() => {
         switch (event.kind) {
           case "credential-observed": {
-            if (event.continuity === "unchanged") return facts(false);
-            const hadBalance = captured !== undefined;
-            return clear(!event.credentialAvailable || hadBalance);
+            if (event.continuity === "unchanged")
+              return facts(currentReaction());
+            return clear(
+              event.credentialAvailable ? "invalidated" : "unavailable",
+            );
           }
           case "acquisition-completed": {
             if (
               event.currentIdentity === undefined ||
               event.currentIdentity !== event.startedIdentity
             ) {
-              return facts(false, undefined, { kind: "healthy" });
+              return facts(currentReaction(), undefined, { kind: "healthy" });
             }
             if (event.exit.kind === "acquired") {
-              captured = {
-                balance: event.exit.value,
-                observedAtMs: event.nowMs,
-                stale: false,
-              };
-              return facts(true, "adequate", { kind: "healthy" });
+              return facts(
+                balanceLifecycle.advance({
+                  kind: "observed",
+                  capacity: event.exit.value,
+                  observedAtMs: event.nowMs,
+                }),
+                "adequate",
+                { kind: "healthy" },
+              );
             }
             const error = event.exit.error;
             switch (error._tag) {
@@ -146,34 +149,32 @@ function makeOpenRouterProviderMonitorAdapter(
                 return temporarilyUnavailable(event.nowMs);
               case "OpenRouterManagementAuthenticationRejected":
                 return {
-                  ...clear(true),
+                  ...clear("unavailable"),
                   acquisitionHealth: { kind: "healthy" },
                 };
               case "PermanentOpenRouterAccountCreditBalanceFailure":
                 return {
-                  ...clear(true),
+                  ...clear("unavailable"),
                   acquisitionHealth: { kind: "terminal" },
                 };
             }
             throw new TypeError("unknown OpenRouter acquisition failure");
           }
           case "activity-observed":
-            return facts(false, "inadequate");
+            return facts(currentReaction(), "inadequate");
           case "passive-observation":
           case "acquisition-deferred":
-            return facts(false);
-          case "stale-expiration-reached": {
-            if (
-              captured?.stale !== true ||
-              staleDeadline() !== event.deadlineMs ||
-              event.nowMs < event.deadlineMs
-            ) {
-              return facts(false);
-            }
-            return clear(true);
-          }
+            return facts(currentReaction());
+          case "stale-expiration-reached":
+            return facts(
+              balanceLifecycle.advance({
+                kind: "stale-expiration-reached",
+                deadline: event.deadline,
+                nowMs: event.nowMs,
+              }),
+            );
           case "session-ended":
-            return clear(false);
+            return facts(balanceLifecycle.advance({ kind: "session-ended" }));
         }
       }),
     finalize: Effect.void,

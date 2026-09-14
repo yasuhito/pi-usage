@@ -3,10 +3,11 @@ import type {
   DedicatedWeeklyQuotaAcquisitionResult,
 } from "./dedicated-weekly-quota-acquisition.ts";
 import {
-  createWeeklySubscriptionUsageLifecycle,
-  type WeeklySubscriptionUsageLifecycleReaction,
-  type WeeklySubscriptionUsageObservation,
-} from "./weekly-subscription-usage-lifecycle.ts";
+  createStaleCapacityLifecycle,
+  type StaleCapacityDeadline,
+  type StaleCapacityLifecycleReaction,
+  type StaleCapacityObservation,
+} from "./stale-capacity-lifecycle.ts";
 
 const PASSIVE_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
 const STALE_AFTER_MS = 10 * 60 * 1_000;
@@ -36,17 +37,18 @@ export type WeeklyQuotaObservationEvent =
   | { readonly kind: "dedicated-weekly-quota-acquisition-deferred" }
   | { readonly kind: "activity" }
   | { readonly kind: "account-selection-invalidated" }
+  | { readonly kind: "account-selection-unavailable" }
   | {
-      readonly kind: "stale-usage-expiration-reached";
-      readonly deadlineMs: number;
+      readonly kind: "stale-capacity-expiration-reached";
+      readonly deadline: StaleCapacityDeadline;
     }
   | { readonly kind: "session-ended" };
 
 export type WeeklyQuotaObservationState =
-  WeeklySubscriptionUsageObservation<WeeklyQuotaUsage>;
+  StaleCapacityObservation<WeeklyQuotaUsage>;
 
 export interface WeeklyQuotaObservationReaction
-  extends WeeklySubscriptionUsageLifecycleReaction<WeeklyQuotaUsage> {
+  extends StaleCapacityLifecycleReaction<WeeklyQuotaUsage> {
   readonly acquireDedicated: boolean;
 }
 
@@ -182,52 +184,54 @@ function usageForPosition(
 export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObservationReconciliation {
   let accumulatedFields: Record<string, string> = {};
   let lastObservedAtMs: number | undefined;
-  const usageLifecycle =
-    createWeeklySubscriptionUsageLifecycle<WeeklyQuotaUsage>({
-      staleRetentionMs: STALE_AFTER_MS,
-    });
-  const discardAll = (): void => {
+  const capacityLifecycle = createStaleCapacityLifecycle<WeeklyQuotaUsage>({
+    staleExpiresAtMs: ({ capacity, observedAtMs }) =>
+      Math.min(capacity.resetsAtMs, observedAtMs + STALE_AFTER_MS),
+  });
+  const discardAll = (kind: "unavailable" | "invalidated") => {
     accumulatedFields = {};
     lastObservedAtMs = undefined;
-    usageLifecycle.advance({ kind: "invalidated" });
+    return capacityLifecycle.advance({ kind });
   };
-  const clearUsage = (): void => {
+  const clearUsage = () => {
     lastObservedAtMs = undefined;
-    usageLifecycle.advance({ kind: "invalidated" });
+    return capacityLifecycle.advance({ kind: "unavailable" });
   };
-  const recordUsage = (usage: WeeklyQuotaUsage, observedAtMs: number): void => {
+  const recordUsage = (usage: WeeklyQuotaUsage, observedAtMs: number) => {
     accumulatedFields = {};
     lastObservedAtMs = observedAtMs;
-    usageLifecycle.advance({
+    return capacityLifecycle.advance({
       kind: "observed",
-      usage,
+      capacity: usage,
       observedAtMs,
     });
   };
   const capturedUsage = (): WeeklyQuotaUsage | undefined => {
-    const observation = usageLifecycle.current().observation;
-    return observation.kind === "usage" ? observation.usage : undefined;
+    const observation = capacityLifecycle.current().observation;
+    return observation.kind === "capacity" ? observation.capacity : undefined;
   };
   const shouldAcquireDedicated = (nowMs: number): boolean =>
     lastObservedAtMs === undefined ||
     nowMs - lastObservedAtMs >= REFRESH_DEBOUNCE_MS;
   const reaction = (
-    publication: WeeklyQuotaObservationReaction["publication"] = "preserve",
+    lifecycleReaction: StaleCapacityLifecycleReaction<WeeklyQuotaUsage> = {
+      ...capacityLifecycle.current(),
+      publication: "preserve",
+    },
     acquireDedicated = false,
   ): WeeklyQuotaObservationReaction => ({
-    ...usageLifecycle.current(),
-    publication,
+    ...lifecycleReaction,
     acquireDedicated,
   });
   const staleOrUnavailable = (
     nowMs: number,
   ): WeeklyQuotaObservationReaction => {
-    const result = usageLifecycle.advance({
+    const result = capacityLifecycle.advance({
       kind: "temporarily-unavailable",
       nowMs,
     });
     if (result.observation.kind === "none") lastObservedAtMs = undefined;
-    return reaction(result.publication);
+    return reaction(result);
   };
 
   return {
@@ -240,8 +244,7 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         case "passive-weekly-quota-observation": {
           const entries = entriesFromProviderFields(event.fields);
           if (entries === undefined) {
-            discardAll();
-            return reaction("replace");
+            return reaction(discardAll("unavailable"));
           }
 
           let contributed = false;
@@ -249,14 +252,13 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
             const normalizedName = name.toLowerCase();
             if (!RATE_LIMIT_FIELD_NAMES.has(normalizedName)) continue;
             if (typeof value !== "string") {
-              discardAll();
-              return reaction("replace");
+              return reaction(discardAll("unavailable"));
             }
             accumulatedFields[normalizedName] = value;
             contributed = true;
           }
           if (!contributed) {
-            return reaction("preserve", shouldAcquireDedicated(nowMs));
+            return reaction(undefined, shouldAcquireDedicated(nowMs));
           }
 
           for (const position of WINDOW_POSITIONS) {
@@ -266,12 +268,10 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
               position,
             );
             if (usage === "malformed") {
-              discardAll();
-              return reaction("replace");
+              return reaction(discardAll("unavailable"));
             }
             if (usage !== undefined) {
-              recordUsage(usage, nowMs);
-              return reaction("replace");
+              return reaction(recordUsage(usage, nowMs));
             }
           }
           return reaction();
@@ -280,44 +280,44 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         case "dedicated-weekly-quota-acquisition": {
           const { result } = event;
           if (result.kind === "acquired") {
-            recordUsage(result.usage, nowMs);
-          } else if (result.kind === "temporary-failure") {
-            return staleOrUnavailable(nowMs);
-          } else if (result.kind === "malformed-observation") {
-            discardAll();
-          } else {
-            clearUsage();
+            return reaction(recordUsage(result.usage, nowMs));
           }
-          return reaction("replace");
+          if (result.kind === "temporary-failure") {
+            return staleOrUnavailable(nowMs);
+          }
+          return reaction(
+            result.kind === "malformed-observation"
+              ? discardAll("unavailable")
+              : clearUsage(),
+          );
         }
 
         case "dedicated-weekly-quota-acquisition-deferred":
           return staleOrUnavailable(nowMs);
 
         case "activity":
-          return reaction("preserve", shouldAcquireDedicated(nowMs));
+          return reaction(undefined, shouldAcquireDedicated(nowMs));
 
-        case "account-selection-invalidated": {
-          const hadUsage = capturedUsage() !== undefined;
-          discardAll();
-          return reaction(hadUsage ? "replace" : "preserve");
-        }
+        case "account-selection-invalidated":
+          return reaction(discardAll("invalidated"));
 
-        case "stale-usage-expiration-reached": {
-          const result = usageLifecycle.advance({
+        case "account-selection-unavailable":
+          return reaction(discardAll("unavailable"));
+
+        case "stale-capacity-expiration-reached": {
+          const result = capacityLifecycle.advance({
             kind: "stale-expiration-reached",
-            deadlineMs: event.deadlineMs,
+            deadline: event.deadline,
             nowMs,
           });
           if (result.observation.kind === "none") lastObservedAtMs = undefined;
-          return reaction(result.publication);
+          return reaction(result);
         }
 
         case "session-ended":
           accumulatedFields = {};
           lastObservedAtMs = undefined;
-          usageLifecycle.advance({ kind: "session-ended" });
-          return reaction("preserve");
+          return reaction(capacityLifecycle.advance({ kind: "session-ended" }));
       }
     },
   };

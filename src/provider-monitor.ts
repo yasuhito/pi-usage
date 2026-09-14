@@ -14,6 +14,7 @@ import type {
   CapacityAcquisitionStatus,
   ProviderCapacityStatus,
 } from "./presentation.ts";
+import type { StaleCapacityDeadline } from "./stale-capacity-lifecycle.ts";
 
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
@@ -92,7 +93,7 @@ export type ProviderCapacityEvent<Acquired, Failure> =
   | { readonly kind: "acquisition-deferred"; readonly nowMs: number }
   | {
       readonly kind: "stale-expiration-reached";
-      readonly deadlineMs: number;
+      readonly deadline: StaleCapacityDeadline;
       readonly nowMs: number;
     }
   | { readonly kind: "session-ended" };
@@ -131,7 +132,7 @@ export interface ProviderCapacityFacts<
   Status extends ProviderCapacityStatus = ProviderCapacityStatus,
 > {
   readonly presentation: ProviderPresentation<Status>;
-  readonly staleCapacityExpiresAtMs: number | undefined;
+  readonly staleCapacityExpiration: StaleCapacityDeadline | undefined;
   readonly observationEvidence?: ProviderCapacityEvidence;
   readonly acquisitionHealth?: ProviderAcquisitionHealth;
 }
@@ -197,7 +198,7 @@ export function makeProviderMonitor<
     let activeRefreshFiber: Fiber.RuntimeFiber<void> | undefined;
     let retryFiber: Fiber.RuntimeFiber<void> | undefined;
     let staleFiber: Fiber.RuntimeFiber<void> | undefined;
-    let staleDeadline: number | undefined;
+    let staleExpiration: StaleCapacityDeadline | undefined;
     let nextAttemptAt = 0;
     let consecutiveFailures = 0;
     let terminal = false;
@@ -246,39 +247,42 @@ export function makeProviderMonitor<
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (!isCurrent(generationSnapshot)) return;
-        const requestedDeadline = facts.staleCapacityExpiresAtMs;
+        const requestedExpiration = facts.staleCapacityExpiration;
         if (
-          requestedDeadline !== undefined &&
-          !Number.isFinite(requestedDeadline)
+          requestedExpiration !== undefined &&
+          !Number.isFinite(requestedExpiration.expiresAtMs)
         ) {
           return yield* Effect.die(
             new TypeError("provider stale expiration must be finite"),
           );
         }
-        if (requestedDeadline !== staleDeadline) {
+        if (requestedExpiration !== staleExpiration) {
           if (staleFiber !== undefined) yield* Fiber.interrupt(staleFiber);
           staleFiber = undefined;
-          staleDeadline = requestedDeadline;
+          staleExpiration = requestedExpiration;
         }
         if (
-          requestedDeadline !== undefined &&
-          staleDeadline === requestedDeadline &&
+          requestedExpiration !== undefined &&
+          staleExpiration === requestedExpiration &&
           staleFiber === undefined &&
           isCurrent(generationSnapshot)
         ) {
-          const deadline = requestedDeadline;
+          const expiration = requestedExpiration;
           const expirationFiber = yield* Effect.forkIn(
             Effect.gen(function* () {
               const now = yield* Clock.currentTimeMillis;
-              yield* Effect.sleep(Math.max(0, deadline - now));
-              if (staleDeadline !== deadline || staleFiber !== expirationFiber)
+              yield* Effect.sleep(Math.max(0, expiration.expiresAtMs - now));
+              if (
+                staleExpiration !== expiration ||
+                staleFiber !== expirationFiber
+              )
                 return;
               staleFiber = undefined;
-              staleDeadline = undefined;
+              staleExpiration = undefined;
               const atExpiration = yield* Clock.currentTimeMillis;
               const expirationFacts = yield* adapter.advance({
                 kind: "stale-expiration-reached",
-                deadlineMs: deadline,
+                deadline: expiration,
                 nowMs: atExpiration,
               });
               yield* applyFacts(expirationFacts, refreshGeneration);
@@ -434,7 +438,7 @@ export function makeProviderMonitor<
                   kind: "replace",
                   status: { kind: "unavailable" },
                 },
-                staleCapacityExpiresAtMs: undefined,
+                staleCapacityExpiration: undefined,
               },
               generationSnapshot,
             );
@@ -549,7 +553,7 @@ export function makeProviderMonitor<
         activeRefreshFiber = undefined;
         retryFiber = undefined;
         staleFiber = undefined;
-        staleDeadline = undefined;
+        staleExpiration = undefined;
         acquisitionDemanded = false;
         observationSuppressionsInFlight = 0;
         accountChangeRefreshesInFlight = 0;

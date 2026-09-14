@@ -17,7 +17,10 @@ import {
   ProviderMonitorService,
   providerCredentialIdentity,
 } from "./provider-monitor.ts";
-import { createWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-usage-lifecycle.ts";
+import {
+  createStaleCapacityLifecycle,
+  type StaleCapacityLifecycleReaction,
+} from "./stale-capacity-lifecycle.ts";
 
 const ACTIVITY_REFRESH_INTERVAL_MS = 3 * 60_000;
 const POLL_INTERVAL_MS = 15 * 60_000;
@@ -51,38 +54,46 @@ function makeClaudeProviderMonitorAdapter(
   WeeklySubscriptionUsageStatus
 > {
   let lastObservedAtMs: number | undefined;
-  const usageLifecycle =
-    createWeeklySubscriptionUsageLifecycle<AcquiredClaudeSubscriptionUsage>({});
+  const capacityLifecycle =
+    createStaleCapacityLifecycle<AcquiredClaudeSubscriptionUsage>({
+      staleExpiresAtMs: ({ capacity }) => capacity.resetsAtMs,
+    });
 
-  const usageStatus = (): WeeklySubscriptionUsageStatus => {
-    const observation = usageLifecycle.current().observation;
-    return observation.kind === "none"
-      ? { kind: "unavailable" }
-      : {
-          kind: "available",
-          usedPercent: observation.usage.usedPercent,
-          stale: observation.freshness === "stale",
-          weeklyWindowResetsAtMs: observation.usage.resetsAtMs,
-        };
-  };
+  const currentReaction =
+    (): StaleCapacityLifecycleReaction<AcquiredClaudeSubscriptionUsage> => ({
+      ...capacityLifecycle.current(),
+      publication: "preserve",
+    });
 
   const weeklySubscriptionUsageFacts = (
-    publish: boolean,
+    reaction: StaleCapacityLifecycleReaction<AcquiredClaudeSubscriptionUsage>,
     observationEvidence?: ProviderCapacityFacts<WeeklySubscriptionUsageStatus>["observationEvidence"],
     acquisitionHealth?: ProviderAcquisitionHealth,
-  ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => ({
-    presentation: publish
-      ? { kind: "replace", status: usageStatus() }
-      : { kind: "preserve" },
-    staleCapacityExpiresAtMs: usageLifecycle.current().staleExpirationAtMs,
-    ...(observationEvidence === undefined ? {} : { observationEvidence }),
-    ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
-  });
+  ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => {
+    const observation = reaction.observation;
+    const status: WeeklySubscriptionUsageStatus =
+      observation.kind === "none"
+        ? { kind: "unavailable" }
+        : {
+            kind: "available",
+            usedPercent: observation.capacity.usedPercent,
+            stale: observation.freshness === "stale",
+            weeklyWindowResetsAtMs: observation.capacity.resetsAtMs,
+          };
+    return {
+      presentation:
+        reaction.publication === "replace"
+          ? { kind: "replace", status }
+          : { kind: "preserve" },
+      staleCapacityExpiration: reaction.staleExpiration,
+      ...(observationEvidence === undefined ? {} : { observationEvidence }),
+      ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
+    };
+  };
 
-  const clearUsage = (publish: boolean) => {
+  const clearUsage = (kind: "unavailable" | "invalidated") => {
     lastObservedAtMs = undefined;
-    usageLifecycle.advance({ kind: "invalidated" });
-    return weeklySubscriptionUsageFacts(publish);
+    return weeklySubscriptionUsageFacts(capacityLifecycle.advance({ kind }));
   };
 
   const temporaryFailure = (
@@ -98,7 +109,7 @@ function makeClaudeProviderMonitorAdapter(
       error.preserveUsage === false
     ) {
       lastObservedAtMs = undefined;
-      usageLifecycle.advance({ kind: "invalidated" });
+      capacityLifecycle.advance({ kind: "invalidated" });
     }
     if (
       error.staleUsage !== undefined &&
@@ -109,18 +120,18 @@ function makeClaudeProviderMonitorAdapter(
       )
     ) {
       lastObservedAtMs = error.staleUsage.observedAtMs;
-      usageLifecycle.advance({
+      capacityLifecycle.advance({
         kind: "observed",
-        usage: error.staleUsage,
+        capacity: error.staleUsage,
         observedAtMs: error.staleUsage.observedAtMs,
       });
     }
-    const reaction = usageLifecycle.advance({
+    const reaction = capacityLifecycle.advance({
       kind: "temporarily-unavailable",
       nowMs,
     });
     if (reaction.observation.kind === "none") lastObservedAtMs = undefined;
-    return weeklySubscriptionUsageFacts(true, undefined, {
+    return weeklySubscriptionUsageFacts(reaction, undefined, {
       kind: "temporarily-unavailable",
       providerNotBeforeMs: error.retryAtMs,
     });
@@ -157,10 +168,10 @@ function makeClaudeProviderMonitorAdapter(
         switch (event.kind) {
           case "credential-observed": {
             if (event.continuity === "unchanged")
-              return weeklySubscriptionUsageFacts(false);
-            const replacingUsage =
-              usageLifecycle.current().observation.kind === "usage";
-            return clearUsage(!event.credentialAvailable || replacingUsage);
+              return weeklySubscriptionUsageFacts(currentReaction());
+            return clearUsage(
+              event.credentialAvailable ? "invalidated" : "unavailable",
+            );
           }
           case "acquisition-completed": {
             if (
@@ -168,27 +179,31 @@ function makeClaudeProviderMonitorAdapter(
               event.exit.error._tag === "ClaudeAuthenticationRejected" &&
               !event.authenticationRefreshUsed
             ) {
-              return weeklySubscriptionUsageFacts(false, undefined, {
-                kind: "credential-rejected",
-              });
+              return weeklySubscriptionUsageFacts(
+                currentReaction(),
+                undefined,
+                { kind: "credential-rejected" },
+              );
             }
             if (
               event.currentIdentity === undefined ||
               event.currentIdentity !== event.startedIdentity
             ) {
-              return weeklySubscriptionUsageFacts(false, undefined, {
-                kind: "healthy",
-              });
+              return weeklySubscriptionUsageFacts(
+                currentReaction(),
+                undefined,
+                { kind: "healthy" },
+              );
             }
             if (event.exit.kind === "acquired") {
               const observedAtMs = event.exit.value.observedAtMs ?? event.nowMs;
               lastObservedAtMs = observedAtMs;
-              usageLifecycle.advance({
+              const reaction = capacityLifecycle.advance({
                 kind: "observed",
-                usage: event.exit.value,
+                capacity: event.exit.value,
                 observedAtMs,
               });
-              return weeklySubscriptionUsageFacts(true, "adequate", {
+              return weeklySubscriptionUsageFacts(reaction, "adequate", {
                 kind: "healthy",
               });
             }
@@ -199,12 +214,12 @@ function makeClaudeProviderMonitorAdapter(
                 return temporaryFailure(error, event.nowMs);
               case "ClaudeAcquisitionCoordinationUnavailable":
                 return {
-                  ...clearUsage(true),
+                  ...clearUsage("unavailable"),
                   acquisitionHealth: { kind: "healthy" },
                 };
               case "ClaudeAuthenticationRejected":
                 return {
-                  ...clearUsage(true),
+                  ...clearUsage("unavailable"),
                   acquisitionHealth:
                     error.retryAtMs === undefined
                       ? { kind: "healthy" }
@@ -215,7 +230,7 @@ function makeClaudeProviderMonitorAdapter(
                 };
               case "PermanentClaudeSubscriptionUsageFailure":
                 return {
-                  ...clearUsage(true),
+                  ...clearUsage("unavailable"),
                   acquisitionHealth:
                     error.retryAtMs === undefined
                       ? { kind: "terminal" }
@@ -229,7 +244,7 @@ function makeClaudeProviderMonitorAdapter(
           }
           case "activity-observed":
             return weeklySubscriptionUsageFacts(
-              false,
+              currentReaction(),
               lastObservedAtMs === undefined ||
                 event.nowMs - lastObservedAtMs >= ACTIVITY_REFRESH_INTERVAL_MS
                 ? "inadequate"
@@ -237,22 +252,22 @@ function makeClaudeProviderMonitorAdapter(
             );
           case "passive-observation":
           case "acquisition-deferred":
-            return weeklySubscriptionUsageFacts(false);
+            return weeklySubscriptionUsageFacts(currentReaction());
           case "stale-expiration-reached": {
-            const reaction = usageLifecycle.advance({
+            const reaction = capacityLifecycle.advance({
               kind: "stale-expiration-reached",
-              deadlineMs: event.deadlineMs,
+              deadline: event.deadline,
               nowMs: event.nowMs,
             });
-            if (reaction.publication === "preserve")
-              return weeklySubscriptionUsageFacts(false);
-            lastObservedAtMs = undefined;
-            return weeklySubscriptionUsageFacts(true);
+            if (reaction.observation.kind === "none")
+              lastObservedAtMs = undefined;
+            return weeklySubscriptionUsageFacts(reaction);
           }
           case "session-ended":
             lastObservedAtMs = undefined;
-            usageLifecycle.advance({ kind: "session-ended" });
-            return weeklySubscriptionUsageFacts(false);
+            return weeklySubscriptionUsageFacts(
+              capacityLifecycle.advance({ kind: "session-ended" }),
+            );
         }
       }),
     finalize: Effect.void,

@@ -41,8 +41,8 @@ function usageState(
   windowPosition: "primary" | "secondary" = "secondary",
 ) {
   return {
-    kind: "usage" as const,
-    usage: {
+    kind: "capacity" as const,
+    capacity: {
       usedPercent,
       resetsAtMs: 4_000_000,
       windowPosition,
@@ -59,7 +59,7 @@ test("records weekly quota usage from dedicated acquisition", () => {
   assert.deepEqual(reaction, {
     observation: usageState(63),
     publication: "replace",
-    staleExpirationAtMs: undefined,
+    staleExpiration: undefined,
     acquireDedicated: false,
   });
 });
@@ -80,12 +80,15 @@ test("preserves dedicated limit reset credits across passive observation", () =>
 
   assert.deepEqual(dedicated.observation, {
     ...usageState(63),
-    usage: { ...usageState(63).usage, availableLimitResetCredits: 2 },
+    capacity: {
+      ...usageState(63).capacity,
+      availableLimitResetCredits: 2,
+    },
   });
   assert.deepEqual(passive.observation, {
     ...usageState(64, "fresh", "primary"),
-    usage: {
-      ...usageState(64, "fresh", "primary").usage,
+    capacity: {
+      ...usageState(64, "fresh", "primary").capacity,
       availableLimitResetCredits: 2,
     },
   });
@@ -270,7 +273,7 @@ test("a dedicated observation replaces sparse passive evidence", () => {
   assert.equal(reaction.publication, "preserve");
 });
 
-test("temporary acquisition failure publishes stale usage and its deadline", () => {
+test("temporary acquisition failure publishes stale capacity and its deadline", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   observeDedicated(reconciliation);
 
@@ -284,7 +287,7 @@ test("temporary acquisition failure publishes stale usage and its deadline", () 
 
   assert.deepEqual(reaction.observation, usageState(63, "stale"));
   assert.equal(reaction.publication, "replace");
-  assert.equal(reaction.staleExpirationAtMs, NOW + 600_000);
+  assert.equal(reaction.staleExpiration?.expiresAtMs, NOW + 600_000);
 });
 
 test("deferred acquisition also makes retained usage stale", () => {
@@ -299,24 +302,27 @@ test("deferred acquisition also makes retained usage stale", () => {
   assert.deepEqual(reaction.observation, usageState(63, "stale"));
 });
 
-test("stale usage expires while sparse passive evidence survives", () => {
+test("stale capacity expires while sparse passive evidence survives", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   observeDedicated(reconciliation);
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
   });
-  reconciliation.advance(
+  const stale = reconciliation.advance(
     {
       kind: "dedicated-weekly-quota-acquisition",
       result: { kind: "temporary-failure", retryAtMs: undefined },
     },
     NOW + 1,
   );
+  if (stale.staleExpiration === undefined) {
+    throw new TypeError("expected stale expiration");
+  }
 
   const expired = reconciliation.advance(
     {
-      kind: "stale-usage-expiration-reached",
-      deadlineMs: NOW + 600_000,
+      kind: "stale-capacity-expiration-reached",
+      deadline: stale.staleExpiration,
     },
     NOW + 600_000,
   );
