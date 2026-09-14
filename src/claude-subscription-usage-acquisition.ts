@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { Cause, Clock, Data, Effect, Schema } from "effect";
 import {
   readBoundedResponseBody,
@@ -26,26 +25,20 @@ const CLAUDE_USAGE_HEADERS = {
   "x-app": "cli",
 } as const;
 
-export interface ClaudeAuthentication {
-  readonly source?: string;
-  readonly auth: {
-    readonly apiKey?: string;
-  };
-}
+declare const claudeOAuthCredentialBrand: unique symbol;
 
-export type ResolveClaudeAuthentication = Effect.Effect<
-  ClaudeAuthentication | undefined
->;
+export type ClaudeOAuthCredential = string & {
+  readonly [claudeOAuthCredentialBrand]: true;
+};
 
 export interface AcquiredClaudeSubscriptionUsage {
   readonly usedPercent: number;
   readonly resetsAtMs: number;
-  readonly credentialFingerprint: string;
   readonly observedAtMs?: number;
 }
 
-export class ClaudeAuthenticationUnavailable extends Data.TaggedError(
-  "ClaudeAuthenticationUnavailable",
+export class ClaudeAcquisitionCoordinationUnavailable extends Data.TaggedError(
+  "ClaudeAcquisitionCoordinationUnavailable",
 ) {}
 export class ClaudeAuthenticationRejected extends Data.TaggedError(
   "ClaudeAuthenticationRejected",
@@ -90,21 +83,25 @@ export class MalformedClaudeSubscriptionUsage extends Data.TaggedError(
   }
 }
 
-export type ClaudeSubscriptionUsageAcquisitionError =
-  | ClaudeAuthenticationUnavailable
+type ClaudeSubscriptionUsageExchangeError =
   | ClaudeAuthenticationRejected
   | TemporaryClaudeSubscriptionUsageFailure
   | PermanentClaudeSubscriptionUsageFailure
   | MalformedClaudeSubscriptionUsage;
 
-export type AcquireClaudeSubscriptionUsage = () => Effect.Effect<
+export type ClaudeSubscriptionUsageAcquisitionError =
+  | ClaudeAcquisitionCoordinationUnavailable
+  | ClaudeSubscriptionUsageExchangeError;
+
+export type AcquireClaudeSubscriptionUsage = (
+  oauthCredential: ClaudeOAuthCredential,
+) => Effect.Effect<
   AcquiredClaudeSubscriptionUsage,
   ClaudeSubscriptionUsageAcquisitionError
 >;
 
 export interface ClaudeSubscriptionUsageAcquisitionDependencies {
   readonly fetch: typeof fetch;
-  readonly resolveAuthentication: ResolveClaudeAuthentication;
   readonly acquisitionCoordinator: ProviderAcquisitionCoordinator;
   readonly onCoordinationUnavailable?: (reason: string) => void;
 }
@@ -167,26 +164,6 @@ const ClaudeUsageBody = Schema.Struct({
   }),
 });
 
-function oauthKey(
-  authentication: ClaudeAuthentication | undefined,
-): string | undefined {
-  if (authentication?.source !== "OAuth") return undefined;
-  const key = authentication.auth.apiKey?.trim();
-  return key === undefined || key === "" ? undefined : key;
-}
-
-function fingerprintOAuthKey(key: string): string {
-  return createHash("sha256").update(key).digest("hex");
-}
-
-/** Returns only a non-reversible, session-memory-safe identity for eligible OAuth. */
-export function claudeCredentialFingerprint(
-  authentication: ClaudeAuthentication | undefined,
-): string | undefined {
-  const key = oauthKey(authentication);
-  return key === undefined ? undefined : fingerprintOAuthKey(key);
-}
-
 function retryAtMs(response: Response, now: number): number | undefined {
   const rawValue = response.headers.get("retry-after");
   if (rawValue === null) return undefined;
@@ -204,7 +181,7 @@ function retryAtMs(response: Response, now: number): number | undefined {
 function requestUsage(
   fetchImplementation: typeof fetch,
   key: string,
-): Effect.Effect<Response, ClaudeSubscriptionUsageAcquisitionError> {
+): Effect.Effect<Response, ClaudeSubscriptionUsageExchangeError> {
   return Effect.tryPromise({
     try: (signal) =>
       fetchImplementation(CLAUDE_USAGE_URL, {
@@ -223,7 +200,7 @@ function requestUsage(
 
 function classifyResponse(
   response: Response,
-): Effect.Effect<Response, ClaudeSubscriptionUsageAcquisitionError> {
+): Effect.Effect<Response, ClaudeSubscriptionUsageExchangeError> {
   if (response.ok) return Effect.succeed(response);
   if (response.status === 401 || response.status === 403) {
     return Effect.fail(new ClaudeAuthenticationRejected());
@@ -256,18 +233,6 @@ function classifyResponse(
 export function createAcquireClaudeSubscriptionUsage(
   dependencies: ClaudeSubscriptionUsageAcquisitionDependencies,
 ): AcquireClaudeSubscriptionUsage {
-  const resolveKey = dependencies.resolveAuthentication.pipe(
-    Effect.catchAllCause(() =>
-      Effect.fail(new ClaudeAuthenticationUnavailable()),
-    ),
-    Effect.flatMap((authentication) => {
-      const key = oauthKey(authentication);
-      return key === undefined
-        ? Effect.fail(new ClaudeAuthenticationUnavailable())
-        : Effect.succeed(key);
-    }),
-  );
-
   const decodeUsage = (response: Response) =>
     Effect.gen(function* () {
       const text = yield* readBoundedResponseBody(
@@ -306,10 +271,6 @@ export function createAcquireClaudeSubscriptionUsage(
           classifyResponse(response).pipe(Effect.flatMap(decodeUsage)),
         ),
       ),
-      Effect.map((usage) => ({
-        ...usage,
-        credentialFingerprint: fingerprintOAuthKey(key),
-      })),
       Effect.timeoutFail({
         duration: REQUEST_TIMEOUT_MS,
         onTimeout: () =>
@@ -371,7 +332,6 @@ export function createAcquireClaudeSubscriptionUsage(
                   });
                 case "MalformedClaudeSubscriptionUsage":
                   return Effect.succeed({ kind: "malformed" as const });
-                case "ClaudeAuthenticationUnavailable":
                 case "ClaudeAuthenticationRejected":
                   return Effect.succeed({
                     kind: "credential-rejected" as const,
@@ -393,12 +353,11 @@ export function createAcquireClaudeSubscriptionUsage(
             dependencies.onCoordinationUnavailable?.(error.reason),
           ),
         ),
-        Effect.mapError(() => new ClaudeAuthenticationUnavailable()),
+        Effect.mapError(() => new ClaudeAcquisitionCoordinationUnavailable()),
       );
 
   const usageFromOutcome = (
     outcome: CoordinatedAcquisitionOutcome<SharedClaudeSubscriptionUsage>,
-    key: string,
   ): Effect.Effect<
     AcquiredClaudeSubscriptionUsage,
     ClaudeSubscriptionUsageAcquisitionError
@@ -412,7 +371,6 @@ export function createAcquireClaudeSubscriptionUsage(
         return Effect.succeed({
           ...outcome.value,
           observedAtMs: outcome.observedAtMs,
-          credentialFingerprint: fingerprintOAuthKey(key),
         });
       }
       const staleUsage =
@@ -421,7 +379,6 @@ export function createAcquireClaudeSubscriptionUsage(
           : {
               ...outcome.stale.value,
               observedAtMs: outcome.stale.observedAtMs,
-              credentialFingerprint: fingerprintOAuthKey(key),
             };
       switch (outcome.reason) {
         case "temporary":
@@ -455,18 +412,6 @@ export function createAcquireClaudeSubscriptionUsage(
       }
     });
 
-  return () =>
-    Effect.gen(function* () {
-      const key = yield* resolveKey;
-      let outcome = yield* coordinateExchange(key);
-      if (
-        outcome.kind === "deferred" &&
-        outcome.reason === "credential-rejected"
-      ) {
-        const refreshedKey = yield* resolveKey;
-        outcome = yield* coordinateExchange(refreshedKey);
-        return yield* usageFromOutcome(outcome, refreshedKey);
-      }
-      return yield* usageFromOutcome(outcome, key);
-    });
+  return (oauthCredential) =>
+    coordinateExchange(oauthCredential).pipe(Effect.flatMap(usageFromOutcome));
 }

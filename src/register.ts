@@ -3,11 +3,11 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
-import { claudeProviderMonitorLayer } from "./claude-provider-monitor.ts";
 import {
-  type AcquireClaudeSubscriptionUsage,
-  claudeCredentialFingerprint,
-} from "./claude-subscription-usage-acquisition.ts";
+  type ClaudeAuthentication,
+  claudeProviderMonitorLayer,
+} from "./claude-provider-monitor.ts";
+import type { AcquireClaudeSubscriptionUsage } from "./claude-subscription-usage-acquisition.ts";
 import {
   type CodexCredentialResolution,
   codexProviderMonitorLayer,
@@ -81,18 +81,11 @@ function credentialFromContext(
   return accountId === undefined ? undefined : { accessToken, accountId };
 }
 
-function claudeCredentialIdentityResolution(ctx: ExtensionContext) {
-  return Effect.tryPromise(() =>
-    ctx.modelRegistry.getProviderAuth("anthropic"),
-  ).pipe(
-    Effect.map((authentication) => {
-      const fingerprint = claudeCredentialFingerprint(authentication);
-      return fingerprint === undefined
-        ? { kind: "missing" as const }
-        : { kind: "available" as const, fingerprint };
-    }),
-    Effect.catchAll(() => Effect.succeed({ kind: "missing" as const })),
-  );
+function claudeAuthenticationResolution(
+  ctx: ExtensionContext,
+): () => Effect.Effect<ClaudeAuthentication | undefined, unknown> {
+  return () =>
+    Effect.tryPromise(() => ctx.modelRegistry.getProviderAuth("anthropic"));
 }
 
 function credentialResolution(ctx: ExtensionContext) {
@@ -159,8 +152,7 @@ export function registerMonitoredProviderCapacity(
             piProviderId: "anthropic",
             makeLayer: (publish) =>
               claudeProviderMonitorLayer({
-                resolveCredentialIdentity:
-                  claudeCredentialIdentityResolution(ctx),
+                resolveAuthentication: claudeAuthenticationResolution(ctx),
                 acquireClaudeSubscriptionUsage:
                   dependencies.acquireClaudeSubscriptionUsage(ctx),
                 publish,

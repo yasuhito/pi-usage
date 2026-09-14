@@ -15,7 +15,6 @@ const codexWeeklyQuotaUsage = {
 const claudeSubscriptionUsage = {
   usedPercent: 80,
   resetsAtMs: 2_000_000,
-  credentialFingerprint: "claude-1",
 };
 
 it.scoped("polls providers independently while one provider is delayed", () =>
@@ -41,10 +40,11 @@ it.scoped("polls providers independently while one provider is delayed", () =>
         }),
     });
     const claude = yield* makeClaudeProviderMonitor({
-      resolveCredentialIdentity: Effect.succeed({
-        kind: "available" as const,
-        fingerprint: "claude-1",
-      }),
+      resolveAuthentication: () =>
+        Effect.succeed({
+          source: "OAuth",
+          auth: { apiKey: "claude-1" },
+        }),
       acquireClaudeSubscriptionUsage: () => {
         claudeReads += 1;
         return claudeAcquisition;
@@ -100,10 +100,11 @@ it.scoped("one provider's retry deadline does not delay the other", () =>
       publish: () => Effect.void,
     });
     const claude = yield* makeClaudeProviderMonitor({
-      resolveCredentialIdentity: Effect.succeed({
-        kind: "available" as const,
-        fingerprint: "claude-1",
-      }),
+      resolveAuthentication: () =>
+        Effect.succeed({
+          source: "OAuth",
+          auth: { apiKey: "claude-1" },
+        }),
       acquireClaudeSubscriptionUsage: () => {
         claudeReads += 1;
         return Effect.succeed(claudeSubscriptionUsage);
@@ -152,10 +153,11 @@ it.scoped("a Codex defect does not stop or alter Claude", () =>
       random: Effect.succeed(0.5),
     });
     const claude = yield* makeClaudeProviderMonitor({
-      resolveCredentialIdentity: Effect.succeed({
-        kind: "available" as const,
-        fingerprint: "claude-1",
-      }),
+      resolveAuthentication: () =>
+        Effect.succeed({
+          source: "OAuth",
+          auth: { apiKey: "claude-1" },
+        }),
       acquireClaudeSubscriptionUsage: () => {
         claudeReads += 1;
         return Effect.succeed(claudeSubscriptionUsage);
@@ -207,10 +209,11 @@ it.scoped("a Claude interruption does not stop or alter Codex", () =>
         }),
     });
     const claude = yield* makeClaudeProviderMonitor({
-      resolveCredentialIdentity: Effect.succeed({
-        kind: "available" as const,
-        fingerprint: "claude-1",
-      }),
+      resolveAuthentication: () =>
+        Effect.succeed({
+          source: "OAuth",
+          auth: { apiKey: "claude-1" },
+        }),
       acquireClaudeSubscriptionUsage: () => {
         claudeReads += 1;
         return Effect.interrupt;

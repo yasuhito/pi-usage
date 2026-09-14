@@ -8,8 +8,7 @@ import { test } from "vitest";
 
 import {
   type AcquiredClaudeSubscriptionUsage,
-  ClaudeAuthenticationUnavailable,
-  claudeCredentialFingerprint,
+  ClaudeAcquisitionCoordinationUnavailable,
   PermanentClaudeSubscriptionUsageFailure,
 } from "../src/claude-subscription-usage-acquisition.ts";
 import type {
@@ -28,15 +27,6 @@ function accessTokenFor(accountId: string): string {
   return `header.${payload}.signature`;
 }
 
-function anthropicCredentialFingerprint(accountId = "account-1"): string {
-  const fingerprint = claudeCredentialFingerprint({
-    source: "OAuth",
-    auth: { apiKey: accessTokenFor(accountId) },
-  });
-  assert.ok(fingerprint);
-  return fingerprint;
-}
-
 type ExtensionHandler = (
   event: { readonly headers?: Readonly<Record<string, unknown>> },
   ctx: ExtensionContext,
@@ -50,6 +40,7 @@ function registerFixture() {
     },
   } as unknown as ExtensionAPI;
   const observedCredentials: CodexCredential[] = [];
+  const observedClaudeCredentials: string[] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   let mode: ExtensionContext["mode"] = "tui";
   let provider = "openai-codex";
@@ -70,11 +61,11 @@ function registerFixture() {
   let claudeReads = 0;
   let claudeAcquisition: Effect.Effect<
     AcquiredClaudeSubscriptionUsage,
-    PermanentClaudeSubscriptionUsageFailure | ClaudeAuthenticationUnavailable
+    | ClaudeAcquisitionCoordinationUnavailable
+    | PermanentClaudeSubscriptionUsageFailure
   > = Effect.succeed({
     usedPercent: 80,
     resetsAtMs: 2_000_000,
-    credentialFingerprint: anthropicCredentialFingerprint(),
   });
 
   registerMonitoredProviderCapacity(pi, {
@@ -84,8 +75,9 @@ function registerFixture() {
       observedCredentials.push(credential);
       return acquisition;
     },
-    acquireClaudeSubscriptionUsage: () => () => {
+    acquireClaudeSubscriptionUsage: () => (credential) => {
       claudeReads += 1;
+      observedClaudeCredentials.push(credential);
       return claudeAcquisition;
     },
   });
@@ -127,6 +119,7 @@ function registerFixture() {
   return {
     emit,
     observedCredentials,
+    observedClaudeCredentials,
     claudeReads: () => claudeReads,
     statuses,
     setMode: (value: ExtensionContext["mode"]) => {
@@ -165,6 +158,7 @@ test("session start adapts Pi authentication and quota presentation", async () =
   assert.deepEqual(f.observedCredentials, [
     { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
   ]);
+  assert.deepEqual(f.observedClaudeCredentials, [accessTokenFor("account-1")]);
   assert.deepEqual(f.statuses.at(-1), {
     key: "pi-usage",
     text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m",
@@ -277,7 +271,9 @@ test("model selection refreshes both monitored providers", async () => {
 
 test("activity refreshes only the direct provider that handled it", async () => {
   const f = registerFixture();
-  f.setClaudeAcquisition(Effect.fail(new ClaudeAuthenticationUnavailable()));
+  f.setClaudeAcquisition(
+    Effect.fail(new ClaudeAcquisitionCoordinationUnavailable()),
+  );
   await f.emit("session_start");
   assert.equal(f.observedCredentials.length, 1);
   assert.equal(f.claudeReads(), 1);
@@ -286,7 +282,6 @@ test("activity refreshes only the direct provider that handled it", async () => 
     Effect.succeed({
       usedPercent: 20,
       resetsAtMs: 2_000_000,
-      credentialFingerprint: anthropicCredentialFingerprint(),
     }),
   );
   f.setProvider("anthropic");

@@ -5,7 +5,7 @@ import { test } from "vitest";
 import { claudeProviderMonitorLayer } from "../src/claude-provider-monitor.ts";
 import {
   type AcquiredClaudeSubscriptionUsage,
-  ClaudeAuthenticationUnavailable,
+  ClaudeAcquisitionCoordinationUnavailable,
   type ClaudeSubscriptionUsageAcquisitionError,
 } from "../src/claude-subscription-usage-acquisition.ts";
 import {
@@ -38,7 +38,6 @@ const codexUsage: AcquiredWeeklyQuotaUsage = {
 const claudeUsage: AcquiredClaudeSubscriptionUsage = {
   usedPercent: 80,
   resetsAtMs: 2_000_000,
-  credentialFingerprint: "claude-1",
 };
 
 type CapacityRecord = Readonly<
@@ -103,10 +102,11 @@ function sessionDependencies(
         makeLayer: (publish) => {
           options.onMakeClaudeLayer?.();
           return claudeProviderMonitorLayer({
-            resolveCredentialIdentity: Effect.succeed({
-              kind: "available",
-              fingerprint: "claude-1",
-            }),
+            resolveAuthentication: () =>
+              Effect.succeed({
+                source: "OAuth",
+                auth: { apiKey: "claude-1" },
+              }),
             acquireClaudeSubscriptionUsage: () =>
               options.acquireClaude ?? Effect.succeed(claudeUsage),
             publish,
@@ -541,7 +541,7 @@ test("routes activity and responses through the provider roster", async () => {
   let claudeAcquisition: Effect.Effect<
     AcquiredClaudeSubscriptionUsage,
     ClaudeSubscriptionUsageAcquisitionError
-  > = Effect.fail(new ClaudeAuthenticationUnavailable());
+  > = Effect.fail(new ClaudeAcquisitionCoordinationUnavailable());
   const presentations: CapacityRecord[] = [];
   await Effect.runPromise(
     session.start(

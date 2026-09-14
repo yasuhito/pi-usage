@@ -3,9 +3,8 @@ import { it } from "@effect/vitest";
 import { Effect, Exit, Fiber, TestClock } from "effect";
 
 import {
-  claudeCredentialFingerprint,
+  type ClaudeOAuthCredential,
   createAcquireClaudeSubscriptionUsage,
-  type ResolveClaudeAuthentication,
 } from "../src/claude-subscription-usage-acquisition.ts";
 import { immediateAcquisitionCoordinator } from "./fixtures/immediate-acquisition-coordinator.ts";
 
@@ -20,19 +19,15 @@ const goodBody = {
   extra_usage: { enabled: false },
 };
 
-function oauth(key = "secret"): ResolveClaudeAuthentication {
-  return Effect.succeed({ source: "OAuth", auth: { apiKey: key } });
+function validatedCredential(value: string): ClaudeOAuthCredential {
+  return value as ClaudeOAuthCredential;
 }
 
-function acquire(
-  fetch: typeof globalThis.fetch,
-  resolveAuthentication: ResolveClaudeAuthentication = oauth(),
-) {
+function acquire(fetch: typeof globalThis.fetch, credential = "secret") {
   return createAcquireClaudeSubscriptionUsage({
     fetch,
-    resolveAuthentication,
     acquisitionCoordinator: immediateAcquisitionCoordinator,
-  })();
+  })(validatedCredential(credential));
 }
 
 function failureTag(exit: Exit.Exit<unknown, unknown>) {
@@ -53,7 +48,6 @@ it.effect(
           requests += 1;
           return new Response(JSON.stringify(goodBody));
         },
-        resolveAuthentication: oauth(),
         acquisitionCoordinator: {
           coordinate: (request) => {
             const value = request.decode({
@@ -69,17 +63,13 @@ it.effect(
                 });
           },
         },
-      })();
+      })(validatedCredential("secret"));
 
       assert.equal(requests, 0);
       assert.deepEqual(usage, {
         usedPercent: 27,
         resetsAtMs: Date.parse("2026-09-18T12:34:56.789Z"),
         observedAtMs: 1_000,
-        credentialFingerprint: claudeCredentialFingerprint({
-          source: "OAuth",
-          auth: { apiKey: "secret" },
-        }),
       });
     }),
 );
@@ -92,7 +82,6 @@ it.effect(
       const exit = yield* Effect.exit(
         createAcquireClaudeSubscriptionUsage({
           fetch: async () => new Response(JSON.stringify(goodBody)),
-          resolveAuthentication: oauth(),
           acquisitionCoordinator: {
             coordinate: (request) => {
               const value = request.decode({ usedPercent: 27, resetsAtMs });
@@ -106,7 +95,7 @@ it.effect(
                   });
             },
           },
-        })(),
+        })(validatedCredential("secret")),
       );
 
       assert.equal(Exit.isFailure(exit), true);
@@ -118,10 +107,6 @@ it.effect(
           usedPercent: 27,
           resetsAtMs,
           observedAtMs: 1_000,
-          credentialFingerprint: claudeCredentialFingerprint({
-            source: "OAuth",
-            auth: { apiKey: "secret" },
-          }),
         },
       );
     }),
@@ -136,10 +121,6 @@ it.effect("decodes the allowlisted seven-day subscription window", () =>
       usedPercent: 63.4,
       resetsAtMs: Date.parse("2026-09-18T12:34:56.789Z"),
       observedAtMs: 0,
-      credentialFingerprint: claudeCredentialFingerprint({
-        source: "OAuth",
-        auth: { apiKey: "secret" },
-      }),
     });
   }),
 );
@@ -243,63 +224,13 @@ it.effect("accepts utilization boundaries without sibling windows", () =>
   }),
 );
 
-it.effect(
-  "does not request for missing, API-key, or invalid authentication",
-  () =>
-    Effect.gen(function* () {
-      const resolutions: ResolveClaudeAuthentication[] = [
-        Effect.succeed(undefined),
-        Effect.succeed({
-          source: "ANTHROPIC_API_KEY",
-          auth: { apiKey: "key" },
-        }),
-        Effect.succeed({ source: "OAuth", auth: { apiKey: "   " } }),
-        Effect.succeed({ source: "OAuth", auth: {} }),
-      ];
-      for (const resolveAuthentication of resolutions) {
-        let requested = false;
-        const exit = yield* Effect.exit(
-          acquire(async () => {
-            requested = true;
-            return new Response(JSON.stringify(goodBody));
-          }, resolveAuthentication),
-        );
-        assert.equal(failureTag(exit), "ClaudeAuthenticationUnavailable");
-        assert.equal(requested, false);
-      }
-    }),
-);
-
-it.effect(
-  "contains resolver defects without requesting or surfacing secrets",
-  () =>
-    Effect.gen(function* () {
-      let requested = false;
-      const exit = yield* Effect.exit(
-        acquire(
-          async () => {
-            requested = true;
-            return new Response(JSON.stringify(goodBody));
-          },
-          Effect.die(new Error("secret-resolver-detail")),
-        ),
-      );
-      assert.equal(failureTag(exit), "ClaudeAuthenticationUnavailable");
-      assert.equal(requested, false);
-      assert.equal(
-        JSON.stringify(exit).includes("secret-resolver-detail"),
-        false,
-      );
-    }),
-);
-
 it.effect("uses the fixed Claude Code OAuth request contract", () =>
   Effect.gen(function* () {
     let request: [RequestInfo | URL, RequestInit | undefined] | undefined;
     yield* acquire(async (input, init) => {
       request = [input, init];
       return new Response(JSON.stringify(goodBody));
-    }, oauth("  secret  "));
+    }, "secret");
     assert.equal(request?.[0], "https://api.anthropic.com/api/oauth/usage");
     assert.equal(request?.[1]?.method, "GET");
     assert.equal(request?.[1]?.redirect, "manual");
@@ -315,57 +246,24 @@ it.effect("uses the fixed Claude Code OAuth request contract", () =>
   }),
 );
 
-it.effect("re-resolves OAuth and retries authentication rejection once", () =>
+it.effect("reports a 403 without retrying or surfacing response data", () =>
   Effect.gen(function* () {
-    let resolutions = 0;
     let requests = 0;
-    const resolveAuthentication = Effect.sync(() => ({
-      source: "OAuth",
-      auth: { apiKey: `secret-${++resolutions}` },
-    }));
-    const usage = yield* acquire(async (_input, init) => {
-      requests += 1;
-      assert.equal(
-        (init?.headers as Record<string, string> | undefined)?.Authorization,
-        `Bearer secret-${requests}`,
-      );
-      return requests === 1
-        ? new Response(null, { status: 401 })
-        : new Response(JSON.stringify(goodBody));
-    }, resolveAuthentication);
-    assert.equal(usage.usedPercent, 63.4);
-    assert.equal(
-      usage.credentialFingerprint,
-      claudeCredentialFingerprint({
-        source: "OAuth",
-        auth: { apiKey: "secret-2" },
+    const exit = yield* Effect.exit(
+      acquire(async () => {
+        requests += 1;
+        return new Response("raw-secret-body", { status: 403 });
       }),
     );
-    assert.equal(resolutions, 2);
-    assert.equal(requests, 2);
+    assert.equal(requests, 1);
+    assert.equal(failureTag(exit), "ClaudeAuthenticationRejected");
+    assert.equal(JSON.stringify(exit).includes("raw-secret-body"), false);
+    assert.equal(JSON.stringify(exit).includes("secret"), false);
   }),
 );
 
 it.effect(
-  "retries a repeated 403 exactly once without surfacing response data",
-  () =>
-    Effect.gen(function* () {
-      let requests = 0;
-      const exit = yield* Effect.exit(
-        acquire(async () => {
-          requests += 1;
-          return new Response("raw-secret-body", { status: 403 });
-        }),
-      );
-      assert.equal(requests, 2);
-      assert.equal(failureTag(exit), "ClaudeAuthenticationRejected");
-      assert.equal(JSON.stringify(exit).includes("raw-secret-body"), false);
-      assert.equal(JSON.stringify(exit).includes("secret"), false);
-    }),
-);
-
-it.effect(
-  "finalizes bodies for terminal, retryable, redirect, and repeated auth outcomes",
+  "finalizes bodies for terminal, retryable, redirect, and auth outcomes",
   () =>
     Effect.gen(function* () {
       const cases = [
@@ -375,7 +273,7 @@ it.effect(
         [425, "TemporaryClaudeSubscriptionUsageFailure", 1],
         [429, "TemporaryClaudeSubscriptionUsageFailure", 1],
         [500, "TemporaryClaudeSubscriptionUsageFailure", 1],
-        [403, "ClaudeAuthenticationRejected", 2],
+        [403, "ClaudeAuthenticationRejected", 1],
       ] as const;
       for (const [status, tag, expectedRequests] of cases) {
         let cancelled = 0;
@@ -406,30 +304,19 @@ it.effect(
   "keeps an OAuth-authenticated 429 separate from authentication metadata",
   () =>
     Effect.gen(function* () {
-      let resolutions = 0;
       let requests = 0;
       const exit = yield* Effect.exit(
-        acquire(
-          async (_input, init) => {
-            requests += 1;
-            assert.equal(
-              (init?.headers as Record<string, string> | undefined)
-                ?.Authorization,
-              "Bearer oauth-secret",
-            );
-            return new Response("rate-limit-raw-secret", { status: 429 });
-          },
-          Effect.sync(() => {
-            resolutions += 1;
-            return {
-              source: "OAuth",
-              auth: { apiKey: "oauth-secret" },
-            };
-          }),
-        ),
+        acquire(async (_input, init) => {
+          requests += 1;
+          assert.equal(
+            (init?.headers as Record<string, string> | undefined)
+              ?.Authorization,
+            "Bearer oauth-secret",
+          );
+          return new Response("rate-limit-raw-secret", { status: 429 });
+        }, "oauth-secret"),
       );
       assert.equal(failureTag(exit), "TemporaryClaudeSubscriptionUsageFailure");
-      assert.equal(resolutions, 1);
       assert.equal(requests, 1);
       assert.equal(JSON.stringify(exit).includes("oauth-secret"), false);
       assert.equal(
@@ -449,8 +336,8 @@ it.effect("keeps every unsuccessful exchange outcome secret-safe", () =>
       [425, "TemporaryClaudeSubscriptionUsageFailure", 1],
       [429, "TemporaryClaudeSubscriptionUsageFailure", 1],
       [503, "TemporaryClaudeSubscriptionUsageFailure", 1],
-      [401, "ClaudeAuthenticationRejected", 2],
-      [403, "ClaudeAuthenticationRejected", 2],
+      [401, "ClaudeAuthenticationRejected", 1],
+      [403, "ClaudeAuthenticationRejected", 1],
       [200, "MalformedClaudeSubscriptionUsage", 1],
     ] as const;
     for (const [status, expectedTag, expectedRequests] of cases) {
@@ -462,7 +349,7 @@ it.effect("keeps every unsuccessful exchange outcome secret-safe", () =>
             status,
             headers: { "x-authenticated-secret": "header-secret" },
           });
-        }, oauth("credential-secret")),
+        }, "credential-secret"),
       );
       const serialized = JSON.stringify(exit);
       assert.equal(failureTag(exit), expectedTag);
@@ -484,7 +371,7 @@ it.effect("keeps every unsuccessful exchange outcome secret-safe", () =>
     const networkExit = yield* Effect.exit(
       acquire(async () => {
         throw new Error("transport-secret");
-      }, oauth("credential-secret")),
+      }, "credential-secret"),
     );
     assert.equal(
       failureTag(networkExit),
@@ -520,22 +407,6 @@ it.effect("applies a fifteen-minute floor to 429 retry instructions", () =>
     }
   }),
 );
-
-it("creates a normalized non-reversible credential identity", () => {
-  const fingerprint = claudeCredentialFingerprint({
-    source: "OAuth",
-    auth: { apiKey: "  secret  " },
-  });
-  assert.equal(fingerprint?.length, 64);
-  assert.equal(fingerprint?.includes("secret"), false);
-  assert.equal(
-    fingerprint,
-    claudeCredentialFingerprint({
-      source: "OAuth",
-      auth: { apiKey: "secret" },
-    }),
-  );
-});
 
 it.effect("enforces the five-second timeout", () =>
   Effect.gen(function* () {

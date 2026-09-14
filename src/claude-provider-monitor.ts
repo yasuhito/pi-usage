@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { Effect, Layer, type Scope } from "effect";
 
 import type {
   AcquireClaudeSubscriptionUsage,
   AcquiredClaudeSubscriptionUsage,
+  ClaudeOAuthCredential,
   ClaudeSubscriptionUsageAcquisitionError,
 } from "./claude-subscription-usage-acquisition.ts";
 import type { WeeklySubscriptionUsageStatus } from "./presentation.ts";
@@ -20,12 +22,18 @@ import { createWeeklySubscriptionUsageLifecycle } from "./weekly-subscription-us
 const ACTIVITY_REFRESH_INTERVAL_MS = 3 * 60_000;
 const POLL_INTERVAL_MS = 15 * 60_000;
 
-export type ClaudeCredentialIdentityResolution =
-  | { readonly kind: "missing" }
-  | { readonly kind: "available"; readonly fingerprint: string };
+export interface ClaudeAuthentication {
+  readonly source?: string;
+  readonly auth: {
+    readonly apiKey?: string;
+  };
+}
 
 export interface ClaudeProviderMonitorDependencies {
-  readonly resolveCredentialIdentity: Effect.Effect<ClaudeCredentialIdentityResolution>;
+  readonly resolveAuthentication: () => Effect.Effect<
+    ClaudeAuthentication | undefined,
+    unknown
+  >;
   readonly acquireClaudeSubscriptionUsage: AcquireClaudeSubscriptionUsage;
   readonly publish: (
     status: WeeklySubscriptionUsageStatus,
@@ -37,7 +45,7 @@ export interface ClaudeProviderMonitorDependencies {
 function makeClaudeProviderMonitorAdapter(
   dependencies: ClaudeProviderMonitorDependencies,
 ): ProviderMonitorAdapter<
-  string,
+  ClaudeOAuthCredential,
   AcquiredClaudeSubscriptionUsage,
   ClaudeSubscriptionUsageAcquisitionError,
   WeeklySubscriptionUsageStatus
@@ -83,7 +91,6 @@ function makeClaudeProviderMonitorAdapter(
       | { readonly _tag: "TemporaryClaudeSubscriptionUsageFailure" }
       | { readonly _tag: "MalformedClaudeSubscriptionUsage" }
     >,
-    startedIdentity: string,
     nowMs: number,
   ): ProviderCapacityFacts<WeeklySubscriptionUsageStatus> => {
     if (
@@ -95,7 +102,6 @@ function makeClaudeProviderMonitorAdapter(
     }
     if (
       error.staleUsage !== undefined &&
-      error.staleUsage.credentialFingerprint === startedIdentity &&
       error.staleUsage.resetsAtMs > nowMs &&
       !(
         error._tag === "TemporaryClaudeSubscriptionUsageFailure" &&
@@ -122,22 +128,30 @@ function makeClaudeProviderMonitorAdapter(
 
   return {
     credentialVerification: "before-and-after",
-    resolveCredential: dependencies.resolveCredentialIdentity.pipe(
-      Effect.map((resolution) =>
-        resolution.kind === "missing"
-          ? {
-              kind: "unavailable" as const,
-              acceptPassiveObservation: false,
-            }
-          : {
-              kind: "available" as const,
-              identity: providerCredentialIdentity(resolution.fingerprint),
-              credential: resolution.fingerprint,
-              acceptPassiveObservation: false,
-            },
-      ),
+    resolveCredential: Effect.suspend(dependencies.resolveAuthentication).pipe(
+      Effect.catchAllCause(() => Effect.succeed(undefined)),
+      Effect.map((authentication) => {
+        const key =
+          authentication?.source === "OAuth"
+            ? authentication.auth.apiKey?.trim()
+            : undefined;
+        if (key === undefined || key === "") {
+          return {
+            kind: "unavailable" as const,
+            acceptPassiveObservation: false,
+          };
+        }
+        return {
+          kind: "available" as const,
+          identity: providerCredentialIdentity(
+            createHash("sha256").update(key).digest("hex"),
+          ),
+          credential: key as ClaudeOAuthCredential,
+          acceptPassiveObservation: false,
+        };
+      }),
     ),
-    acquire: () => dependencies.acquireClaudeSubscriptionUsage(),
+    acquire: dependencies.acquireClaudeSubscriptionUsage,
     advance: (event) =>
       Effect.sync(() => {
         switch (event.kind) {
@@ -149,14 +163,24 @@ function makeClaudeProviderMonitorAdapter(
             return clearUsage(!event.credentialAvailable || replacingUsage);
           }
           case "acquisition-completed": {
+            if (
+              event.exit.kind === "failed" &&
+              event.exit.error._tag === "ClaudeAuthenticationRejected" &&
+              !event.authenticationRefreshUsed
+            ) {
+              return weeklySubscriptionUsageFacts(false, undefined, {
+                kind: "credential-rejected",
+              });
+            }
+            if (
+              event.currentIdentity === undefined ||
+              event.currentIdentity !== event.startedIdentity
+            ) {
+              return weeklySubscriptionUsageFacts(false, undefined, {
+                kind: "healthy",
+              });
+            }
             if (event.exit.kind === "acquired") {
-              if (
-                event.currentIdentity !== event.exit.value.credentialFingerprint
-              ) {
-                return weeklySubscriptionUsageFacts(false, undefined, {
-                  kind: "healthy",
-                });
-              }
               const observedAtMs = event.exit.value.observedAtMs ?? event.nowMs;
               lastObservedAtMs = observedAtMs;
               usageLifecycle.advance({
@@ -168,24 +192,12 @@ function makeClaudeProviderMonitorAdapter(
                 kind: "healthy",
               });
             }
-            if (
-              event.currentIdentity === undefined ||
-              event.currentIdentity !== event.startedIdentity
-            ) {
-              return weeklySubscriptionUsageFacts(false, undefined, {
-                kind: "healthy",
-              });
-            }
             const error = event.exit.error;
             switch (error._tag) {
               case "TemporaryClaudeSubscriptionUsageFailure":
               case "MalformedClaudeSubscriptionUsage":
-                return temporaryFailure(
-                  error,
-                  event.startedIdentity,
-                  event.nowMs,
-                );
-              case "ClaudeAuthenticationUnavailable":
+                return temporaryFailure(error, event.nowMs);
+              case "ClaudeAcquisitionCoordinationUnavailable":
                 return {
                   ...clearUsage(true),
                   acquisitionHealth: { kind: "healthy" },
@@ -252,7 +264,7 @@ export function makeClaudeProviderMonitor(
   dependencies: ClaudeProviderMonitorDependencies,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
   return makeProviderMonitor<
-    string,
+    ClaudeOAuthCredential,
     AcquiredClaudeSubscriptionUsage,
     ClaudeSubscriptionUsageAcquisitionError,
     WeeklySubscriptionUsageStatus

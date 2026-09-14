@@ -1,6 +1,4 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
-
 import { createAcquireClaudeSubscriptionUsage } from "./src/claude-subscription-usage-acquisition.ts";
 import { createAcquireDedicatedWeeklyQuotaUsage } from "./src/dedicated-weekly-quota-acquisition.ts";
 import { createFileProviderAcquisitionCoordinator } from "./src/provider-acquisition-coordinator.ts";
@@ -29,9 +27,6 @@ export default function piUsage(pi: ExtensionAPI): void {
       createAcquireClaudeSubscriptionUsage({
         fetch,
         acquisitionCoordinator,
-        resolveAuthentication: Effect.tryPromise(() =>
-          ctx.modelRegistry.getProviderAuth("anthropic"),
-        ).pipe(Effect.catchAll(() => Effect.succeed(undefined))),
         onCoordinationUnavailable: () =>
           showCoordinationWarningOnce(() =>
             ctx.ui.notify(
