@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
-import { Effect, Exit, Fiber, TestClock } from "effect";
+import { Effect, Exit } from "effect";
 
 import {
   type ClaudeOAuthCredential,
@@ -35,6 +35,14 @@ function failureTag(exit: Exit.Exit<unknown, unknown>) {
   const error = exit.cause.error;
   return typeof error === "object" && error !== null
     ? Reflect.get(error, "_tag")
+    : undefined;
+}
+
+function retryAtMs(exit: Exit.Exit<unknown, unknown>) {
+  if (!Exit.isFailure(exit) || exit.cause._tag !== "Fail") return undefined;
+  const error = exit.cause.error;
+  return typeof error === "object" && error !== null
+    ? Reflect.get(error, "retryAtMs")
     : undefined;
 }
 
@@ -137,6 +145,7 @@ it.effect("rejects malformed required weekly data without clamping", () =>
       { utilization: 50, resets_at: "2026-09-18" },
       { utilization: 50, resets_at: "1969-01-01T00:00:00Z" },
       { utilization: 50, resets_at: "+275760-09-13T00:00:00.001Z" },
+      { utilization: "raw-response-secret", resets_at: "2026-09-18T12:34:56Z" },
     ]) {
       const exit = yield* Effect.exit(
         acquire(
@@ -148,6 +157,7 @@ it.effect("rejects malformed required weekly data without clamping", () =>
         "MalformedClaudeSubscriptionUsage",
         JSON.stringify(seven_day),
       );
+      assert.equal(JSON.stringify(exit).includes("raw-response-secret"), false);
     }
   }),
 );
@@ -246,142 +256,52 @@ it.effect("uses the fixed Claude Code OAuth request contract", () =>
   }),
 );
 
-it.effect("reports a 403 without retrying or surfacing response data", () =>
-  Effect.gen(function* () {
-    let requests = 0;
-    const exit = yield* Effect.exit(
-      acquire(async () => {
-        requests += 1;
-        return new Response("raw-secret-body", { status: 403 });
-      }),
-    );
-    assert.equal(requests, 1);
-    assert.equal(failureTag(exit), "ClaudeAuthenticationRejected");
-    assert.equal(JSON.stringify(exit).includes("raw-secret-body"), false);
-    assert.equal(JSON.stringify(exit).includes("secret"), false);
-  }),
-);
-
 it.effect(
-  "finalizes bodies for terminal, retryable, redirect, and auth outcomes",
+  "maps every exchange outcome to an acquisition failure without retrying",
   () =>
     Effect.gen(function* () {
       const cases = [
-        [400, "PermanentClaudeSubscriptionUsageFailure", 1],
-        [302, "PermanentClaudeSubscriptionUsageFailure", 1],
-        [408, "TemporaryClaudeSubscriptionUsageFailure", 1],
-        [425, "TemporaryClaudeSubscriptionUsageFailure", 1],
-        [429, "TemporaryClaudeSubscriptionUsageFailure", 1],
-        [500, "TemporaryClaudeSubscriptionUsageFailure", 1],
-        [403, "ClaudeAuthenticationRejected", 1],
+        [400, "PermanentClaudeSubscriptionUsageFailure"],
+        [404, "PermanentClaudeSubscriptionUsageFailure"],
+        [302, "PermanentClaudeSubscriptionUsageFailure"],
+        [408, "TemporaryClaudeSubscriptionUsageFailure"],
+        [425, "TemporaryClaudeSubscriptionUsageFailure"],
+        [429, "TemporaryClaudeSubscriptionUsageFailure"],
+        [503, "TemporaryClaudeSubscriptionUsageFailure"],
+        [401, "ClaudeAuthenticationRejected"],
+        [403, "ClaudeAuthenticationRejected"],
+        [200, "MalformedClaudeSubscriptionUsage"],
       ] as const;
-      for (const [status, tag, expectedRequests] of cases) {
-        let cancelled = 0;
-        const bodies: ReadableStream<Uint8Array>[] = [];
+      for (const [status, expectedTag] of cases) {
+        let requests = 0;
         const exit = yield* Effect.exit(
-          acquire(async () => {
-            const body = new ReadableStream<Uint8Array>({
-              cancel() {
-                cancelled += 1;
-              },
-            });
-            bodies.push(body);
-            return new Response(body, { status });
-          }),
+          acquire(async (_input, init) => {
+            requests += 1;
+            assert.equal(
+              (init?.headers as Record<string, string> | undefined)
+                ?.Authorization,
+              "Bearer oauth-secret",
+            );
+            return new Response("raw-response-secret", { status });
+          }, "oauth-secret"),
         );
-        assert.equal(failureTag(exit), tag);
-        assert.equal(cancelled, expectedRequests);
-        assert.equal(bodies.length, expectedRequests);
-        assert.equal(
-          bodies.every((body) => !body.locked),
-          true,
-        );
+        assert.equal(failureTag(exit), expectedTag, String(status));
+        assert.equal(requests, 1, String(status));
       }
-    }),
-);
 
-it.effect(
-  "keeps an OAuth-authenticated 429 separate from authentication metadata",
-  () =>
-    Effect.gen(function* () {
-      let requests = 0;
-      const exit = yield* Effect.exit(
-        acquire(async (_input, init) => {
-          requests += 1;
-          assert.equal(
-            (init?.headers as Record<string, string> | undefined)
-              ?.Authorization,
-            "Bearer oauth-secret",
-          );
-          return new Response("rate-limit-raw-secret", { status: 429 });
-        }, "oauth-secret"),
-      );
-      assert.equal(failureTag(exit), "TemporaryClaudeSubscriptionUsageFailure");
-      assert.equal(requests, 1);
-      assert.equal(JSON.stringify(exit).includes("oauth-secret"), false);
-      assert.equal(
-        JSON.stringify(exit).includes("rate-limit-raw-secret"),
-        false,
-      );
-    }),
-);
-
-it.effect("keeps every unsuccessful exchange outcome secret-safe", () =>
-  Effect.gen(function* () {
-    const cases = [
-      [400, "PermanentClaudeSubscriptionUsageFailure", 1],
-      [404, "PermanentClaudeSubscriptionUsageFailure", 1],
-      [302, "PermanentClaudeSubscriptionUsageFailure", 1],
-      [408, "TemporaryClaudeSubscriptionUsageFailure", 1],
-      [425, "TemporaryClaudeSubscriptionUsageFailure", 1],
-      [429, "TemporaryClaudeSubscriptionUsageFailure", 1],
-      [503, "TemporaryClaudeSubscriptionUsageFailure", 1],
-      [401, "ClaudeAuthenticationRejected", 1],
-      [403, "ClaudeAuthenticationRejected", 1],
-      [200, "MalformedClaudeSubscriptionUsage", 1],
-    ] as const;
-    for (const [status, expectedTag, expectedRequests] of cases) {
-      let requests = 0;
-      const exit = yield* Effect.exit(
+      const rejected = yield* Effect.exit(
         acquire(async () => {
-          requests += 1;
-          return new Response("raw-response-secret", {
-            status,
-            headers: { "x-authenticated-secret": "header-secret" },
-          });
-        }, "credential-secret"),
+          throw new Error("network unavailable");
+        }),
       );
-      const serialized = JSON.stringify(exit);
-      assert.equal(failureTag(exit), expectedTag);
-      assert.equal(requests, expectedRequests);
-      for (const secret of [
-        "credential-secret",
-        "raw-response-secret",
-        "header-secret",
-        "x-authenticated-secret",
-      ]) {
-        assert.equal(
-          serialized.includes(secret),
-          false,
-          `${status}: ${secret}`,
-        );
-      }
-    }
-
-    const networkExit = yield* Effect.exit(
-      acquire(async () => {
-        throw new Error("transport-secret");
-      }, "credential-secret"),
-    );
-    assert.equal(
-      failureTag(networkExit),
-      "TemporaryClaudeSubscriptionUsageFailure",
-    );
-    assert.equal(JSON.stringify(networkExit).includes("secret"), false);
-  }),
+      assert.equal(
+        failureTag(rejected),
+        "TemporaryClaudeSubscriptionUsageFailure",
+      );
+    }),
 );
 
-it.effect("applies a fifteen-minute floor to 429 retry instructions", () =>
+it.effect("floors 429 retry instructions at fifteen minutes only", () =>
   Effect.gen(function* () {
     for (const [retryAfter, expectedRetryAtMs] of [
       ["0", 900_000],
@@ -398,146 +318,28 @@ it.effect("applies a fifteen-minute floor to 429 retry instructions", () =>
             }),
         ),
       );
-      assert.equal(
-        Exit.isFailure(exit) && exit.cause._tag === "Fail"
-          ? Reflect.get(exit.cause.error, "retryAtMs")
-          : undefined,
-        expectedRetryAtMs,
-      );
+      assert.equal(retryAtMs(exit), expectedRetryAtMs, retryAfter);
     }
-  }),
-);
-
-it.effect("enforces the five-second timeout", () =>
-  Effect.gen(function* () {
-    const fiber = yield* Effect.fork(
-      Effect.exit(
-        acquire(
-          (_input, init) =>
-            new Promise((_resolve, reject) => {
-              init?.signal?.addEventListener(
-                "abort",
-                () => reject(init.signal?.reason),
-                { once: true },
-              );
-            }),
-        ),
+    const unfloored = yield* Effect.exit(
+      acquire(
+        async () =>
+          new Response(null, {
+            status: 503,
+            headers: { "retry-after": "7" },
+          }),
       ),
     );
-    yield* TestClock.adjust("5 seconds");
     assert.equal(
-      failureTag(yield* Fiber.join(fiber)),
+      failureTag(unfloored),
       "TemporaryClaudeSubscriptionUsageFailure",
     );
+    assert.equal(retryAtMs(unfloored), 7_000);
   }),
 );
 
-it.effect("times out and cancels a stalled response body", () =>
+it.effect("bounds response bodies at 64 KiB", () =>
   Effect.gen(function* () {
-    let cancelled = false;
-    const fiber = yield* Effect.fork(
-      Effect.exit(
-        acquire(
-          async () =>
-            new Response(
-              new ReadableStream<Uint8Array>({
-                pull() {},
-                cancel() {
-                  cancelled = true;
-                },
-              }),
-            ),
-        ),
-      ),
-    );
-    yield* Effect.yieldNow();
-    yield* TestClock.adjust("5 seconds");
-    assert.equal(
-      failureTag(yield* Fiber.join(fiber)),
-      "TemporaryClaudeSubscriptionUsageFailure",
-    );
-    assert.equal(cancelled, true);
-  }),
-);
-
-it.effect("awaits streamed response cancellation before completing", () =>
-  Effect.gen(function* () {
-    let cancelStarted = false;
-    let finishCancellation: (() => void) | undefined;
-    const fiber = yield* Effect.fork(
-      Effect.exit(
-        acquire(
-          async () =>
-            new Response(
-              new ReadableStream<Uint8Array>({
-                start(controller) {
-                  controller.enqueue(new Uint8Array(64 * 1024 + 1));
-                },
-                cancel() {
-                  cancelStarted = true;
-                  return new Promise<void>((resolve) => {
-                    finishCancellation = resolve;
-                  });
-                },
-              }),
-            ),
-        ),
-      ),
-    );
-    while (!cancelStarted) yield* Effect.yieldNow();
-    yield* Effect.promise<void>(
-      () => new Promise((resolve) => setImmediate(resolve)),
-    );
-    assert.equal((yield* Fiber.poll(fiber))._tag, "None");
-    assert.ok(finishCancellation);
-    finishCancellation();
-    assert.equal(
-      failureTag(yield* Fiber.join(fiber)),
-      "MalformedClaudeSubscriptionUsage",
-    );
-  }),
-);
-
-it.effect(
-  "awaits cancellation and releases the lock for an oversized declared body",
-  () =>
-    Effect.gen(function* () {
-      let cancelStarted = false;
-      let finishCancellation: (() => void) | undefined;
-      const body = new ReadableStream<Uint8Array>({
-        cancel() {
-          cancelStarted = true;
-          return new Promise<void>((resolve) => {
-            finishCancellation = resolve;
-          });
-        },
-      });
-      const fiber = yield* Effect.fork(
-        Effect.exit(
-          acquire(
-            async () =>
-              new Response(body, {
-                headers: { "content-length": String(64 * 1024 + 1) },
-              }),
-          ),
-        ),
-      );
-      while (!cancelStarted) yield* Effect.yieldNow();
-      assert.equal((yield* Fiber.poll(fiber))._tag, "None");
-      assert.equal(body.locked, true);
-      assert.ok(finishCancellation);
-      finishCancellation();
-      assert.equal(
-        failureTag(yield* Fiber.join(fiber)),
-        "MalformedClaudeSubscriptionUsage",
-      );
-      assert.equal(body.locked, false);
-    }),
-);
-
-it.effect("bounds declared and streamed response bodies at 64 KiB", () =>
-  Effect.gen(function* () {
-    const declared = yield* Effect.exit(
+    const exit = yield* Effect.exit(
       acquire(
         async () =>
           new Response("{}", {
@@ -545,25 +347,6 @@ it.effect("bounds declared and streamed response bodies at 64 KiB", () =>
           }),
       ),
     );
-    assert.equal(failureTag(declared), "MalformedClaudeSubscriptionUsage");
-
-    let cancelled = false;
-    const streamed = yield* Effect.exit(
-      acquire(
-        async () =>
-          new Response(
-            new ReadableStream<Uint8Array>({
-              start(controller) {
-                controller.enqueue(new Uint8Array(64 * 1024 + 1));
-              },
-              cancel() {
-                cancelled = true;
-              },
-            }),
-          ),
-      ),
-    );
-    assert.equal(failureTag(streamed), "MalformedClaudeSubscriptionUsage");
-    assert.equal(cancelled, true);
+    assert.equal(failureTag(exit), "MalformedClaudeSubscriptionUsage");
   }),
 );

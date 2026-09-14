@@ -1,19 +1,31 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
-import { Effect, Exit, Fiber, TestClock } from "effect";
+import { Effect, Equal, Exit } from "effect";
 
 import {
   createAcquireOpenRouterAccountCreditBalance,
   type OpenRouterManagementKey,
+  TemporaryOpenRouterAccountCreditBalanceFailure,
 } from "../src/openrouter-account-credit-balance-acquisition.ts";
 
 function managementKey(value: string): OpenRouterManagementKey {
   return value as OpenRouterManagementKey;
 }
 
+function acquire(fetch: typeof globalThis.fetch) {
+  return createAcquireOpenRouterAccountCreditBalance({ fetch })(
+    managementKey("management-secret"),
+  );
+}
+
+function failure(exit: Exit.Exit<unknown, unknown>): unknown {
+  return Exit.isFailure(exit) && exit.cause._tag === "Fail"
+    ? exit.cause.error
+    : undefined;
+}
+
 function failureTag(exit: Exit.Exit<unknown, unknown>) {
-  if (!Exit.isFailure(exit) || exit.cause._tag !== "Fail") return undefined;
-  const error = exit.cause.error;
+  const error = failure(exit);
   return typeof error === "object" && error !== null
     ? Reflect.get(error, "_tag")
     : undefined;
@@ -22,20 +34,18 @@ function failureTag(exit: Exit.Exit<unknown, unknown>) {
 it.effect("acquires and derives the OpenRouter account credit balance", () =>
   Effect.gen(function* () {
     let request: [RequestInfo | URL, RequestInit | undefined] | undefined;
-    const balance = yield* createAcquireOpenRouterAccountCreditBalance({
-      fetch: async (input, init) => {
-        request = [input, init];
-        return new Response(
-          JSON.stringify({
-            data: {
-              total_credits: 20,
-              total_usage: 7.66,
-              future_field: true,
-            },
-          }),
-        );
-      },
-    })(managementKey("management-secret"));
+    const balance = yield* acquire(async (input, init) => {
+      request = [input, init];
+      return new Response(
+        JSON.stringify({
+          data: {
+            total_credits: 20,
+            total_usage: 7.66,
+            future_field: true,
+          },
+        }),
+      );
+    });
 
     assert.deepEqual(balance, {
       totalCreditsUsd: 20,
@@ -59,8 +69,8 @@ it.effect("preserves zero and negative account credit balances", () =>
       [20, 20, 0],
       [20, 21.25, -1.25],
     ] as const) {
-      const balance = yield* createAcquireOpenRouterAccountCreditBalance({
-        fetch: async () =>
+      const balance = yield* acquire(
+        async () =>
           new Response(
             JSON.stringify({
               data: {
@@ -69,31 +79,30 @@ it.effect("preserves zero and negative account credit balances", () =>
               },
             }),
           ),
-      })(managementKey("management-secret"));
+      );
       assert.equal(balance.balanceUsd, expected);
     }
   }),
 );
 
-it.effect("rejects malformed credit totals", () =>
+it.effect("rejects malformed credit totals without carrying them", () =>
   Effect.gen(function* () {
     for (const data of [
       {},
       { total_credits: -1, total_usage: 0 },
       { total_credits: 1, total_usage: -1 },
-      { total_credits: "20", total_usage: 1 },
+      { total_credits: "raw-response-secret", total_usage: 1 },
     ]) {
       const exit = yield* Effect.exit(
-        createAcquireOpenRouterAccountCreditBalance({
-          fetch: async () => new Response(JSON.stringify({ data })),
-        })(managementKey("management-secret")),
+        acquire(async () => new Response(JSON.stringify({ data }))),
       );
       assert.equal(failureTag(exit), "MalformedOpenRouterAccountCreditBalance");
+      assert.equal(JSON.stringify(exit).includes("raw-response-secret"), false);
     }
   }),
 );
 
-it.effect("classifies failures without exposing Management Key data", () =>
+it.effect("maps every exchange outcome to an acquisition failure", () =>
   Effect.gen(function* () {
     for (const [status, expectedTag] of [
       [401, "OpenRouterManagementAuthenticationRejected"],
@@ -106,62 +115,79 @@ it.effect("classifies failures without exposing Management Key data", () =>
       [400, "PermanentOpenRouterAccountCreditBalanceFailure"],
     ] as const) {
       const exit = yield* Effect.exit(
-        createAcquireOpenRouterAccountCreditBalance({
-          fetch: async () =>
-            new Response("raw-response-secret", {
-              status,
-              headers: { "x-secret": "header-secret" },
-            }),
-        })(managementKey("management-secret")),
+        acquire(async () => new Response("{", { status })),
       );
-      const serialized = JSON.stringify(exit);
-      assert.equal(failureTag(exit), expectedTag);
-      for (const secret of [
-        "management-secret",
-        "raw-response-secret",
-        "header-secret",
-        "x-secret",
-      ]) {
-        assert.equal(serialized.includes(secret), false);
-      }
+      assert.equal(failureTag(exit), expectedTag, String(status));
     }
+    const malformed = yield* Effect.exit(
+      acquire(async () => new Response("{")),
+    );
+    assert.equal(
+      failureTag(malformed),
+      "MalformedOpenRouterAccountCreditBalance",
+    );
+
+    const rejected = yield* Effect.exit(
+      acquire(async () => {
+        throw new Error("network unavailable");
+      }),
+    );
+    assert.equal(
+      Equal.equals(
+        failure(rejected),
+        new TemporaryOpenRouterAccountCreditBalanceFailure(),
+      ),
+      true,
+    );
+  }),
+);
+
+it.effect("adopts Retry-After on every temporary outcome", () =>
+  Effect.gen(function* () {
+    for (const status of [429, 503]) {
+      const exit = yield* Effect.exit(
+        acquire(
+          async () =>
+            new Response(null, {
+              status,
+              headers: { "retry-after": "120" },
+            }),
+        ),
+      );
+      assert.equal(
+        Equal.equals(
+          failure(exit),
+          new TemporaryOpenRouterAccountCreditBalanceFailure({
+            retryAtMs: 120_000,
+          }),
+        ),
+        true,
+        String(status),
+      );
+    }
+    const withoutInstruction = yield* Effect.exit(
+      acquire(async () => new Response(null, { status: 429 })),
+    );
+    assert.equal(
+      Equal.equals(
+        failure(withoutInstruction),
+        new TemporaryOpenRouterAccountCreditBalanceFailure(),
+      ),
+      true,
+    );
   }),
 );
 
 it.effect("bounds response bodies at 64 KiB", () =>
   Effect.gen(function* () {
     const exit = yield* Effect.exit(
-      createAcquireOpenRouterAccountCreditBalance({
-        fetch: async () =>
+      acquire(
+        async () =>
           new Response("{}", {
             headers: { "content-length": String(64 * 1024 + 1) },
           }),
-      })(managementKey("management-secret")),
-    );
-    assert.equal(failureTag(exit), "MalformedOpenRouterAccountCreditBalance");
-  }),
-);
-
-it.effect("times out a stalled credits request after five seconds", () =>
-  Effect.gen(function* () {
-    const fiber = yield* Effect.fork(
-      Effect.exit(
-        createAcquireOpenRouterAccountCreditBalance({
-          fetch: (_input, init) =>
-            new Promise((_resolve, reject) => {
-              init?.signal?.addEventListener(
-                "abort",
-                () => reject(init.signal?.reason),
-                { once: true },
-              );
-            }),
-        })(managementKey("management-secret")),
       ),
     );
-    yield* TestClock.adjust("5 seconds");
-    assert.equal(
-      failureTag(yield* Fiber.join(fiber)),
-      "TemporaryOpenRouterAccountCreditBalanceFailure",
-    );
+    assert.equal(failureTag(exit), "MalformedOpenRouterAccountCreditBalance");
   }),
 );

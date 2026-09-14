@@ -60,6 +60,10 @@ _Avoid_: Header usage, passive quota update
 Weekly quota usage acquisition performed through an explicit provider quota request rather than information accompanying normal provider activity.
 _Avoid_: Active observation, quota fetch
 
+**Provider JSON exchange**:
+A single direct JSON request-response interaction with a provider made within capacity acquisition. It excludes credential resolution, cross-process acquisition coordination, and interpretation into provider capacity.
+_Avoid_: Provider acquisition, coordinated acquisition
+
 **Weekly quota observation reconciliation**:
 The process of combining dedicated and passive observations into coherent weekly quota usage while preserving or discarding incomplete observation evidence as account and acquisition outcomes require.
 _Avoid_: Usage merging, observation cache
