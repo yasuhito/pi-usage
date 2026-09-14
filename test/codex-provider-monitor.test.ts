@@ -236,6 +236,31 @@ it.scoped(
     }),
 );
 
+it.scoped(
+  "reacquires once when passive evidence outranks the initial acquisition",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const acquisitionGate = yield* Deferred.make<void>();
+      f.setAcquisition(
+        Deferred.await(acquisitionGate).pipe(Effect.as(goodUsage)),
+      );
+      const started = yield* Effect.fork(f.monitor.start);
+      while (f.reads() < 1) yield* Effect.yieldNow();
+
+      yield* f.monitor.observeResponse({
+        "x-codex-primary-used-percent": "50",
+      });
+      yield* Deferred.succeed(acquisitionGate, undefined);
+      yield* Fiber.join(started);
+
+      assert.equal(f.reads(), 2);
+      assert.equal(f.statuses.at(-1)?.kind, "available");
+      yield* TestClock.adjust("59 seconds");
+      assert.equal(f.reads(), 2);
+    }),
+);
+
 it.scoped("isolates passive evidence from a silently changed account", () =>
   Effect.gen(function* () {
     const f = yield* fixture();

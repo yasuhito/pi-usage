@@ -16,6 +16,15 @@ function provenanceFor(
   return { credentialEpoch, sequence };
 }
 
+function createReconciliation() {
+  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  reconciliation.advance(
+    { kind: "account-selection-invalidated", credentialEpoch: 1 },
+    NOW,
+  );
+  return reconciliation;
+}
+
 function observeDedicated(
   reconciliation: ReturnType<typeof createWeeklyQuotaObservationReconciliation>,
   nowMs = NOW,
@@ -68,7 +77,7 @@ function usageState(
 }
 
 test("records weekly quota usage from dedicated acquisition", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
 
   const reaction = observeDedicated(reconciliation);
 
@@ -81,7 +90,7 @@ test("records weekly quota usage from dedicated acquisition", () => {
 });
 
 test("preserves dedicated limit reset credits across passive observation", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   const dedicated = observeDedicated(reconciliation, NOW, {
     usedPercent: 63,
     resetsAtMs: 4_000_000,
@@ -111,7 +120,7 @@ test("preserves dedicated limit reset credits across passive observation", () =>
 });
 
 test("malformed dedicated evidence clears all observation evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
   });
@@ -134,7 +143,7 @@ test("malformed dedicated evidence clears all observation evidence", () => {
 });
 
 test("observes a weekly window from mixed-case passive evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
 
   const reaction = observePassive(reconciliation, {
     "X-Codex-Secondary-Used-Percent": "72.5",
@@ -147,7 +156,7 @@ test("observes a weekly window from mixed-case passive evidence", () => {
 });
 
 test("accumulates sparse passive evidence in call order", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
 
   const incomplete = observePassive(reconciliation, {
     "x-codex-secondary-window-minutes": "10080",
@@ -162,7 +171,7 @@ test("accumulates sparse passive evidence in call order", () => {
 });
 
 test("a dedicated observation becomes a same-position passive baseline", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
 
   const reaction = observePassive(reconciliation, {
@@ -173,7 +182,7 @@ test("a dedicated observation becomes a same-position passive baseline", () => {
 });
 
 test("unrecognized passive evidence recommends acquisition only for old usage", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
 
   assert.equal(
@@ -189,7 +198,7 @@ test("unrecognized passive evidence recommends acquisition only for old usage", 
 });
 
 test("activity uses observation age to recommend dedicated acquisition", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
 
   assert.equal(
     reconciliation.advance({ kind: "activity" }, NOW).acquireDedicated,
@@ -207,7 +216,7 @@ test("activity uses observation age to recommend dedicated acquisition", () => {
 });
 
 test("treats inaccessible passive evidence as malformed", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
   const fields = new Proxy(
     {},
@@ -225,7 +234,7 @@ test("treats inaccessible passive evidence as malformed", () => {
 });
 
 test("malformed passive evidence discards the baseline and sparse evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
@@ -245,7 +254,7 @@ test("malformed passive evidence discards the baseline and sparse evidence", () 
 });
 
 test("primary wins when both positions contain weekly observations", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
 
   const reaction = observePassive(reconciliation, {
     "x-codex-primary-used-percent": "25",
@@ -260,7 +269,7 @@ test("primary wins when both positions contain weekly observations", () => {
 });
 
 test("skips a complete non-weekly position", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
 
   const reaction = observePassive(reconciliation, {
     "x-codex-primary-used-percent": "25",
@@ -275,7 +284,7 @@ test("skips a complete non-weekly position", () => {
 });
 
 test("a dedicated observation replaces sparse passive evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
   });
@@ -290,8 +299,80 @@ test("a dedicated observation replaces sparse passive evidence", () => {
   assert.equal(reaction.publication, "preserve");
 });
 
-test("obsolete dedicated evidence leaves newer sparse passive evidence intact", () => {
+test("rejects evidence until account selection establishes an epoch", () => {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
+
+  const early = reconciliation.advance(
+    {
+      kind: "dedicated-weekly-quota-acquisition",
+      result: {
+        kind: "acquired",
+        usage: {
+          usedPercent: 63,
+          resetsAtMs: 4_000_000,
+          windowPosition: "secondary",
+        },
+      },
+      provenance: { credentialEpoch: 1, sequence: 1 },
+    },
+    NOW,
+  );
+
+  assert.deepEqual(early.observation, { kind: "none" });
+  assert.equal(early.publication, "preserve");
+});
+
+test("obsolete dedicated evidence requests acquisition only while usage is unknown", () => {
+  const reconciliation = createReconciliation();
+  reconciliation.advance(
+    {
+      kind: "passive-weekly-quota-observation",
+      fields: { "x-codex-primary-window-minutes": "10080" },
+      provenance: { credentialEpoch: 1, sequence: 2 },
+    },
+    NOW + 1,
+  );
+  const usage = {
+    usedPercent: 63,
+    resetsAtMs: 4_000_000,
+    windowPosition: "secondary",
+  } as const;
+
+  const withoutUsage = reconciliation.advance(
+    {
+      kind: "dedicated-weekly-quota-acquisition",
+      result: { kind: "acquired", usage },
+      provenance: { credentialEpoch: 1, sequence: 1 },
+    },
+    NOW + 2,
+  );
+  reconciliation.advance(
+    {
+      kind: "passive-weekly-quota-observation",
+      fields: {
+        "x-codex-primary-used-percent": "74",
+        "x-codex-primary-reset-at": "4000",
+      },
+      provenance: { credentialEpoch: 1, sequence: 4 },
+    },
+    NOW + 3,
+  );
+  const withUsage = reconciliation.advance(
+    {
+      kind: "dedicated-weekly-quota-acquisition",
+      result: { kind: "acquired", usage },
+      provenance: { credentialEpoch: 1, sequence: 3 },
+    },
+    NOW + 4,
+  );
+
+  assert.equal(withoutUsage.acquireDedicated, true);
+  assert.equal(withUsage.acquireDedicated, false);
+  assert.deepEqual(withUsage.observation, usageState(74, "fresh", "primary"));
+});
+
+test("obsolete dedicated evidence leaves newer sparse passive evidence intact", () => {
+  const reconciliation = createReconciliation();
   reconciliation.advance(
     {
       kind: "passive-weekly-quota-observation",
@@ -332,7 +413,7 @@ test("obsolete dedicated evidence leaves newer sparse passive evidence intact", 
 });
 
 test("temporary acquisition failure publishes stale capacity and its deadline", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
 
   const reaction = reconciliation.advance(
@@ -350,7 +431,7 @@ test("temporary acquisition failure publishes stale capacity and its deadline", 
 });
 
 test("deferred acquisition also makes retained usage stale", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
 
   const reaction = reconciliation.advance(
@@ -362,7 +443,7 @@ test("deferred acquisition also makes retained usage stale", () => {
 });
 
 test("stale capacity expires while sparse passive evidence survives", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
@@ -405,7 +486,7 @@ for (const result of [
   { kind: "permanently-unavailable" } as const,
 ]) {
   test(`${result.kind} clears usage but preserves sparse evidence`, () => {
-    const reconciliation = createWeeklyQuotaObservationReconciliation();
+    const reconciliation = createReconciliation();
     observeDedicated(reconciliation);
     observePassive(reconciliation, {
       "x-codex-primary-window-minutes": "10080",
@@ -429,7 +510,7 @@ for (const result of [
 }
 
 test("account selection invalidation publishes usage removal and discards sparse evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
   observePassive(reconciliation, {
     "x-codex-primary-window-minutes": "10080",
@@ -455,7 +536,7 @@ test("account selection invalidation publishes usage removal and discards sparse
 });
 
 test("ignores delayed evidence from a previous credential epoch", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
   reconciliation.advance(
     { kind: "account-selection-invalidated", credentialEpoch: 2 },
@@ -483,7 +564,7 @@ test("ignores delayed evidence from a previous credential epoch", () => {
 });
 
 test("non-finite time throws before changing observation evidence", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation);
 
   assert.throws(
@@ -501,7 +582,7 @@ test("non-finite time throws before changing observation evidence", () => {
 });
 
 test("clock rollback is evaluated without rejection", () => {
-  const reconciliation = createWeeklyQuotaObservationReconciliation();
+  const reconciliation = createReconciliation();
   observeDedicated(reconciliation, NOW);
 
   assert.doesNotThrow(() =>

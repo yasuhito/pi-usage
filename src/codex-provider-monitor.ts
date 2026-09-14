@@ -181,7 +181,11 @@ function makeCodexProviderMonitorAdapter(
             );
             return factsFromReconciliation(
               reaction,
-              result.kind === "acquired" ? "adequate" : undefined,
+              reaction.acquireDedicated
+                ? "inadequate"
+                : result.kind === "acquired"
+                  ? "adequate"
+                  : undefined,
               healthFromResult(result),
             );
           }

@@ -246,10 +246,8 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
     return reaction(result);
   };
   const acceptEvidence = (provenance: ProviderEvidenceProvenance): boolean => {
-    if (credentialEpoch === undefined) {
-      credentialEpoch = provenance.credentialEpoch;
-    }
     if (
+      credentialEpoch === undefined ||
       provenance.credentialEpoch !== credentialEpoch ||
       (latestEvidenceSequence !== undefined &&
         provenance.sequence <= latestEvidenceSequence)
@@ -315,7 +313,9 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         }
 
         case "dedicated-weekly-quota-acquisition": {
-          if (!acceptEvidence(event.provenance)) return reaction();
+          if (!acceptEvidence(event.provenance)) {
+            return reaction(undefined, shouldAcquireDedicated(nowMs));
+          }
           const { result } = event;
           if (result.kind === "acquired") {
             return reaction(recordUsage(result.usage, nowMs));
