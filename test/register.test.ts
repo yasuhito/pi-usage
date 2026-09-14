@@ -3,39 +3,94 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
+import { Effect, Layer } from "effect";
 import { test } from "vitest";
 
+import { defineMonitoredProvider } from "../src/monitored-provider-capacity-session.ts";
+import type {
+  ProviderCapacityPresentation,
+  WeeklySubscriptionProviderName,
+  WeeklySubscriptionUsageStatus,
+} from "../src/presentation.ts";
+import { ProviderMonitorService } from "../src/provider-monitor.ts";
 import {
-  type AcquiredClaudeSubscriptionUsage,
-  ClaudeAcquisitionCoordinationUnavailable,
-  PermanentClaudeSubscriptionUsageFailure,
-} from "../src/claude-subscription-usage-acquisition.ts";
-import type {
-  AcquiredWeeklyQuotaUsage,
-  CodexCredential,
-  DedicatedWeeklyQuotaAcquisitionError,
-} from "../src/dedicated-weekly-quota-acquisition.ts";
-import type {
-  AcquiredOpenRouterAccountCreditBalance,
-  OpenRouterAccountCreditBalanceAcquisitionError,
-} from "../src/openrouter-account-credit-balance-acquisition.ts";
-import type { OpenRouterManagementKey } from "../src/openrouter-management-key-resolution.ts";
-import { registerMonitoredProviderCapacity } from "../src/register.ts";
-
-function accessTokenFor(accountId: string): string {
-  const payload = Buffer.from(
-    JSON.stringify({
-      "https://api.openai.com/auth": { chatgpt_account_id: accountId },
-    }),
-  ).toString("base64url");
-  return `header.${payload}.signature`;
-}
+  type MonitoredProviderRegistrationFactory,
+  registerMonitoredProviderCapacity,
+} from "../src/register.ts";
 
 type ExtensionHandler = (
   event: { readonly headers?: Readonly<Record<string, unknown>> },
   ctx: ExtensionContext,
 ) => void | Promise<void>;
+
+interface ProviderProbe {
+  readonly starts: number;
+  readonly responses: ReadonlyArray<Readonly<Record<string, unknown>>>;
+  readonly activityRefreshes: number;
+  readonly accountRefreshes: number;
+  readonly finalizations: number;
+}
+
+function providerFactory(
+  piProviderId: string,
+  providerName: WeeklySubscriptionProviderName,
+  usedPercent: number,
+  probes: Map<string, ProviderProbe>,
+): MonitoredProviderRegistrationFactory {
+  return () => {
+    const providerProbeState = {
+      starts: 0,
+      responses: [] as Array<Readonly<Record<string, unknown>>>,
+      activityRefreshes: 0,
+      accountRefreshes: 0,
+      finalizations: 0,
+    };
+    probes.set(piProviderId, providerProbeState);
+    return defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
+      piProviderId,
+      makeLayer: (publish) =>
+        Layer.scoped(
+          ProviderMonitorService,
+          Effect.acquireRelease(
+            Effect.succeed({
+              start: Effect.sync(() => {
+                providerProbeState.starts += 1;
+              }).pipe(
+                Effect.andThen(
+                  publish({ kind: "available", usedPercent, stale: false }),
+                ),
+              ),
+              observeResponse: (headers) =>
+                Effect.sync(() => {
+                  providerProbeState.responses.push(headers);
+                }),
+              refreshAfterActivity: Effect.sync(() => {
+                providerProbeState.activityRefreshes += 1;
+              }),
+              refreshForAccountChange: Effect.sync(() => {
+                providerProbeState.accountRefreshes += 1;
+              }),
+            }),
+            () =>
+              Effect.sync(() => {
+                providerProbeState.finalizations += 1;
+              }),
+          ),
+        ),
+      present: (status): ProviderCapacityPresentation => ({
+        providerName,
+        detail:
+          status.kind === "available"
+            ? `${Math.round(status.usedPercent)}%`
+            : status.kind,
+        color:
+          status.kind === "available" && status.usedPercent >= 75
+            ? "warning"
+            : "dim",
+      }),
+    });
+  };
+}
 
 function registerFixture() {
   const handlers = new Map<string, ExtensionHandler[]>();
@@ -44,67 +99,18 @@ function registerFixture() {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
   } as unknown as ExtensionAPI;
-  const observedCredentials: CodexCredential[] = [];
-  const observedClaudeCredentials: string[] = [];
-  const observedOpenRouterCredentials: string[] = [];
-  const providerAuthRequests: string[] = [];
+  const probes = new Map<string, ProviderProbe>();
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   let mode: ExtensionContext["mode"] = "tui";
-  let provider = "openai-codex";
-  let authEnabled = true;
-  let openRouterManagementKey: OpenRouterManagementKey | undefined =
-    "management-key" as OpenRouterManagementKey;
-  let accountId = "account-1";
-  let authWait: Promise<void> | undefined;
+  let provider = "provider-a";
   let showThemeColors = false;
-  let now: Effect.Effect<number> = Effect.succeed(1_000_000);
-  let acquisition: Effect.Effect<
-    AcquiredWeeklyQuotaUsage,
-    DedicatedWeeklyQuotaAcquisitionError
-  > = Effect.succeed({
-    usedPercent: 63.4,
-    resetsAtMs: 2_000_000,
-    windowPosition: "secondary",
-    availableLimitResetCredits: 2,
-  });
-  let claudeReads = 0;
-  let openRouterReads = 0;
-  let claudeAcquisition: Effect.Effect<
-    AcquiredClaudeSubscriptionUsage,
-    | ClaudeAcquisitionCoordinationUnavailable
-    | PermanentClaudeSubscriptionUsageFailure
-  > = Effect.succeed({
-    usedPercent: 80,
-    resetsAtMs: 2_000_000,
-  });
-  let openRouterAcquisition: Effect.Effect<
-    AcquiredOpenRouterAccountCreditBalance,
-    OpenRouterAccountCreditBalanceAcquisitionError
-  > = Effect.succeed({
-    totalCreditsUsd: 20,
-    totalUsageUsd: 7.66,
-    balanceUsd: 12.34,
-  });
 
   registerMonitoredProviderCapacity(pi, {
-    now: Effect.suspend(() => now),
-    random: Effect.succeed(0.5),
-    acquireDedicatedWeeklyQuotaUsage: (credential) => {
-      observedCredentials.push(credential);
-      return acquisition;
-    },
-    acquireClaudeSubscriptionUsage: () => (credential) => {
-      claudeReads += 1;
-      observedClaudeCredentials.push(credential);
-      return claudeAcquisition;
-    },
-    resolveOpenRouterManagementKey: () =>
-      Effect.sync(() => openRouterManagementKey),
-    acquireOpenRouterAccountCreditBalance: (credential) => {
-      openRouterReads += 1;
-      observedOpenRouterCredentials.push(credential);
-      return openRouterAcquisition;
-    },
+    now: Effect.succeed(1_000_000),
+    providers: [
+      providerFactory("provider-a", "Codex", 63, probes),
+      providerFactory("provider-b", "Claude", 80, probes),
+    ],
   });
 
   const ctx = {
@@ -113,18 +119,6 @@ function registerFixture() {
     },
     get model() {
       return { provider };
-    },
-    modelRegistry: {
-      getProviderAuth: async (providerName: string) => {
-        await authWait;
-        providerAuthRequests.push(providerName);
-        return providerName !== "openai-codex" || authEnabled
-          ? {
-              auth: { apiKey: accessTokenFor(accountId) },
-              source: "OAuth" as const,
-            }
-          : undefined;
-      },
     },
     ui: {
       theme: {
@@ -136,20 +130,16 @@ function registerFixture() {
     },
   } as unknown as ExtensionContext;
   const emit = async (event: string, payload: unknown = {}) => {
-    for (const handler of handlers.get(event) ?? [])
+    for (const handler of handlers.get(event) ?? []) {
       await handler(
         payload as { readonly headers?: Readonly<Record<string, unknown>> },
         ctx,
       );
+    }
   };
   return {
     emit,
-    observedCredentials,
-    observedClaudeCredentials,
-    observedOpenRouterCredentials,
-    providerAuthRequests,
-    claudeReads: () => claudeReads,
-    openRouterReads: () => openRouterReads,
+    probes,
     statuses,
     setMode: (value: ExtensionContext["mode"]) => {
       mode = value;
@@ -157,216 +147,70 @@ function registerFixture() {
     setProvider: (value: string) => {
       provider = value;
     },
-    setAuthEnabled: (value: boolean) => {
-      authEnabled = value;
-    },
-    setOpenRouterManagementKeyEnabled: (value: boolean) => {
-      openRouterManagementKey = value
-        ? ("management-key" as OpenRouterManagementKey)
-        : undefined;
-    },
-    setAccountId: (value: string) => {
-      accountId = value;
-    },
-    setAuthWait: (value: Promise<void> | undefined) => {
-      authWait = value;
-    },
     setShowThemeColors: (value: boolean) => {
       showThemeColors = value;
-    },
-    setNow: (value: Effect.Effect<number>) => {
-      now = value;
-    },
-    setAcquisition: (value: typeof acquisition) => {
-      acquisition = value;
-    },
-    setClaudeAcquisition: (value: typeof claudeAcquisition) => {
-      claudeAcquisition = value;
-    },
-    setOpenRouterAcquisition: (value: typeof openRouterAcquisition) => {
-      openRouterAcquisition = value;
     },
   };
 }
 
-test("session start adapts Pi authentication and quota presentation", async () => {
+test("renders provider-independent registrations in roster order", async () => {
   const f = registerFixture();
+  f.setShowThemeColors(true);
+
   await f.emit("session_start");
-  assert.deepEqual(f.observedCredentials, [
-    { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
-  ]);
-  assert.deepEqual(f.observedClaudeCredentials, [accessTokenFor("account-1")]);
-  assert.deepEqual(f.observedOpenRouterCredentials, ["management-key"]);
-  assert.equal(f.providerAuthRequests.includes("openrouter"), false);
-  assert.deepEqual(f.statuses.at(-1), {
-    key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
-  });
+
+  assert.equal(
+    f.statuses.at(-1)?.text,
+    "[accent:Codex] [dim:63%] [accent:Claude] [warning:80%]",
+  );
+  assert.equal(f.probes.get("provider-a")?.starts, 1);
+  assert.equal(f.probes.get("provider-b")?.starts, 1);
   await f.emit("session_shutdown");
 });
 
-test("missing Codex authentication remains unavailable without delaying Claude", async () => {
+test("routes response and activity events by Pi provider id", async () => {
   const f = registerFixture();
-  f.setAuthEnabled(false);
-  await f.emit("session_start");
-  assert.deepEqual(f.statuses.at(-1), {
-    key: "pi-usage",
-    text: "Codex wk unavailable Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
-  });
-  assert.equal(f.observedCredentials.length, 0);
-  await f.emit("session_shutdown");
-});
-
-test("missing OpenRouter Management Key remains visibly unavailable", async () => {
-  const f = registerFixture();
-  f.setOpenRouterManagementKeyEnabled(false);
-
   await f.emit("session_start");
 
-  assert.equal(f.openRouterReads(), 0);
-  assert.deepEqual(f.statuses.at(-1), {
-    key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter unavailable",
-  });
-  await f.emit("session_shutdown");
-});
-
-test("direct Codex activity refreshes Codex without refreshing Claude", async () => {
-  const f = registerFixture();
-  f.setAuthEnabled(false);
-  await f.emit("session_start");
-  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [0, 1]);
-  f.setAuthEnabled(true);
+  await f.emit("after_provider_response", { headers: { observed: true } });
   await f.emit("agent_settled");
-  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+
+  assert.deepEqual(f.probes.get("provider-a")?.responses, [{ observed: true }]);
+  assert.equal(f.probes.get("provider-a")?.activityRefreshes, 1);
+  assert.deepEqual(f.probes.get("provider-b")?.responses, []);
+  assert.equal(f.probes.get("provider-b")?.activityRefreshes, 0);
   await f.emit("session_shutdown");
 });
 
-test("provider names and independently colored details compose without a separator", async () => {
+test("refreshes every registration after model selection", async () => {
   const f = registerFixture();
-  f.setShowThemeColors(true);
   await f.emit("session_start");
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [warning:wk ━━━━━━━━── 80% 16m] [accent:OpenRouter] [dim:$12.34 left]",
-  );
-  await f.emit("session_shutdown");
-});
 
-test("a failed provider remains independently presentable", async () => {
-  const f = registerFixture();
-  f.setClaudeAcquisition(
-    Effect.fail(new PermanentClaudeSubscriptionUsageFailure()),
-  );
-  await f.emit("session_start");
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk unavailable OpenRouter $12.34 left",
-  );
-  await f.emit("session_shutdown");
-});
-
-test("a provider defect does not reorder or recolor the other provider", async () => {
-  const f = registerFixture();
-  f.setShowThemeColors(true);
-  f.setClaudeAcquisition(Effect.die("Claude acquisition defect"));
-  await f.emit("session_start");
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [dim:wk unavailable] [accent:OpenRouter] [dim:$12.34 left]",
-  );
-  await f.emit("session_shutdown");
-});
-
-test("non-TUI sessions remain inactive for every Pi lifecycle event", async () => {
-  const f = registerFixture();
-  f.setMode("rpc");
-  await f.emit("session_start");
   await f.emit("model_select");
-  await f.emit("agent_settled");
-  await f.emit("after_provider_response", {
-    headers: {
-      "x-codex-primary-used-percent": "20",
-      "x-codex-primary-window-minutes": "10080",
-      "x-codex-primary-reset-at": "2000",
-    },
-  });
+
+  assert.equal(f.probes.get("provider-a")?.accountRefreshes, 1);
+  assert.equal(f.probes.get("provider-b")?.accountRefreshes, 1);
   await f.emit("session_shutdown");
-  assert.equal(f.observedCredentials.length, 0);
-  assert.equal(f.claudeReads(), 0);
-  assert.equal(f.statuses.length, 0);
 });
 
-test("a non-TUI session start closes the previous TUI session", async () => {
+test("keeps non-TUI sessions inactive and closes a preceding TUI session", async () => {
   const f = registerFixture();
   await f.emit("session_start");
-  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+  const initialProviderAProbe = f.probes.get("provider-a");
+  const initialProviderBProbe = f.probes.get("provider-b");
 
   f.setMode("rpc");
   await f.emit("session_start");
-  f.setMode("tui");
+  f.setProvider("provider-b");
+  await f.emit("after_provider_response", { headers: { ignored: true } });
+  await f.emit("agent_settled");
   await f.emit("model_select");
 
-  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
-  await f.emit("session_shutdown");
-});
-
-test("model selection refreshes all monitored providers", async () => {
-  const f = registerFixture();
-  await f.emit("session_start");
-  assert.deepEqual(
-    [f.observedCredentials.length, f.claudeReads(), f.openRouterReads()],
-    [1, 1, 1],
-  );
-
-  await f.emit("model_select");
-
-  assert.deepEqual(
-    [f.observedCredentials.length, f.claudeReads(), f.openRouterReads()],
-    [2, 2, 2],
-  );
-  await f.emit("session_shutdown");
-});
-
-test("activity refreshes only the direct provider that handled it", async () => {
-  const f = registerFixture();
-  f.setClaudeAcquisition(
-    Effect.fail(new ClaudeAcquisitionCoordinationUnavailable()),
-  );
-  await f.emit("session_start");
-  assert.equal(f.observedCredentials.length, 1);
-  assert.equal(f.claudeReads(), 1);
-
-  f.setClaudeAcquisition(
-    Effect.succeed({
-      usedPercent: 20,
-      resetsAtMs: 2_000_000,
-    }),
-  );
-  f.setProvider("anthropic");
-  await f.emit("agent_settled");
-  assert.equal(f.observedCredentials.length, 1);
-  assert.equal(f.claudeReads(), 2);
-
-  assert.equal(f.openRouterReads(), 1);
-  f.setProvider("openrouter");
-  await f.emit("agent_settled");
-  assert.equal(f.observedCredentials.length, 1);
-  assert.equal(f.claudeReads(), 2);
-  assert.equal(f.openRouterReads(), 2);
-  await f.emit("session_shutdown");
-});
-
-test("responses from another provider are ignored", async () => {
-  const f = registerFixture();
-  await f.emit("session_start");
-  f.setProvider("anthropic");
-  await f.emit("after_provider_response", {
-    headers: { "x-codex-secondary-used-percent": "99" },
-  });
-  assert.equal(
-    f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
-  );
+  assert.equal(initialProviderAProbe?.finalizations, 1);
+  assert.equal(initialProviderBProbe?.finalizations, 1);
+  assert.deepEqual(initialProviderBProbe?.responses, []);
+  assert.equal(initialProviderBProbe?.activityRefreshes, 0);
+  assert.equal(initialProviderBProbe?.accountRefreshes, 0);
+  assert.equal(f.statuses.length > 0, true);
   await f.emit("session_shutdown");
 });

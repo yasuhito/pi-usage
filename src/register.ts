@@ -3,114 +3,21 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
-import { claudeProviderMonitorLayer } from "./claude-provider-monitor.ts";
-import type { AcquireClaudeSubscriptionUsage } from "./claude-subscription-usage-acquisition.ts";
+
 import {
-  type CodexCredentialResolution,
-  codexProviderMonitorLayer,
-} from "./codex-provider-monitor.ts";
-import type {
-  AcquireDedicatedWeeklyQuotaUsage,
-  CodexCredential,
-} from "./dedicated-weekly-quota-acquisition.ts";
-import {
-  defineMonitoredProvider,
+  type MonitoredProviderRegistration,
   makeMonitoredProviderCapacitySession,
 } from "./monitored-provider-capacity-session.ts";
-import type { AcquireOpenRouterAccountCreditBalance } from "./openrouter-account-credit-balance-acquisition.ts";
-import type { ResolveOpenRouterManagementKey } from "./openrouter-management-key-resolution.ts";
-import { openRouterProviderMonitorLayer } from "./openrouter-provider-monitor.ts";
-import {
-  type OpenRouterAccountCreditBalanceStatus,
-  presentOpenRouterAccountCreditBalance,
-  presentProviderSubscriptionUsage,
-  type WeeklySubscriptionUsageStatus,
-} from "./presentation.ts";
 
 const STATUS_KEY = "pi-usage";
 
-export interface MonitoredProviderCapacityDependencies {
-  readonly acquireDedicatedWeeklyQuotaUsage: AcquireDedicatedWeeklyQuotaUsage;
-  readonly acquireClaudeSubscriptionUsage: (
-    ctx: ExtensionContext,
-  ) => AcquireClaudeSubscriptionUsage;
-  readonly resolveOpenRouterManagementKey: ResolveOpenRouterManagementKey;
-  readonly acquireOpenRouterAccountCreditBalance: AcquireOpenRouterAccountCreditBalance;
-  readonly now?: Effect.Effect<number>;
-  readonly random?: Effect.Effect<number>;
-}
-
-function accountIdFromAccessToken(accessToken: string): string | undefined {
-  const payload = accessToken.split(".")[1];
-  if (payload === undefined) return undefined;
-  try {
-    const claims: unknown = JSON.parse(
-      Buffer.from(payload, "base64url").toString("utf8"),
-    );
-    const openAiAuth =
-      typeof claims === "object" && claims !== null
-        ? Reflect.get(claims, "https://api.openai.com/auth")
-        : undefined;
-    const accountId =
-      typeof openAiAuth === "object" && openAiAuth !== null
-        ? Reflect.get(openAiAuth, "chatgpt_account_id")
-        : undefined;
-    return typeof accountId === "string" && accountId.trim() !== ""
-      ? accountId
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function credentialFromContext(
-  auth: Awaited<
-    ReturnType<ExtensionContext["modelRegistry"]["getProviderAuth"]>
-  >,
-): CodexCredential | undefined {
-  const accessToken = auth?.auth.apiKey;
-  const headers = auth?.auth.headers;
-  const accountIdEntry = headers
-    ? Object.entries(headers).find(
-        ([name]) => name.toLowerCase() === "chatgpt-account-id",
-      )
-    : undefined;
-  if (typeof accessToken !== "string" || accessToken.trim() === "")
-    return undefined;
-  const headerAccountId = accountIdEntry?.[1];
-  const accountId =
-    typeof headerAccountId === "string" && headerAccountId.trim() !== ""
-      ? headerAccountId
-      : accountIdFromAccessToken(accessToken);
-  return accountId === undefined ? undefined : { accessToken, accountId };
-}
-
-interface PiApiKeyAuthentication {
-  readonly source?: string;
-  readonly auth: { readonly apiKey?: string };
-}
-
-function authenticationResolution(
+export type MonitoredProviderRegistrationFactory = (
   ctx: ExtensionContext,
-  piProviderId: string,
-): () => Effect.Effect<PiApiKeyAuthentication | undefined, unknown> {
-  return () =>
-    Effect.tryPromise(() => ctx.modelRegistry.getProviderAuth(piProviderId));
-}
+) => MonitoredProviderRegistration;
 
-function credentialResolution(ctx: ExtensionContext) {
-  return Effect.tryPromise(() =>
-    ctx.modelRegistry.getProviderAuth("openai-codex"),
-  ).pipe(
-    Effect.map((auth): CodexCredentialResolution => {
-      if (auth === undefined) return { kind: "missing" };
-      const credential = credentialFromContext(auth);
-      return credential === undefined
-        ? { kind: "invalid" }
-        : { kind: "available", credential };
-    }),
-    Effect.catchAll(() => Effect.succeed({ kind: "invalid" } as const)),
-  );
+export interface MonitoredProviderCapacityDependencies {
+  readonly providers: ReadonlyArray<MonitoredProviderRegistrationFactory>;
+  readonly now?: Effect.Effect<number>;
 }
 
 export function registerMonitoredProviderCapacity(
@@ -142,56 +49,9 @@ export function registerMonitoredProviderCapacity(
             lastRendered = rendered;
             ctx.ui.setStatus(STATUS_KEY, rendered);
           }),
-        providers: [
-          defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
-            piProviderId: "openai-codex",
-            makeLayer: (publish) =>
-              codexProviderMonitorLayer({
-                resolveCredential: credentialResolution(ctx),
-                acquireDedicatedWeeklyQuotaUsage:
-                  dependencies.acquireDedicatedWeeklyQuotaUsage,
-                publish,
-                ...(dependencies.random === undefined
-                  ? {}
-                  : { random: dependencies.random }),
-              }),
-            present: (status, currentTime) =>
-              presentProviderSubscriptionUsage("Codex", status, currentTime),
-          }),
-          defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
-            piProviderId: "anthropic",
-            makeLayer: (publish) =>
-              claudeProviderMonitorLayer({
-                resolveAuthentication: authenticationResolution(
-                  ctx,
-                  "anthropic",
-                ),
-                acquireClaudeSubscriptionUsage:
-                  dependencies.acquireClaudeSubscriptionUsage(ctx),
-                publish,
-                ...(dependencies.random === undefined
-                  ? {}
-                  : { random: dependencies.random }),
-              }),
-            present: (status, currentTime) =>
-              presentProviderSubscriptionUsage("Claude", status, currentTime),
-          }),
-          defineMonitoredProvider<OpenRouterAccountCreditBalanceStatus>({
-            piProviderId: "openrouter",
-            makeLayer: (publish) =>
-              openRouterProviderMonitorLayer({
-                resolveManagementKey:
-                  dependencies.resolveOpenRouterManagementKey,
-                acquireOpenRouterAccountCreditBalance:
-                  dependencies.acquireOpenRouterAccountCreditBalance,
-                publish,
-                ...(dependencies.random === undefined
-                  ? {}
-                  : { random: dependencies.random }),
-              }),
-            present: (status) => presentOpenRouterAccountCreditBalance(status),
-          }),
-        ],
+        providers: dependencies.providers.map((makeProvider) =>
+          makeProvider(ctx),
+        ),
       }),
     );
   });

@@ -1,8 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { makeClaudeMonitoredProviderRegistration } from "./src/claude-monitored-provider.ts";
 import { createAcquireClaudeSubscriptionUsage } from "./src/claude-subscription-usage-acquisition.ts";
+import { makeCodexMonitoredProviderRegistration } from "./src/codex-monitored-provider.ts";
 import { createAcquireDedicatedWeeklyQuotaUsage } from "./src/dedicated-weekly-quota-acquisition.ts";
 import { createAcquireOpenRouterAccountCreditBalance } from "./src/openrouter-account-credit-balance-acquisition.ts";
 import { createResolveOpenRouterManagementKey } from "./src/openrouter-management-key-resolution.ts";
+import { makeOpenRouterMonitoredProviderRegistration } from "./src/openrouter-monitored-provider.ts";
 import { createFileProviderAcquisitionCoordinator } from "./src/provider-acquisition-coordinator.ts";
 import { registerMonitoredProviderCapacity } from "./src/register.ts";
 
@@ -21,24 +24,37 @@ function showCoordinationWarningOnce(notify: () => void): void {
 
 export default function piUsage(pi: ExtensionAPI): void {
   const acquisitionCoordinator = createFileProviderAcquisitionCoordinator();
+  const acquireDedicatedWeeklyQuotaUsage =
+    createAcquireDedicatedWeeklyQuotaUsage({ fetch });
+  const resolveOpenRouterManagementKey = createResolveOpenRouterManagementKey();
+  const acquireOpenRouterAccountCreditBalance =
+    createAcquireOpenRouterAccountCreditBalance({ fetch });
+
   registerMonitoredProviderCapacity(pi, {
-    acquireDedicatedWeeklyQuotaUsage: createAcquireDedicatedWeeklyQuotaUsage({
-      fetch,
-    }),
-    resolveOpenRouterManagementKey: createResolveOpenRouterManagementKey(),
-    acquireOpenRouterAccountCreditBalance:
-      createAcquireOpenRouterAccountCreditBalance({ fetch }),
-    acquireClaudeSubscriptionUsage: (ctx) =>
-      createAcquireClaudeSubscriptionUsage({
-        fetch,
-        acquisitionCoordinator,
-        onCoordinationUnavailable: () =>
-          showCoordinationWarningOnce(() =>
-            ctx.ui.notify(
-              "Claude usage unavailable: secure Linux XDG_RUNTIME_DIR required",
-              "warning",
-            ),
-          ),
-      }),
+    providers: [
+      (ctx) =>
+        makeCodexMonitoredProviderRegistration(ctx, {
+          acquireDedicatedWeeklyQuotaUsage,
+        }),
+      (ctx) =>
+        makeClaudeMonitoredProviderRegistration(ctx, {
+          acquireClaudeSubscriptionUsage: createAcquireClaudeSubscriptionUsage({
+            fetch,
+            acquisitionCoordinator,
+            onCoordinationUnavailable: () =>
+              showCoordinationWarningOnce(() =>
+                ctx.ui.notify(
+                  "Claude usage unavailable: secure Linux XDG_RUNTIME_DIR required",
+                  "warning",
+                ),
+              ),
+          }),
+        }),
+      () =>
+        makeOpenRouterMonitoredProviderRegistration({
+          resolveOpenRouterManagementKey,
+          acquireOpenRouterAccountCreditBalance,
+        }),
+    ],
   });
 }
