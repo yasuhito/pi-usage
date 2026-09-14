@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAcquireClaudeSubscriptionUsage } from "./src/claude-subscription-usage-acquisition.ts";
 import { createAcquireDedicatedWeeklyQuotaUsage } from "./src/dedicated-weekly-quota-acquisition.ts";
-import { createAcquireOpenRouterKeyCapacity } from "./src/openrouter-key-capacity-acquisition.ts";
+import { createAcquireOpenRouterAccountCreditBalance } from "./src/openrouter-account-credit-balance-acquisition.ts";
+import { createResolveOpenRouterManagementKey } from "./src/openrouter-management-key-resolution.ts";
 import { createFileProviderAcquisitionCoordinator } from "./src/provider-acquisition-coordinator.ts";
 import { registerMonitoredProviderCapacity } from "./src/register.ts";
 
@@ -24,7 +25,9 @@ export default function piUsage(pi: ExtensionAPI): void {
     acquireDedicatedWeeklyQuotaUsage: createAcquireDedicatedWeeklyQuotaUsage({
       fetch,
     }),
-    acquireOpenRouterKeyCapacity: createAcquireOpenRouterKeyCapacity({ fetch }),
+    resolveOpenRouterManagementKey: createResolveOpenRouterManagementKey(),
+    acquireOpenRouterAccountCreditBalance:
+      createAcquireOpenRouterAccountCreditBalance({ fetch }),
     acquireClaudeSubscriptionUsage: (ctx) =>
       createAcquireClaudeSubscriptionUsage({
         fetch,

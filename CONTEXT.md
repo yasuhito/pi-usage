@@ -17,7 +17,7 @@ A provider-reported subscription allowance window whose duration is exactly seve
 _Avoid_: Secondary window
 
 **Stale capacity**:
-The last successfully observed provider capacity information when a newer observation temporarily cannot be obtained. Its retention period is provider-specific and never extends beyond a provider-reported reset or expiration. Codex and OpenRouter retain it for at most ten minutes from observation; Claude retains it until reset.
+The last successfully observed provider capacity information when a newer observation temporarily cannot be obtained. Its retention period is provider-specific: Codex and OpenRouter retain it for at most ten minutes from observation, while Claude retains it until reset; a provider-reported reset or expiration shortens retention when one exists.
 _Avoid_: Stale usage, cached usage, current usage
 
 **Claude subscription usage**:
@@ -37,15 +37,19 @@ A provider-granted, consumable credit that resets a Codex rate-limit window. It 
 _Avoid_: Weekly credit, usage credit
 
 **OpenRouter key remaining spend**:
-The provider-reported US-dollar amount remaining under the authenticated OpenRouter API key’s configured spending limit. It is scoped to that key, not the OpenRouter account’s purchased-credit balance. When the key has no configured limit, no remaining amount exists and the key is presented as having no limit rather than as unavailable.
-_Avoid_: OpenRouter account balance, OpenRouter credits, weekly subscription usage
+The provider-reported US-dollar amount remaining under an OpenRouter API key’s configured spending limit. It is scoped to that key and is distinct from the account’s purchased-credit balance.
+_Avoid_: OpenRouter account credit balance, OpenRouter credits, weekly subscription usage
+
+**OpenRouter account credit balance**:
+The OpenRouter account’s total purchased credits minus its total usage, obtained with a Management Key. It is account-scoped and distinct from an individual API key’s configured spending limit.
+_Avoid_: OpenRouter key remaining spend, OpenRouter key limit, weekly subscription usage
 
 **Weekly subscription usage lifecycle**:
 The progression of a provider's weekly subscription usage from initial acquisition through fresh observation, temporary staleness, expiration, and session end. Each monitored provider progresses independently.
 _Avoid_: Weekly quota usage lifecycle, usage cache lifecycle
 
 **Monitored provider capacity session**:
-The session-scoped ownership of all monitored providers’ capacity information, including startup, replacement, event routing, presentation, and shutdown. It coordinates independent provider lifecycles without treating unlike capacity measures, such as weekly subscription usage and OpenRouter key remaining spend, as the same quantity.
+The session-scoped ownership of all monitored providers’ capacity information, including startup, replacement, event routing, presentation, and shutdown. It coordinates independent provider lifecycles without treating unlike capacity measures, such as weekly subscription usage and OpenRouter account credit balance, as the same quantity.
 _Avoid_: Weekly subscription usage session, provider monitor session
 
 **Passive weekly quota observation**:

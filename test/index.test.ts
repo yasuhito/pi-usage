@@ -29,7 +29,11 @@ test("warns only once per process when secure coordination is unavailable", asyn
   );
   Reflect.deleteProperty(globalThis, warningSymbol);
   const previousRuntimeDirectory = process.env.XDG_RUNTIME_DIR;
+  const previousPath = process.env.PATH;
+  const previousManagementKey = process.env.OPENROUTER_MANAGEMENT_KEY;
   delete process.env.XDG_RUNTIME_DIR;
+  delete process.env.OPENROUTER_MANAGEMENT_KEY;
+  process.env.PATH = "/nonexistent";
   const warnings: string[] = [];
 
   type Handler = (event: unknown, context: unknown) => Promise<void>;
@@ -70,6 +74,13 @@ test("warns only once per process when secure coordination is unavailable", asyn
       delete process.env.XDG_RUNTIME_DIR;
     } else {
       process.env.XDG_RUNTIME_DIR = previousRuntimeDirectory;
+    }
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousManagementKey === undefined) {
+      delete process.env.OPENROUTER_MANAGEMENT_KEY;
+    } else {
+      process.env.OPENROUTER_MANAGEMENT_KEY = previousManagementKey;
     }
     Reflect.deleteProperty(globalThis, warningSymbol);
   }

@@ -23,7 +23,7 @@ import {
   makeMonitoredProviderCapacitySession,
 } from "../src/monitored-provider-capacity-session.ts";
 import {
-  type OpenRouterKeyCapacityStatus,
+  type OpenRouterAccountCreditBalanceStatus,
   presentProviderSubscriptionUsage,
   type WeeklySubscriptionProviderName,
   type WeeklySubscriptionUsageStatus,
@@ -433,22 +433,15 @@ test("accepts non-weekly capacity through the provider roster", async () => {
     session.start({
       now: Effect.succeed(1_000_000),
       providers: [
-        defineMonitoredProvider<OpenRouterKeyCapacityStatus>({
+        defineMonitoredProvider<OpenRouterAccountCreditBalanceStatus>({
           piProviderId: "openrouter",
           makeLayer: (publish) =>
             Layer.succeed(ProviderMonitorService, {
               start: publish({
-                kind: "openrouter-key-no-limit",
+                kind: "openrouter-account-credit-balance",
+                balanceUsd: 12.34,
                 stale: false,
-              }).pipe(
-                Effect.andThen(
-                  publish({
-                    kind: "openrouter-key-remaining-spend",
-                    remainingUsd: 12.34,
-                    stale: false,
-                  }),
-                ),
-              ),
+              }),
               observeResponse: () => Effect.void,
               refreshAfterActivity: Effect.void,
               refreshForAccountChange: Effect.void,
@@ -456,11 +449,9 @@ test("accepts non-weekly capacity through the provider roster", async () => {
           present: (status) => ({
             providerName: "OpenRouter",
             detail:
-              status.kind === "openrouter-key-no-limit"
-                ? "no limit"
-                : status.kind === "openrouter-key-remaining-spend"
-                  ? `$${status.remainingUsd}`
-                  : "unexpected",
+              status.kind === "openrouter-account-credit-balance"
+                ? `$${status.balanceUsd}`
+                : "unexpected",
             color: "dim",
           }),
         }),
@@ -473,19 +464,9 @@ test("accepts non-weekly capacity through the provider roster", async () => {
   assert.deepEqual(presentations, [
     [
       {
-        status: { kind: "openrouter-key-no-limit", stale: false },
-        presentation: {
-          providerName: "OpenRouter",
-          detail: "no limit",
-          color: "dim",
-        },
-      },
-    ],
-    [
-      {
         status: {
-          kind: "openrouter-key-remaining-spend",
-          remainingUsd: 12.34,
+          kind: "openrouter-account-credit-balance",
+          balanceUsd: 12.34,
           stale: false,
         },
         presentation: {

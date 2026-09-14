@@ -12,21 +12,17 @@ export type WeeklySubscriptionUsageStatus =
       readonly availableLimitResetCredits?: number;
     };
 
-export type OpenRouterKeyCapacityStatus =
+export type OpenRouterAccountCreditBalanceStatus =
   | CapacityAcquisitionStatus
   | {
-      readonly kind: "openrouter-key-remaining-spend";
-      readonly remainingUsd: number;
-      readonly stale: boolean;
-    }
-  | {
-      readonly kind: "openrouter-key-no-limit";
+      readonly kind: "openrouter-account-credit-balance";
+      readonly balanceUsd: number;
       readonly stale: boolean;
     };
 
 export type ProviderCapacityStatus =
   | WeeklySubscriptionUsageStatus
-  | OpenRouterKeyCapacityStatus;
+  | OpenRouterAccountCreditBalanceStatus;
 export type WeeklySubscriptionProviderName = "Codex" | "Claude";
 export type ProviderName = WeeklySubscriptionProviderName | "OpenRouter";
 
@@ -90,8 +86,8 @@ export function presentProviderSubscriptionUsage(
   };
 }
 
-export function presentOpenRouterKeyCapacity(
-  status: OpenRouterKeyCapacityStatus,
+export function presentOpenRouterAccountCreditBalance(
+  status: OpenRouterAccountCreditBalanceStatus,
 ): ProviderCapacityPresentation {
   if (status.kind === "loading" || status.kind === "unavailable") {
     return {
@@ -101,18 +97,18 @@ export function presentOpenRouterKeyCapacity(
     };
   }
 
-  if (status.kind === "openrouter-key-no-limit") {
-    return {
-      providerName: "OpenRouter",
-      detail: `no limit${status.stale ? " ~" : ""}`,
-      color: "dim",
-    };
-  }
-
+  const balance = status.balanceUsd;
   const amount =
-    status.remainingUsd > 0 && status.remainingUsd < 0.01
+    balance > 0 && balance < 0.01
       ? "<$0.01"
-      : `$${Math.max(0, status.remainingUsd).toFixed(2)}`;
+      : balance < 0 && balance > -0.01
+        ? `-$${new Intl.NumberFormat("en-US", {
+            useGrouping: false,
+            maximumSignificantDigits: 15,
+          }).format(Math.abs(balance))}`
+        : balance < 0
+          ? `-$${Math.abs(balance).toFixed(2)}`
+          : `$${balance.toFixed(2)}`;
   return {
     providerName: "OpenRouter",
     detail: `${amount} left${status.stale ? " ~" : ""}`,

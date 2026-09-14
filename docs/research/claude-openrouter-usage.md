@@ -9,8 +9,8 @@ Treat Claude and OpenRouter as different quota domains rather than forcing both 
 
 - **Anthropic API-key accounts:** opportunistically observe documented API rate-limit response headers. Organization-wide historical usage, cost, and configured limits require an Admin credential that Pi does not normally provide.
 - **Claude Pro/Max subscriptions:** do not promise a supported weekly-quota meter. Claude Code can expose subscription rate-limit percentages to its own status line, but Anthropic does not document a general-purpose subscription-usage API for third-party extensions. Pi also states that its third-party Anthropic harness usage draws from paid extra usage rather than Claude plan limits.
-- **OpenRouter:** query the documented `GET /api/v1/key` endpoint with Pi's resolved OpenRouter API key. This provides per-key spend limits, remaining spend, reset configuration, and usage aggregates. Do not present these as subscription weekly quota.
-- Resolve all credentials through Pi's documented `ctx.modelRegistry.getProviderAuth(providerId)` interface. Do not read Pi credential files directly.
+- **OpenRouter:** query the documented `GET /api/v1/credits` endpoint with an explicitly configured Management Key and derive the account credit balance from total purchased credits minus total usage. Keep `/api/v1/key` as background capability information only; its per-key spending limit is not the account balance users want presented.
+- Resolve inference credentials through Pi's documented `ctx.modelRegistry.getProviderAuth(providerId)` interface and do not read Pi credential files directly. OpenRouter account credits are the exception: their separate Management Key is not a Pi inference credential and is resolved explicitly as documented in [ADR 0004](../adr/0004-use-management-key-for-openrouter-account-credit-balance.md).
 
 ## Capability summary
 
@@ -137,7 +137,7 @@ Sources:
 
 The limit and remaining amount are **per key**, not an account-wide purchased-credit balance. A `null` limit means that the key has no configured spending cap. Daily limits reset at midnight UTC, weekly limits follow Monday–Sunday UTC, and monthly limits follow the UTC calendar month.
 
-For this project, `/api/v1/key` is the best supported dedicated acquisition endpoint. Poll conservatively, cache results, back off on failures, and prefer refresh after relevant activity rather than frequent unconditional polling. OpenRouter does not document a polling freshness SLA for this endpoint.
+`/api/v1/key` remains the supported endpoint for key-scoped limits, but Pi Usage does not present that metric. Poll conservatively, cache results, back off on failures, and prefer refresh after relevant activity rather than frequent unconditional polling. OpenRouter does not document a polling freshness SLA for this endpoint.
 
 ### Per-request usage
 
@@ -147,7 +147,7 @@ Source: [OpenRouter usage accounting](https://openrouter.ai/docs/cookbook/admini
 
 ### Account credits and management APIs
 
-`GET /api/v1/credits` returns `total_credits` and `total_usage` for the account. It requires a separate management key. The response has no explicit remaining field; a presentation may derive `total_credits - total_usage` while retaining the original values and currency semantics.
+`GET /api/v1/credits` returns `total_credits` and `total_usage` for the account. It requires a separate management key. The response has no explicit remaining field; Pi Usage derives the **OpenRouter account credit balance** as `total_credits - total_usage` while retaining the original values and currency semantics.
 
 Management keys can also list/manage keys and access account analytics, but cannot be used for inference. They have broader account visibility and should be explicit opt-in configuration rather than inferred from Pi's normal OpenRouter model credential.
 
@@ -237,7 +237,7 @@ The existing `WeeklyQuotaUsage` type cannot represent all three providers faithf
 - Anthropic API headers expose continuously replenishing request/token buckets, while its Admin APIs expose delayed organization usage and configured limits.
 - OpenRouter exposes monetary key limits and usage aggregates, with optional daily/weekly/monthly reset policies.
 
-The implementation should therefore place provider-specific adapters behind a higher-level usage-status interface without normalizing unlike quantities into one percentage. At minimum, preserve:
+The implementation should therefore place provider-specific adapters behind a higher-level usage-status interface without normalizing unlike quantities into one percentage. For OpenRouter, the product decision in [ADR 0004](../adr/0004-use-management-key-for-openrouter-account-credit-balance.md) is to present account credit balance rather than key remaining spend. At minimum, preserve:
 
 - metric kind: subscription utilization, monetary spend, token/request capacity, or historical usage;
 - scope: account, organization, workspace, or API key;
@@ -247,4 +247,4 @@ The implementation should therefore place provider-specific adapters behind a hi
 
 ## Conclusion
 
-OpenRouter has a practical, documented path for a Pi extension: resolve `openrouter` auth and query `/api/v1/key` for per-key spend usage and reset configuration. Anthropic has documented paths for API rate-limit headers and privileged organization reporting, but no supported third-party equivalent of the existing Codex weekly subscription meter. Multi-provider support should expose these semantic differences instead of presenting all providers as interchangeable weekly quota percentages.
+OpenRouter has two documented but distinct paths: ordinary inference-key authentication can query `/api/v1/key` for per-key spending limits, while a separate Management Key can query `/api/v1/credits` for account totals. Pi Usage uses the latter to derive the account credit balance. Anthropic has documented paths for API rate-limit headers and privileged organization reporting, but no supported third-party equivalent of the existing Codex weekly subscription meter. Multi-provider support should expose these semantic differences instead of presenting all providers as interchangeable weekly quota percentages.

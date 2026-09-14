@@ -1,20 +1,36 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import { Effect, TestClock } from "effect";
-import { TemporaryOpenRouterKeyCapacityFailure } from "../src/openrouter-key-capacity-acquisition.ts";
-import { makeOpenRouterProviderMonitor } from "../src/openrouter-provider-monitor.ts";
-import type { OpenRouterKeyCapacityStatus } from "../src/presentation.ts";
 
-it.scoped("publishes OpenRouter key remaining spend at startup", () =>
+import {
+  OpenRouterManagementAuthenticationRejected,
+  TemporaryOpenRouterAccountCreditBalanceFailure,
+} from "../src/openrouter-account-credit-balance-acquisition.ts";
+import type { OpenRouterManagementKey } from "../src/openrouter-management-key-resolution.ts";
+import { makeOpenRouterProviderMonitor } from "../src/openrouter-provider-monitor.ts";
+import type { OpenRouterAccountCreditBalanceStatus } from "../src/presentation.ts";
+
+function managementKey(value: string): OpenRouterManagementKey {
+  return value as OpenRouterManagementKey;
+}
+
+it.scoped("publishes OpenRouter account credit balance at startup", () =>
   Effect.gen(function* () {
-    const statuses: OpenRouterKeyCapacityStatus[] = [];
+    const statuses: OpenRouterAccountCreditBalanceStatus[] = [];
     let receivedCredential: string | undefined;
+    let resolutions = 0;
     const monitor = yield* makeOpenRouterProviderMonitor({
-      resolveAuthentication: () =>
-        Effect.succeed({ auth: { apiKey: "  secret  " } }),
-      acquireOpenRouterKeyCapacity: (credential) => {
+      resolveManagementKey: () => {
+        resolutions += 1;
+        return Effect.succeed(managementKey("management-secret"));
+      },
+      acquireOpenRouterAccountCreditBalance: (credential) => {
         receivedCredential = credential;
-        return Effect.succeed({ kind: "limited", remainingUsd: 12.34 });
+        return Effect.succeed({
+          totalCreditsUsd: 20,
+          totalUsageUsd: 7.66,
+          balanceUsd: 12.34,
+        });
       },
       publish: (status) =>
         Effect.sync(() => {
@@ -24,49 +40,32 @@ it.scoped("publishes OpenRouter key remaining spend at startup", () =>
 
     yield* monitor.start;
 
-    assert.equal(receivedCredential, "secret");
+    assert.equal(receivedCredential, "management-secret");
+    assert.equal(resolutions, 1);
     assert.deepEqual(statuses, [
       { kind: "loading" },
       {
-        kind: "openrouter-key-remaining-spend",
-        remainingUsd: 12.34,
+        kind: "openrouter-account-credit-balance",
+        balanceUsd: 12.34,
         stale: false,
       },
     ]);
   }),
 );
 
-it.scoped("publishes a key with no configured spending limit", () =>
-  Effect.gen(function* () {
-    const statuses: OpenRouterKeyCapacityStatus[] = [];
-    const monitor = yield* makeOpenRouterProviderMonitor({
-      resolveAuthentication: () =>
-        Effect.succeed({ auth: { apiKey: "secret" } }),
-      acquireOpenRouterKeyCapacity: () => Effect.succeed({ kind: "no-limit" }),
-      publish: (status) =>
-        Effect.sync(() => {
-          statuses.push(status);
-        }),
-    });
-
-    yield* monitor.start;
-
-    assert.deepEqual(statuses.at(-1), {
-      kind: "openrouter-key-no-limit",
-      stale: false,
-    });
-  }),
-);
-
-it.scoped("stays unavailable when OpenRouter authentication is missing", () =>
+it.scoped("stays unavailable when the Management Key is missing", () =>
   Effect.gen(function* () {
     let reads = 0;
-    const statuses: OpenRouterKeyCapacityStatus[] = [];
+    const statuses: OpenRouterAccountCreditBalanceStatus[] = [];
     const monitor = yield* makeOpenRouterProviderMonitor({
-      resolveAuthentication: () => Effect.succeed(undefined),
-      acquireOpenRouterKeyCapacity: () => {
+      resolveManagementKey: () => Effect.succeed(undefined),
+      acquireOpenRouterAccountCreditBalance: () => {
         reads += 1;
-        return Effect.succeed({ kind: "limited", remainingUsd: 12.34 });
+        return Effect.succeed({
+          totalCreditsUsd: 20,
+          totalUsageUsd: 7.66,
+          balanceUsd: 12.34,
+        });
       },
       publish: (status) =>
         Effect.sync(() => {
@@ -82,21 +81,26 @@ it.scoped("stays unavailable when OpenRouter authentication is missing", () =>
 );
 
 it.scoped(
-  "refreshes after OpenRouter activity without polling or failure retries",
+  "refreshes after OpenRouter activity without polling or timer retries",
   () =>
     Effect.gen(function* () {
       let reads = 0;
       let fail = false;
       const monitor = yield* makeOpenRouterProviderMonitor({
-        resolveAuthentication: () =>
-          Effect.succeed({ auth: { apiKey: "secret" } }),
-        acquireOpenRouterKeyCapacity: () => {
+        resolveManagementKey: () =>
+          Effect.succeed(managementKey("management-secret")),
+        acquireOpenRouterAccountCreditBalance: () => {
           reads += 1;
           return fail
-            ? Effect.fail(new TemporaryOpenRouterKeyCapacityFailure())
-            : Effect.succeed({ kind: "limited", remainingUsd: 12.34 });
+            ? Effect.fail(new TemporaryOpenRouterAccountCreditBalanceFailure())
+            : Effect.succeed({
+                totalCreditsUsd: 20,
+                totalUsageUsd: 7.66,
+                balanceUsd: 12.34,
+              });
         },
         publish: () => Effect.void,
+        random: Effect.succeed(0.5),
       });
 
       yield* monitor.start;
@@ -106,8 +110,6 @@ it.scoped(
       fail = true;
       yield* monitor.refreshAfterActivity;
       yield* monitor.refreshAfterActivity;
-      yield* monitor.refreshForAccountChange;
-      assert.equal(reads, 2);
       yield* TestClock.adjust("1 hour");
       assert.equal(reads, 2);
 
@@ -117,80 +119,20 @@ it.scoped(
     }),
 );
 
-it.scoped("marks the last amount stale for at most ten minutes", () =>
+it.scoped("marks the last balance stale for at most ten minutes", () =>
   Effect.gen(function* () {
     let fail = false;
-    const statuses: OpenRouterKeyCapacityStatus[] = [];
+    const statuses: OpenRouterAccountCreditBalanceStatus[] = [];
     const monitor = yield* makeOpenRouterProviderMonitor({
-      resolveAuthentication: () =>
-        Effect.succeed({ auth: { apiKey: "secret" } }),
-      acquireOpenRouterKeyCapacity: () =>
+      resolveManagementKey: () =>
+        Effect.succeed(managementKey("management-secret")),
+      acquireOpenRouterAccountCreditBalance: () =>
         fail
-          ? Effect.fail(new TemporaryOpenRouterKeyCapacityFailure())
-          : Effect.succeed({ kind: "limited" as const, remainingUsd: 12.34 }),
-      publish: (status) =>
-        Effect.sync(() => {
-          statuses.push(status);
-        }),
-      random: Effect.succeed(0.5),
-    });
-
-    yield* monitor.start;
-    fail = true;
-    yield* monitor.refreshForAccountChange;
-    assert.deepEqual(statuses.at(-1), {
-      kind: "openrouter-key-remaining-spend",
-      remainingUsd: 12.34,
-      stale: true,
-    });
-
-    yield* TestClock.adjust("599999 millis");
-    assert.equal(statuses.at(-1)?.kind, "openrouter-key-remaining-spend");
-    yield* TestClock.adjust("1 millis");
-    assert.deepEqual(statuses.at(-1), { kind: "unavailable" });
-  }),
-);
-
-it.scoped("invalidates fresh capacity at its reset or expiration", () =>
-  Effect.gen(function* () {
-    const statuses: OpenRouterKeyCapacityStatus[] = [];
-    const monitor = yield* makeOpenRouterProviderMonitor({
-      resolveAuthentication: () =>
-        Effect.succeed({ auth: { apiKey: "secret" } }),
-      acquireOpenRouterKeyCapacity: () =>
-        Effect.succeed({
-          kind: "limited",
-          remainingUsd: 12.34,
-          validUntilMs: 120_000,
-        }),
-      publish: (status) =>
-        Effect.sync(() => {
-          statuses.push(status);
-        }),
-    });
-
-    yield* monitor.start;
-    yield* TestClock.adjust("119999 millis");
-    assert.equal(statuses.at(-1)?.kind, "openrouter-key-remaining-spend");
-    yield* TestClock.adjust("1 millis");
-    assert.deepEqual(statuses.at(-1), { kind: "unavailable" });
-  }),
-);
-
-it.scoped("does not retain stale capacity beyond its reset or expiration", () =>
-  Effect.gen(function* () {
-    let fail = false;
-    const statuses: OpenRouterKeyCapacityStatus[] = [];
-    const monitor = yield* makeOpenRouterProviderMonitor({
-      resolveAuthentication: () =>
-        Effect.succeed({ auth: { apiKey: "secret" } }),
-      acquireOpenRouterKeyCapacity: () =>
-        fail
-          ? Effect.fail(new TemporaryOpenRouterKeyCapacityFailure())
+          ? Effect.fail(new TemporaryOpenRouterAccountCreditBalanceFailure())
           : Effect.succeed({
-              kind: "limited" as const,
-              remainingUsd: 12.34,
-              validUntilMs: 120_000,
+              totalCreditsUsd: 20,
+              totalUsageUsd: 7.66,
+              balanceUsd: 12.34,
             }),
       publish: (status) =>
         Effect.sync(() => {
@@ -202,9 +144,39 @@ it.scoped("does not retain stale capacity beyond its reset or expiration", () =>
     yield* monitor.start;
     fail = true;
     yield* monitor.refreshForAccountChange;
-    yield* TestClock.adjust("119999 millis");
-    assert.equal(statuses.at(-1)?.kind, "openrouter-key-remaining-spend");
+    assert.deepEqual(statuses.at(-1), {
+      kind: "openrouter-account-credit-balance",
+      balanceUsd: 12.34,
+      stale: true,
+    });
+
+    yield* TestClock.adjust("599999 millis");
+    assert.equal(statuses.at(-1)?.kind, "openrouter-account-credit-balance");
     yield* TestClock.adjust("1 millis");
+    assert.deepEqual(statuses.at(-1), { kind: "unavailable" });
+  }),
+);
+
+it.scoped("does not retry a rejected static Management Key immediately", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const statuses: OpenRouterAccountCreditBalanceStatus[] = [];
+    const monitor = yield* makeOpenRouterProviderMonitor({
+      resolveManagementKey: () =>
+        Effect.succeed(managementKey("management-secret")),
+      acquireOpenRouterAccountCreditBalance: () => {
+        reads += 1;
+        return Effect.fail(new OpenRouterManagementAuthenticationRejected());
+      },
+      publish: (status) =>
+        Effect.sync(() => {
+          statuses.push(status);
+        }),
+    });
+
+    yield* monitor.start;
+
+    assert.equal(reads, 1);
     assert.deepEqual(statuses.at(-1), { kind: "unavailable" });
   }),
 );

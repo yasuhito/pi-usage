@@ -17,11 +17,12 @@ import {
   defineMonitoredProvider,
   makeMonitoredProviderCapacitySession,
 } from "./monitored-provider-capacity-session.ts";
-import type { AcquireOpenRouterKeyCapacity } from "./openrouter-key-capacity-acquisition.ts";
+import type { AcquireOpenRouterAccountCreditBalance } from "./openrouter-account-credit-balance-acquisition.ts";
+import type { ResolveOpenRouterManagementKey } from "./openrouter-management-key-resolution.ts";
 import { openRouterProviderMonitorLayer } from "./openrouter-provider-monitor.ts";
 import {
-  type OpenRouterKeyCapacityStatus,
-  presentOpenRouterKeyCapacity,
+  type OpenRouterAccountCreditBalanceStatus,
+  presentOpenRouterAccountCreditBalance,
   presentProviderSubscriptionUsage,
   type WeeklySubscriptionUsageStatus,
 } from "./presentation.ts";
@@ -33,7 +34,8 @@ export interface MonitoredProviderCapacityDependencies {
   readonly acquireClaudeSubscriptionUsage: (
     ctx: ExtensionContext,
   ) => AcquireClaudeSubscriptionUsage;
-  readonly acquireOpenRouterKeyCapacity: AcquireOpenRouterKeyCapacity;
+  readonly resolveOpenRouterManagementKey: ResolveOpenRouterManagementKey;
+  readonly acquireOpenRouterAccountCreditBalance: AcquireOpenRouterAccountCreditBalance;
   readonly now?: Effect.Effect<number>;
   readonly random?: Effect.Effect<number>;
 }
@@ -174,22 +176,20 @@ export function registerMonitoredProviderCapacity(
             present: (status, currentTime) =>
               presentProviderSubscriptionUsage("Claude", status, currentTime),
           }),
-          defineMonitoredProvider<OpenRouterKeyCapacityStatus>({
+          defineMonitoredProvider<OpenRouterAccountCreditBalanceStatus>({
             piProviderId: "openrouter",
             makeLayer: (publish) =>
               openRouterProviderMonitorLayer({
-                resolveAuthentication: authenticationResolution(
-                  ctx,
-                  "openrouter",
-                ),
-                acquireOpenRouterKeyCapacity:
-                  dependencies.acquireOpenRouterKeyCapacity,
+                resolveManagementKey:
+                  dependencies.resolveOpenRouterManagementKey,
+                acquireOpenRouterAccountCreditBalance:
+                  dependencies.acquireOpenRouterAccountCreditBalance,
                 publish,
                 ...(dependencies.random === undefined
                   ? {}
                   : { random: dependencies.random }),
               }),
-            present: (status) => presentOpenRouterKeyCapacity(status),
+            present: (status) => presentOpenRouterAccountCreditBalance(status),
           }),
         ],
       }),

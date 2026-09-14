@@ -1,0 +1,3 @@
+# Use a Management Key for OpenRouter account credit balance
+
+Present OpenRouter’s account credit balance from the documented `/api/v1/credits` endpoint, derived as total purchased credits minus total usage, rather than presenting an inference key’s configured spending limit. Because Pi’s OpenRouter authentication is an ordinary inference key and cannot access account credits, resolve the separate Management Key from the Linux OS keychain with `OPENROUTER_MANAGEMENT_KEY` as an environment fallback; never substitute Pi’s inference credential. This accepts a privileged additional credential and Linux-specific keychain integration in exchange for presenting the account-scoped amount users actually use to judge remaining funded work.

@@ -3,7 +3,7 @@ import { test } from "vitest";
 
 import {
   presentCodexQuotaStatus,
-  presentOpenRouterKeyCapacity,
+  presentOpenRouterAccountCreditBalance,
   presentProviderSubscriptionUsage,
 } from "../src/presentation.ts";
 
@@ -138,17 +138,20 @@ test("loading and unavailable statuses have compact neutral presentations", () =
   });
 });
 
-test("OpenRouter key remaining spend is presented as neutral USD", () => {
-  for (const [remainingUsd, detail] of [
+test("OpenRouter account credit balance is presented as neutral USD", () => {
+  for (const [balanceUsd, detail] of [
     [12.344, "$12.34 left"],
     [12.345, "$12.35 left"],
     [0.004, "<$0.01 left"],
     [0, "$0.00 left"],
+    [-1.25, "-$1.25 left"],
+    [-0.004, "-$0.004 left"],
+    [-0.0000004, "-$0.0000004 left"],
   ] as const) {
     assert.deepEqual(
-      presentOpenRouterKeyCapacity({
-        kind: "openrouter-key-remaining-spend",
-        remainingUsd,
+      presentOpenRouterAccountCreditBalance({
+        kind: "openrouter-account-credit-balance",
+        balanceUsd,
         stale: false,
       }),
       { providerName: "OpenRouter", detail, color: "dim" },
@@ -156,11 +159,11 @@ test("OpenRouter key remaining spend is presented as neutral USD", () => {
   }
 });
 
-test("OpenRouter capacity presents freshness and acquisition states", () => {
+test("OpenRouter account balance presents freshness and acquisition states", () => {
   assert.deepEqual(
-    presentOpenRouterKeyCapacity({
-      kind: "openrouter-key-remaining-spend",
-      remainingUsd: 12.34,
+    presentOpenRouterAccountCreditBalance({
+      kind: "openrouter-account-credit-balance",
+      balanceUsd: 12.34,
       stale: true,
     }),
     {
@@ -169,21 +172,17 @@ test("OpenRouter capacity presents freshness and acquisition states", () => {
       color: "dim",
     },
   );
-  assert.deepEqual(
-    presentOpenRouterKeyCapacity({
-      kind: "openrouter-key-no-limit",
-      stale: false,
-    }),
-    { providerName: "OpenRouter", detail: "no limit", color: "dim" },
-  );
-  assert.deepEqual(presentOpenRouterKeyCapacity({ kind: "loading" }), {
+  assert.deepEqual(presentOpenRouterAccountCreditBalance({ kind: "loading" }), {
     providerName: "OpenRouter",
     detail: "loading…",
     color: "dim",
   });
-  assert.deepEqual(presentOpenRouterKeyCapacity({ kind: "unavailable" }), {
-    providerName: "OpenRouter",
-    detail: "unavailable",
-    color: "dim",
-  });
+  assert.deepEqual(
+    presentOpenRouterAccountCreditBalance({ kind: "unavailable" }),
+    {
+      providerName: "OpenRouter",
+      detail: "unavailable",
+      color: "dim",
+    },
+  );
 });

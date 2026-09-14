@@ -17,9 +17,10 @@ import type {
   DedicatedWeeklyQuotaAcquisitionError,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
 import type {
-  AcquiredOpenRouterKeyCapacity,
-  OpenRouterKeyCapacityAcquisitionError,
-} from "../src/openrouter-key-capacity-acquisition.ts";
+  AcquiredOpenRouterAccountCreditBalance,
+  OpenRouterAccountCreditBalanceAcquisitionError,
+} from "../src/openrouter-account-credit-balance-acquisition.ts";
+import type { OpenRouterManagementKey } from "../src/openrouter-management-key-resolution.ts";
 import { registerMonitoredProviderCapacity } from "../src/register.ts";
 
 function accessTokenFor(accountId: string): string {
@@ -46,11 +47,13 @@ function registerFixture() {
   const observedCredentials: CodexCredential[] = [];
   const observedClaudeCredentials: string[] = [];
   const observedOpenRouterCredentials: string[] = [];
+  const providerAuthRequests: string[] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   let mode: ExtensionContext["mode"] = "tui";
   let provider = "openai-codex";
   let authEnabled = true;
-  let openRouterAuthEnabled = true;
+  let openRouterManagementKey: OpenRouterManagementKey | undefined =
+    "management-key" as OpenRouterManagementKey;
   let accountId = "account-1";
   let authWait: Promise<void> | undefined;
   let showThemeColors = false;
@@ -75,9 +78,13 @@ function registerFixture() {
     resetsAtMs: 2_000_000,
   });
   let openRouterAcquisition: Effect.Effect<
-    AcquiredOpenRouterKeyCapacity,
-    OpenRouterKeyCapacityAcquisitionError
-  > = Effect.succeed({ kind: "limited", remainingUsd: 12.34 });
+    AcquiredOpenRouterAccountCreditBalance,
+    OpenRouterAccountCreditBalanceAcquisitionError
+  > = Effect.succeed({
+    totalCreditsUsd: 20,
+    totalUsageUsd: 7.66,
+    balanceUsd: 12.34,
+  });
 
   registerMonitoredProviderCapacity(pi, {
     now: Effect.suspend(() => now),
@@ -91,7 +98,9 @@ function registerFixture() {
       observedClaudeCredentials.push(credential);
       return claudeAcquisition;
     },
-    acquireOpenRouterKeyCapacity: (credential) => {
+    resolveOpenRouterManagementKey: () =>
+      Effect.sync(() => openRouterManagementKey),
+    acquireOpenRouterAccountCreditBalance: (credential) => {
       openRouterReads += 1;
       observedOpenRouterCredentials.push(credential);
       return openRouterAcquisition;
@@ -108,14 +117,7 @@ function registerFixture() {
     modelRegistry: {
       getProviderAuth: async (providerName: string) => {
         await authWait;
-        if (providerName === "openrouter") {
-          return openRouterAuthEnabled
-            ? {
-                auth: { apiKey: "openrouter-key" },
-                source: "OPENROUTER_API_KEY" as const,
-              }
-            : undefined;
-        }
+        providerAuthRequests.push(providerName);
         return providerName !== "openai-codex" || authEnabled
           ? {
               auth: { apiKey: accessTokenFor(accountId) },
@@ -145,6 +147,7 @@ function registerFixture() {
     observedCredentials,
     observedClaudeCredentials,
     observedOpenRouterCredentials,
+    providerAuthRequests,
     claudeReads: () => claudeReads,
     openRouterReads: () => openRouterReads,
     statuses,
@@ -157,8 +160,10 @@ function registerFixture() {
     setAuthEnabled: (value: boolean) => {
       authEnabled = value;
     },
-    setOpenRouterAuthEnabled: (value: boolean) => {
-      openRouterAuthEnabled = value;
+    setOpenRouterManagementKeyEnabled: (value: boolean) => {
+      openRouterManagementKey = value
+        ? ("management-key" as OpenRouterManagementKey)
+        : undefined;
     },
     setAccountId: (value: string) => {
       accountId = value;
@@ -191,7 +196,8 @@ test("session start adapts Pi authentication and quota presentation", async () =
     { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
   ]);
   assert.deepEqual(f.observedClaudeCredentials, [accessTokenFor("account-1")]);
-  assert.deepEqual(f.observedOpenRouterCredentials, ["openrouter-key"]);
+  assert.deepEqual(f.observedOpenRouterCredentials, ["management-key"]);
+  assert.equal(f.providerAuthRequests.includes("openrouter"), false);
   assert.deepEqual(f.statuses.at(-1), {
     key: "pi-usage",
     text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
@@ -211,9 +217,9 @@ test("missing Codex authentication remains unavailable without delaying Claude",
   await f.emit("session_shutdown");
 });
 
-test("missing OpenRouter authentication remains visibly unavailable", async () => {
+test("missing OpenRouter Management Key remains visibly unavailable", async () => {
   const f = registerFixture();
-  f.setOpenRouterAuthEnabled(false);
+  f.setOpenRouterManagementKeyEnabled(false);
 
   await f.emit("session_start");
 

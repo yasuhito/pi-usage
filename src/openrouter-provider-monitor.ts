@@ -2,12 +2,15 @@ import { createHash } from "node:crypto";
 import { Effect, Layer, type Scope } from "effect";
 
 import type {
-  AcquiredOpenRouterKeyCapacity,
-  AcquireOpenRouterKeyCapacity,
-  OpenRouterApiKey,
-  OpenRouterKeyCapacityAcquisitionError,
-} from "./openrouter-key-capacity-acquisition.ts";
-import type { OpenRouterKeyCapacityStatus } from "./presentation.ts";
+  AcquiredOpenRouterAccountCreditBalance,
+  AcquireOpenRouterAccountCreditBalance,
+  OpenRouterAccountCreditBalanceAcquisitionError,
+} from "./openrouter-account-credit-balance-acquisition.ts";
+import type {
+  OpenRouterManagementKey,
+  ResolveOpenRouterManagementKey,
+} from "./openrouter-management-key-resolution.ts";
+import type { OpenRouterAccountCreditBalanceStatus } from "./presentation.ts";
 import {
   makeProviderMonitor,
   type ProviderAcquisitionHealth,
@@ -20,26 +23,17 @@ import {
 
 const STALE_RETENTION_MS = 10 * 60_000;
 
-export interface OpenRouterAuthentication {
-  readonly auth: {
-    readonly apiKey?: string;
-  };
-}
-
 export interface OpenRouterProviderMonitorDependencies {
-  readonly resolveAuthentication: () => Effect.Effect<
-    OpenRouterAuthentication | undefined,
-    unknown
-  >;
-  readonly acquireOpenRouterKeyCapacity: AcquireOpenRouterKeyCapacity;
+  readonly resolveManagementKey: ResolveOpenRouterManagementKey;
+  readonly acquireOpenRouterAccountCreditBalance: AcquireOpenRouterAccountCreditBalance;
   readonly publish: (
-    status: OpenRouterKeyCapacityStatus,
+    status: OpenRouterAccountCreditBalanceStatus,
   ) => Effect.Effect<void>;
   readonly random?: Effect.Effect<number>;
 }
 
-interface CapturedCapacity {
-  readonly capacity: AcquiredOpenRouterKeyCapacity;
+interface CapturedBalance {
+  readonly balance: AcquiredOpenRouterAccountCreditBalance;
   readonly observedAtMs: number;
   readonly stale: boolean;
 }
@@ -47,42 +41,36 @@ interface CapturedCapacity {
 function makeOpenRouterProviderMonitorAdapter(
   dependencies: OpenRouterProviderMonitorDependencies,
 ): ProviderMonitorAdapter<
-  OpenRouterApiKey,
-  AcquiredOpenRouterKeyCapacity,
-  OpenRouterKeyCapacityAcquisitionError,
-  OpenRouterKeyCapacityStatus
+  OpenRouterManagementKey,
+  AcquiredOpenRouterAccountCreditBalance,
+  OpenRouterAccountCreditBalanceAcquisitionError,
+  OpenRouterAccountCreditBalanceStatus
 > {
-  let captured: CapturedCapacity | undefined;
+  let captured: CapturedBalance | undefined;
 
-  const capacityDeadline = (): number | undefined => {
-    if (captured === undefined) return undefined;
-    if (!captured.stale) return captured.capacity.validUntilMs;
-    return Math.min(
-      captured.observedAtMs + STALE_RETENTION_MS,
-      captured.capacity.validUntilMs ?? Number.POSITIVE_INFINITY,
-    );
-  };
+  const staleDeadline = () =>
+    captured?.stale === true
+      ? captured.observedAtMs + STALE_RETENTION_MS
+      : undefined;
 
-  const status = (): OpenRouterKeyCapacityStatus => {
-    if (captured === undefined) return { kind: "unavailable" };
-    return captured.capacity.kind === "limited"
-      ? {
-          kind: "openrouter-key-remaining-spend",
-          remainingUsd: captured.capacity.remainingUsd,
+  const status = (): OpenRouterAccountCreditBalanceStatus =>
+    captured === undefined
+      ? { kind: "unavailable" }
+      : {
+          kind: "openrouter-account-credit-balance",
+          balanceUsd: captured.balance.balanceUsd,
           stale: captured.stale,
-        }
-      : { kind: "openrouter-key-no-limit", stale: captured.stale };
-  };
+        };
 
   const facts = (
     publish: boolean,
-    observationEvidence?: ProviderCapacityFacts<OpenRouterKeyCapacityStatus>["observationEvidence"],
+    observationEvidence?: ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus>["observationEvidence"],
     acquisitionHealth?: ProviderAcquisitionHealth,
-  ): ProviderCapacityFacts<OpenRouterKeyCapacityStatus> => ({
+  ): ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus> => ({
     presentation: publish
       ? { kind: "replace", status: status() }
       : { kind: "preserve" },
-    staleCapacityExpiresAtMs: capacityDeadline(),
+    staleCapacityExpiresAtMs: staleDeadline(),
     ...(observationEvidence === undefined ? {} : { observationEvidence }),
     ...(acquisitionHealth === undefined ? {} : { acquisitionHealth }),
   });
@@ -95,13 +83,12 @@ function makeOpenRouterProviderMonitorAdapter(
   const temporarilyUnavailable = (
     nowMs: number,
     providerNotBeforeMs?: number,
-  ): ProviderCapacityFacts<OpenRouterKeyCapacityStatus> => {
+  ): ProviderCapacityFacts<OpenRouterAccountCreditBalanceStatus> => {
     if (captured !== undefined) {
       captured = { ...captured, stale: true };
-      const deadline = capacityDeadline();
+      const deadline = staleDeadline();
       if (deadline === undefined || nowMs >= deadline) captured = undefined;
     }
-    // Preserve backoff without scheduling a request outside lifecycle triggers.
     return facts(true, undefined, {
       kind: "trigger-deferred",
       providerNotBeforeMs,
@@ -109,44 +96,34 @@ function makeOpenRouterProviderMonitorAdapter(
   };
 
   return {
-    credentialVerification: "before-and-after",
-    resolveCredential: Effect.suspend(dependencies.resolveAuthentication).pipe(
-      Effect.catchAllCause(() => Effect.succeed(undefined)),
-      Effect.map((authentication) => {
-        const key = authentication?.auth.apiKey?.trim();
-        if (key === undefined || key === "") {
-          return {
-            kind: "unavailable" as const,
-            acceptPassiveObservation: false,
-          };
-        }
-        return {
-          kind: "available" as const,
-          identity: providerCredentialIdentity(
-            createHash("sha256").update(key).digest("hex"),
-          ),
-          credential: key as OpenRouterApiKey,
-          acceptPassiveObservation: false,
-        };
-      }),
+    credentialVerification: "before",
+    resolveCredential: Effect.suspend(dependencies.resolveManagementKey).pipe(
+      Effect.map((key) =>
+        key === undefined
+          ? {
+              kind: "unavailable" as const,
+              acceptPassiveObservation: false,
+            }
+          : {
+              kind: "available" as const,
+              identity: providerCredentialIdentity(
+                createHash("sha256").update(key).digest("hex"),
+              ),
+              credential: key,
+              acceptPassiveObservation: false,
+            },
+      ),
     ),
-    acquire: dependencies.acquireOpenRouterKeyCapacity,
+    acquire: dependencies.acquireOpenRouterAccountCreditBalance,
     advance: (event) =>
       Effect.sync(() => {
         switch (event.kind) {
           case "credential-observed": {
             if (event.continuity === "unchanged") return facts(false);
-            const hadCapacity = captured !== undefined;
-            return clear(!event.credentialAvailable || hadCapacity);
+            const hadBalance = captured !== undefined;
+            return clear(!event.credentialAvailable || hadBalance);
           }
           case "acquisition-completed": {
-            if (
-              event.exit.kind === "failed" &&
-              event.exit.error._tag === "OpenRouterAuthenticationRejected" &&
-              !event.authenticationRefreshUsed
-            ) {
-              return facts(false, undefined, { kind: "credential-rejected" });
-            }
             if (
               event.currentIdentity === undefined ||
               event.currentIdentity !== event.startedIdentity
@@ -155,7 +132,7 @@ function makeOpenRouterProviderMonitorAdapter(
             }
             if (event.exit.kind === "acquired") {
               captured = {
-                capacity: event.exit.value,
+                balance: event.exit.value,
                 observedAtMs: event.nowMs,
                 stale: false,
               };
@@ -163,16 +140,16 @@ function makeOpenRouterProviderMonitorAdapter(
             }
             const error = event.exit.error;
             switch (error._tag) {
-              case "TemporaryOpenRouterKeyCapacityFailure":
+              case "TemporaryOpenRouterAccountCreditBalanceFailure":
                 return temporarilyUnavailable(event.nowMs, error.retryAtMs);
-              case "MalformedOpenRouterKeyCapacity":
+              case "MalformedOpenRouterAccountCreditBalance":
                 return temporarilyUnavailable(event.nowMs);
-              case "OpenRouterAuthenticationRejected":
+              case "OpenRouterManagementAuthenticationRejected":
                 return {
                   ...clear(true),
                   acquisitionHealth: { kind: "healthy" },
                 };
-              case "PermanentOpenRouterKeyCapacityFailure":
+              case "PermanentOpenRouterAccountCreditBalanceFailure":
                 return {
                   ...clear(true),
                   acquisitionHealth: { kind: "terminal" },
@@ -187,8 +164,8 @@ function makeOpenRouterProviderMonitorAdapter(
             return facts(false);
           case "stale-expiration-reached": {
             if (
-              captured === undefined ||
-              capacityDeadline() !== event.deadlineMs ||
+              captured?.stale !== true ||
+              staleDeadline() !== event.deadlineMs ||
               event.nowMs < event.deadlineMs
             ) {
               return facts(false);
@@ -207,10 +184,10 @@ export function makeOpenRouterProviderMonitor(
   dependencies: OpenRouterProviderMonitorDependencies,
 ): Effect.Effect<ProviderMonitor, never, Scope.Scope> {
   return makeProviderMonitor<
-    OpenRouterApiKey,
-    AcquiredOpenRouterKeyCapacity,
-    OpenRouterKeyCapacityAcquisitionError,
-    OpenRouterKeyCapacityStatus
+    OpenRouterManagementKey,
+    AcquiredOpenRouterAccountCreditBalance,
+    OpenRouterAccountCreditBalanceAcquisitionError,
+    OpenRouterAccountCreditBalanceStatus
   >(makeOpenRouterProviderMonitorAdapter(dependencies), {
     ...dependencies,
     polling: { kind: "disabled" },

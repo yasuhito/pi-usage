@@ -175,8 +175,8 @@ it.scoped("publishes non-weekly provider capacity", () =>
     harness.setAcquisition(
       Effect.succeed({
         status: {
-          kind: "openrouter-key-remaining-spend",
-          remainingUsd: 12.34,
+          kind: "openrouter-account-credit-balance",
+          balanceUsd: 12.34,
           stale: false,
         },
         health: { kind: "healthy" },
@@ -186,8 +186,8 @@ it.scoped("publishes non-weekly provider capacity", () =>
     yield* harness.monitor.start;
 
     assert.deepEqual(harness.statuses.at(-1), {
-      kind: "openrouter-key-remaining-spend",
-      remainingUsd: 12.34,
+      kind: "openrouter-account-credit-balance",
+      balanceUsd: 12.34,
       stale: false,
     });
   }),
