@@ -16,6 +16,10 @@ import type {
   CodexCredential,
   DedicatedWeeklyQuotaAcquisitionError,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
+import type {
+  AcquiredOpenRouterKeyCapacity,
+  OpenRouterKeyCapacityAcquisitionError,
+} from "../src/openrouter-key-capacity-acquisition.ts";
 import { registerMonitoredProviderCapacity } from "../src/register.ts";
 
 function accessTokenFor(accountId: string): string {
@@ -41,10 +45,12 @@ function registerFixture() {
   } as unknown as ExtensionAPI;
   const observedCredentials: CodexCredential[] = [];
   const observedClaudeCredentials: string[] = [];
+  const observedOpenRouterCredentials: string[] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   let mode: ExtensionContext["mode"] = "tui";
   let provider = "openai-codex";
   let authEnabled = true;
+  let openRouterAuthEnabled = true;
   let accountId = "account-1";
   let authWait: Promise<void> | undefined;
   let showThemeColors = false;
@@ -59,6 +65,7 @@ function registerFixture() {
     availableLimitResetCredits: 2,
   });
   let claudeReads = 0;
+  let openRouterReads = 0;
   let claudeAcquisition: Effect.Effect<
     AcquiredClaudeSubscriptionUsage,
     | ClaudeAcquisitionCoordinationUnavailable
@@ -67,6 +74,10 @@ function registerFixture() {
     usedPercent: 80,
     resetsAtMs: 2_000_000,
   });
+  let openRouterAcquisition: Effect.Effect<
+    AcquiredOpenRouterKeyCapacity,
+    OpenRouterKeyCapacityAcquisitionError
+  > = Effect.succeed({ kind: "limited", remainingUsd: 12.34 });
 
   registerMonitoredProviderCapacity(pi, {
     now: Effect.suspend(() => now),
@@ -80,6 +91,11 @@ function registerFixture() {
       observedClaudeCredentials.push(credential);
       return claudeAcquisition;
     },
+    acquireOpenRouterKeyCapacity: (credential) => {
+      openRouterReads += 1;
+      observedOpenRouterCredentials.push(credential);
+      return openRouterAcquisition;
+    },
   });
 
   const ctx = {
@@ -92,6 +108,14 @@ function registerFixture() {
     modelRegistry: {
       getProviderAuth: async (providerName: string) => {
         await authWait;
+        if (providerName === "openrouter") {
+          return openRouterAuthEnabled
+            ? {
+                auth: { apiKey: "openrouter-key" },
+                source: "OPENROUTER_API_KEY" as const,
+              }
+            : undefined;
+        }
         return providerName !== "openai-codex" || authEnabled
           ? {
               auth: { apiKey: accessTokenFor(accountId) },
@@ -120,7 +144,9 @@ function registerFixture() {
     emit,
     observedCredentials,
     observedClaudeCredentials,
+    observedOpenRouterCredentials,
     claudeReads: () => claudeReads,
+    openRouterReads: () => openRouterReads,
     statuses,
     setMode: (value: ExtensionContext["mode"]) => {
       mode = value;
@@ -130,6 +156,9 @@ function registerFixture() {
     },
     setAuthEnabled: (value: boolean) => {
       authEnabled = value;
+    },
+    setOpenRouterAuthEnabled: (value: boolean) => {
+      openRouterAuthEnabled = value;
     },
     setAccountId: (value: string) => {
       accountId = value;
@@ -149,6 +178,9 @@ function registerFixture() {
     setClaudeAcquisition: (value: typeof claudeAcquisition) => {
       claudeAcquisition = value;
     },
+    setOpenRouterAcquisition: (value: typeof openRouterAcquisition) => {
+      openRouterAcquisition = value;
+    },
   };
 }
 
@@ -159,9 +191,10 @@ test("session start adapts Pi authentication and quota presentation", async () =
     { accessToken: accessTokenFor("account-1"), accountId: "account-1" },
   ]);
   assert.deepEqual(f.observedClaudeCredentials, [accessTokenFor("account-1")]);
+  assert.deepEqual(f.observedOpenRouterCredentials, ["openrouter-key"]);
   assert.deepEqual(f.statuses.at(-1), {
     key: "pi-usage",
-    text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m",
+    text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
   });
   await f.emit("session_shutdown");
 });
@@ -172,9 +205,23 @@ test("missing Codex authentication remains unavailable without delaying Claude",
   await f.emit("session_start");
   assert.deepEqual(f.statuses.at(-1), {
     key: "pi-usage",
-    text: "Codex wk unavailable Claude wk ━━━━━━━━── 80% 16m",
+    text: "Codex wk unavailable Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
   });
   assert.equal(f.observedCredentials.length, 0);
+  await f.emit("session_shutdown");
+});
+
+test("missing OpenRouter authentication remains visibly unavailable", async () => {
+  const f = registerFixture();
+  f.setOpenRouterAuthEnabled(false);
+
+  await f.emit("session_start");
+
+  assert.equal(f.openRouterReads(), 0);
+  assert.deepEqual(f.statuses.at(-1), {
+    key: "pi-usage",
+    text: "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter unavailable",
+  });
   await f.emit("session_shutdown");
 });
 
@@ -195,7 +242,7 @@ test("provider names and independently colored details compose without a separat
   await f.emit("session_start");
   assert.equal(
     f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [warning:wk ━━━━━━━━── 80% 16m]",
+    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [warning:wk ━━━━━━━━── 80% 16m] [accent:OpenRouter] [dim:$12.34 left]",
   );
   await f.emit("session_shutdown");
 });
@@ -208,7 +255,7 @@ test("a failed provider remains independently presentable", async () => {
   await f.emit("session_start");
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk unavailable",
+    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk unavailable OpenRouter $12.34 left",
   );
   await f.emit("session_shutdown");
 });
@@ -220,7 +267,7 @@ test("a provider defect does not reorder or recolor the other provider", async (
   await f.emit("session_start");
   assert.equal(
     f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [dim:wk unavailable]",
+    "[accent:Codex] [dim:wk ━━━━━━──── 63% 16m ↻2] [accent:Claude] [dim:wk unavailable] [accent:OpenRouter] [dim:$12.34 left]",
   );
   await f.emit("session_shutdown");
 });
@@ -258,14 +305,20 @@ test("a non-TUI session start closes the previous TUI session", async () => {
   await f.emit("session_shutdown");
 });
 
-test("model selection refreshes both monitored providers", async () => {
+test("model selection refreshes all monitored providers", async () => {
   const f = registerFixture();
   await f.emit("session_start");
-  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [1, 1]);
+  assert.deepEqual(
+    [f.observedCredentials.length, f.claudeReads(), f.openRouterReads()],
+    [1, 1, 1],
+  );
 
   await f.emit("model_select");
 
-  assert.deepEqual([f.observedCredentials.length, f.claudeReads()], [2, 2]);
+  assert.deepEqual(
+    [f.observedCredentials.length, f.claudeReads(), f.openRouterReads()],
+    [2, 2, 2],
+  );
   await f.emit("session_shutdown");
 });
 
@@ -289,10 +342,12 @@ test("activity refreshes only the direct provider that handled it", async () => 
   assert.equal(f.observedCredentials.length, 1);
   assert.equal(f.claudeReads(), 2);
 
+  assert.equal(f.openRouterReads(), 1);
   f.setProvider("openrouter");
   await f.emit("agent_settled");
   assert.equal(f.observedCredentials.length, 1);
   assert.equal(f.claudeReads(), 2);
+  assert.equal(f.openRouterReads(), 2);
   await f.emit("session_shutdown");
 });
 
@@ -305,7 +360,7 @@ test("responses from another provider are ignored", async () => {
   });
   assert.equal(
     f.statuses.at(-1)?.text,
-    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m",
+    "Codex wk ━━━━━━──── 63% 16m ↻2 Claude wk ━━━━━━━━── 80% 16m OpenRouter $12.34 left",
   );
   await f.emit("session_shutdown");
 });

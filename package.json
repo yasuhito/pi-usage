@@ -1,12 +1,13 @@
 {
   "name": "@yasuhito/pi-usage",
   "version": "0.1.0",
-  "description": "A Pi extension that displays Codex and Claude weekly subscription usage",
+  "description": "A Pi extension that displays Codex and Claude subscription usage plus OpenRouter key remaining spend",
   "keywords": [
     "pi-package",
     "pi-extension",
     "codex",
     "claude",
+    "openrouter",
     "usage"
   ],
   "type": "module",

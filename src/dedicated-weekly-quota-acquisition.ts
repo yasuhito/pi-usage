@@ -3,6 +3,7 @@ import {
   readBoundedResponseBody,
   withFinalizedResponseBody,
 } from "./bounded-response-body.ts";
+import { retryAfterDeadlineMs } from "./retry-after.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -69,20 +70,6 @@ const ProviderBody = Schema.Struct({
   rate_limit: Schema.Record({ key: Schema.String, value: Schema.Unknown }),
   rate_limit_reset_credits: Schema.optional(Schema.Unknown),
 });
-
-function retryAtMs(response: Response, now: number): number | undefined {
-  const rawValue = response.headers.get("retry-after");
-  if (rawValue === null) return undefined;
-  if (/^\d+$/.test(rawValue)) {
-    const retryAt = now + Number(rawValue) * 1_000;
-    return Number.isFinite(retryAt) ? retryAt : undefined;
-  }
-  const retryAt = Date.parse(rawValue);
-  return Number.isFinite(retryAt) &&
-    new Date(retryAt).toUTCString() === rawValue
-    ? retryAt
-    : undefined;
-}
 
 function interpretProviderBody(
   body: typeof ProviderBody.Type,
@@ -158,7 +145,7 @@ export function createAcquireDedicatedWeeklyQuotaUsage(
               return yield* new TemporaryAcquisitionFailure({
                 retryAtMs:
                   response.status === 429
-                    ? retryAtMs(response, now)
+                    ? retryAfterDeadlineMs(response, now)
                     : undefined,
               });
             }

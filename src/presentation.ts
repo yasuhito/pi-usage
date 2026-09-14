@@ -19,7 +19,10 @@ export type OpenRouterKeyCapacityStatus =
       readonly remainingUsd: number;
       readonly stale: boolean;
     }
-  | { readonly kind: "openrouter-key-no-limit" };
+  | {
+      readonly kind: "openrouter-key-no-limit";
+      readonly stale: boolean;
+    };
 
 export type ProviderCapacityStatus =
   | WeeklySubscriptionUsageStatus
@@ -84,6 +87,36 @@ export function presentProviderSubscriptionUsage(
     providerName,
     detail: `wk ${bar} ${usedPercent}%${resetCountdownSuffix}${limitResetCreditsSuffix}${status.stale ? " ~" : ""}`,
     color: usedPercent >= 90 ? "error" : usedPercent >= 75 ? "warning" : "dim",
+  };
+}
+
+export function presentOpenRouterKeyCapacity(
+  status: OpenRouterKeyCapacityStatus,
+): ProviderCapacityPresentation {
+  if (status.kind === "loading" || status.kind === "unavailable") {
+    return {
+      providerName: "OpenRouter",
+      detail: status.kind === "loading" ? "loading…" : "unavailable",
+      color: "dim",
+    };
+  }
+
+  if (status.kind === "openrouter-key-no-limit") {
+    return {
+      providerName: "OpenRouter",
+      detail: `no limit${status.stale ? " ~" : ""}`,
+      color: "dim",
+    };
+  }
+
+  const amount =
+    status.remainingUsd > 0 && status.remainingUsd < 0.01
+      ? "<$0.01"
+      : `$${Math.max(0, status.remainingUsd).toFixed(2)}`;
+  return {
+    providerName: "OpenRouter",
+    detail: `${amount} left${status.stale ? " ~" : ""}`,
+    color: "dim",
   };
 }
 

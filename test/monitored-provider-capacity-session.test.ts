@@ -437,7 +437,10 @@ test("accepts non-weekly capacity through the provider roster", async () => {
           piProviderId: "openrouter",
           makeLayer: (publish) =>
             Layer.succeed(ProviderMonitorService, {
-              start: publish({ kind: "openrouter-key-no-limit" }).pipe(
+              start: publish({
+                kind: "openrouter-key-no-limit",
+                stale: false,
+              }).pipe(
                 Effect.andThen(
                   publish({
                     kind: "openrouter-key-remaining-spend",
@@ -470,7 +473,7 @@ test("accepts non-weekly capacity through the provider roster", async () => {
   assert.deepEqual(presentations, [
     [
       {
-        status: { kind: "openrouter-key-no-limit" },
+        status: { kind: "openrouter-key-no-limit", stale: false },
         presentation: {
           providerName: "OpenRouter",
           detail: "no limit",

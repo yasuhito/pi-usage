@@ -270,7 +270,7 @@ export function makeClaudeProviderMonitor(
     WeeklySubscriptionUsageStatus
   >(makeClaudeProviderMonitorAdapter(dependencies), {
     ...dependencies,
-    pollIntervalMs: POLL_INTERVAL_MS,
+    polling: { kind: "periodic", intervalMs: POLL_INTERVAL_MS },
   });
 }
 

@@ -3,11 +3,13 @@ import {
   readBoundedResponseBody,
   withFinalizedResponseBody,
 } from "./bounded-response-body.ts";
+import { IsoInstant } from "./iso-instant.ts";
 import type {
   CoordinatedAcquisitionAttempt,
   CoordinatedAcquisitionOutcome,
   ProviderAcquisitionCoordinator,
 } from "./provider-acquisition-coordinator.ts";
+import { retryAfterDeadlineMs } from "./retry-after.ts";
 
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -111,72 +113,12 @@ interface SharedClaudeSubscriptionUsage {
   readonly resetsAtMs: number;
 }
 
-const ISO_INSTANT_PATTERN =
-  /^(\d{4}|[+-]\d{6})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-](\d{2}):(\d{2}))$/;
-
-function isValidIsoInstant(value: string): boolean {
-  const match = ISO_INSTANT_PATTERN.exec(value);
-  if (match === null) return false;
-
-  const [, rawYear, rawMonth, rawDay, rawHour, rawMinute, rawSecond] = match;
-  const year = Number(rawYear);
-  const month = Number(rawMonth);
-  const day = Number(rawDay);
-  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = [
-    31,
-    leapYear ? 29 : 28,
-    31,
-    30,
-    31,
-    30,
-    31,
-    31,
-    30,
-    31,
-    30,
-    31,
-  ];
-
-  return (
-    month >= 1 &&
-    month <= 12 &&
-    day >= 1 &&
-    day <= (daysInMonth[month - 1] ?? 0) &&
-    Number(rawHour) <= 23 &&
-    Number(rawMinute) <= 59 &&
-    Number(rawSecond ?? 0) <= 59 &&
-    Number(match[7] ?? 0) <= 23 &&
-    Number(match[8] ?? 0) <= 59 &&
-    Number.isFinite(Date.parse(value))
-  );
-}
-
-const IsoInstant = Schema.String.pipe(
-  Schema.filter(isValidIsoInstant),
-  Schema.compose(Schema.Date),
-);
-
 const ClaudeUsageBody = Schema.Struct({
   seven_day: Schema.Struct({
     utilization: Schema.Number.pipe(Schema.between(0, 100)),
     resets_at: IsoInstant,
   }),
 });
-
-function retryAtMs(response: Response, now: number): number | undefined {
-  const rawValue = response.headers.get("retry-after");
-  if (rawValue === null) return undefined;
-  if (/^\d+$/.test(rawValue)) {
-    const retryAt = now + Number(rawValue) * 1_000;
-    return Number.isFinite(retryAt) ? retryAt : undefined;
-  }
-  const retryAt = Date.parse(rawValue);
-  return Number.isFinite(retryAt) &&
-    new Date(retryAt).toUTCString() === rawValue
-    ? retryAt
-    : undefined;
-}
 
 function requestUsage(
   fetchImplementation: typeof fetch,
@@ -219,9 +161,9 @@ function classifyResponse(
               response.status === 429
                 ? Math.max(
                     now + RATE_LIMIT_COOLDOWN_MS,
-                    retryAtMs(response, now) ?? 0,
+                    retryAfterDeadlineMs(response, now) ?? 0,
                   )
-                : retryAtMs(response, now),
+                : retryAfterDeadlineMs(response, now),
           }),
         ),
       ),

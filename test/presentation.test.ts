@@ -3,6 +3,7 @@ import { test } from "vitest";
 
 import {
   presentCodexQuotaStatus,
+  presentOpenRouterKeyCapacity,
   presentProviderSubscriptionUsage,
 } from "../src/presentation.ts";
 
@@ -133,6 +134,56 @@ test("loading and unavailable statuses have compact neutral presentations", () =
   });
   assert.deepEqual(presentCodexQuotaStatus({ kind: "unavailable" }), {
     text: "Codex wk unavailable",
+    color: "dim",
+  });
+});
+
+test("OpenRouter key remaining spend is presented as neutral USD", () => {
+  for (const [remainingUsd, detail] of [
+    [12.344, "$12.34 left"],
+    [12.345, "$12.35 left"],
+    [0.004, "<$0.01 left"],
+    [0, "$0.00 left"],
+  ] as const) {
+    assert.deepEqual(
+      presentOpenRouterKeyCapacity({
+        kind: "openrouter-key-remaining-spend",
+        remainingUsd,
+        stale: false,
+      }),
+      { providerName: "OpenRouter", detail, color: "dim" },
+    );
+  }
+});
+
+test("OpenRouter capacity presents freshness and acquisition states", () => {
+  assert.deepEqual(
+    presentOpenRouterKeyCapacity({
+      kind: "openrouter-key-remaining-spend",
+      remainingUsd: 12.34,
+      stale: true,
+    }),
+    {
+      providerName: "OpenRouter",
+      detail: "$12.34 left ~",
+      color: "dim",
+    },
+  );
+  assert.deepEqual(
+    presentOpenRouterKeyCapacity({
+      kind: "openrouter-key-no-limit",
+      stale: false,
+    }),
+    { providerName: "OpenRouter", detail: "no limit", color: "dim" },
+  );
+  assert.deepEqual(presentOpenRouterKeyCapacity({ kind: "loading" }), {
+    providerName: "OpenRouter",
+    detail: "loading…",
+    color: "dim",
+  });
+  assert.deepEqual(presentOpenRouterKeyCapacity({ kind: "unavailable" }), {
+    providerName: "OpenRouter",
+    detail: "unavailable",
     color: "dim",
   });
 });

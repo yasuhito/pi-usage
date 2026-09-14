@@ -3,10 +3,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
-import {
-  type ClaudeAuthentication,
-  claudeProviderMonitorLayer,
-} from "./claude-provider-monitor.ts";
+import { claudeProviderMonitorLayer } from "./claude-provider-monitor.ts";
 import type { AcquireClaudeSubscriptionUsage } from "./claude-subscription-usage-acquisition.ts";
 import {
   type CodexCredentialResolution,
@@ -20,7 +17,11 @@ import {
   defineMonitoredProvider,
   makeMonitoredProviderCapacitySession,
 } from "./monitored-provider-capacity-session.ts";
+import type { AcquireOpenRouterKeyCapacity } from "./openrouter-key-capacity-acquisition.ts";
+import { openRouterProviderMonitorLayer } from "./openrouter-provider-monitor.ts";
 import {
+  type OpenRouterKeyCapacityStatus,
+  presentOpenRouterKeyCapacity,
   presentProviderSubscriptionUsage,
   type WeeklySubscriptionUsageStatus,
 } from "./presentation.ts";
@@ -32,6 +33,7 @@ export interface MonitoredProviderCapacityDependencies {
   readonly acquireClaudeSubscriptionUsage: (
     ctx: ExtensionContext,
   ) => AcquireClaudeSubscriptionUsage;
+  readonly acquireOpenRouterKeyCapacity: AcquireOpenRouterKeyCapacity;
   readonly now?: Effect.Effect<number>;
   readonly random?: Effect.Effect<number>;
 }
@@ -81,11 +83,17 @@ function credentialFromContext(
   return accountId === undefined ? undefined : { accessToken, accountId };
 }
 
-function claudeAuthenticationResolution(
+interface PiApiKeyAuthentication {
+  readonly source?: string;
+  readonly auth: { readonly apiKey?: string };
+}
+
+function authenticationResolution(
   ctx: ExtensionContext,
-): () => Effect.Effect<ClaudeAuthentication | undefined, unknown> {
+  piProviderId: string,
+): () => Effect.Effect<PiApiKeyAuthentication | undefined, unknown> {
   return () =>
-    Effect.tryPromise(() => ctx.modelRegistry.getProviderAuth("anthropic"));
+    Effect.tryPromise(() => ctx.modelRegistry.getProviderAuth(piProviderId));
 }
 
 function credentialResolution(ctx: ExtensionContext) {
@@ -152,7 +160,10 @@ export function registerMonitoredProviderCapacity(
             piProviderId: "anthropic",
             makeLayer: (publish) =>
               claudeProviderMonitorLayer({
-                resolveAuthentication: claudeAuthenticationResolution(ctx),
+                resolveAuthentication: authenticationResolution(
+                  ctx,
+                  "anthropic",
+                ),
                 acquireClaudeSubscriptionUsage:
                   dependencies.acquireClaudeSubscriptionUsage(ctx),
                 publish,
@@ -162,6 +173,23 @@ export function registerMonitoredProviderCapacity(
               }),
             present: (status, currentTime) =>
               presentProviderSubscriptionUsage("Claude", status, currentTime),
+          }),
+          defineMonitoredProvider<OpenRouterKeyCapacityStatus>({
+            piProviderId: "openrouter",
+            makeLayer: (publish) =>
+              openRouterProviderMonitorLayer({
+                resolveAuthentication: authenticationResolution(
+                  ctx,
+                  "openrouter",
+                ),
+                acquireOpenRouterKeyCapacity:
+                  dependencies.acquireOpenRouterKeyCapacity,
+                publish,
+                ...(dependencies.random === undefined
+                  ? {}
+                  : { random: dependencies.random }),
+              }),
+            present: (status) => presentOpenRouterKeyCapacity(status),
           }),
         ],
       }),

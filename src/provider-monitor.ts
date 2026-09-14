@@ -120,6 +120,10 @@ export type ProviderAcquisitionHealth =
       readonly kind: "temporarily-unavailable";
       readonly providerNotBeforeMs: number | undefined;
     }
+  | {
+      readonly kind: "trigger-deferred";
+      readonly providerNotBeforeMs: number | undefined;
+    }
   | { readonly kind: "credential-rejected" }
   | { readonly kind: "terminal" };
 
@@ -152,11 +156,16 @@ export interface ProviderMonitorAdapter<
   readonly finalize: Effect.Effect<void>;
 }
 
+export type ProviderPollingPolicy =
+  | { readonly kind: "periodic"; readonly intervalMs: number }
+  | { readonly kind: "disabled" };
+
 interface ProviderMonitorDependencies<Status extends ProviderCapacityStatus> {
   readonly publish: (
     status: ProviderMonitorStatus<Status>,
   ) => Effect.Effect<void>;
-  readonly pollIntervalMs?: number;
+  /** Omitted for the default one-minute polling interval. */
+  readonly polling?: ProviderPollingPolicy;
   readonly random?: Effect.Effect<number>;
 }
 
@@ -192,6 +201,7 @@ export function makeProviderMonitor<
     let nextAttemptAt = 0;
     let consecutiveFailures = 0;
     let terminal = false;
+    let forcedRefreshDeferred = false;
     let acquisitionDemanded = false;
     let observationSuppressionsInFlight = 0;
     let accountChangeRefreshesInFlight = 0;
@@ -217,6 +227,7 @@ export function makeProviderMonitor<
 
     const resetSchedule = Effect.gen(function* () {
       terminal = false;
+      forcedRefreshDeferred = false;
       nextAttemptAt = 0;
       consecutiveFailures = 0;
       yield* interruptRetry;
@@ -344,8 +355,12 @@ export function makeProviderMonitor<
         if (!isCurrent(generationSnapshot) || health === undefined) return;
         if (health.kind === "credential-rejected") return;
         const now = yield* Clock.currentTimeMillis;
-        if (health.kind === "temporarily-unavailable") {
+        if (
+          health.kind === "temporarily-unavailable" ||
+          health.kind === "trigger-deferred"
+        ) {
           terminal = false;
+          forcedRefreshDeferred = health.kind === "trigger-deferred";
           consecutiveFailures += 1;
           const providerDeadline = health.providerNotBeforeMs;
           if (
@@ -370,7 +385,9 @@ export function makeProviderMonitor<
             );
             nextAttemptAt = now + delay;
           }
-          yield* scheduleRetry(generationSnapshot, now);
+          if (health.kind === "temporarily-unavailable") {
+            yield* scheduleRetry(generationSnapshot, now);
+          }
           return;
         }
         yield* resetSchedule;
@@ -466,9 +483,10 @@ export function makeProviderMonitor<
         const inspected = yield* resolveCredential(generationSnapshot);
         if (!isCurrent(generationSnapshot)) return;
         if (inspected.resolution.kind === "unavailable") return;
-        if (terminal && mode === "ordinary") return;
+        const honorSchedule = mode === "ordinary" || forcedRefreshDeferred;
+        if (terminal && honorSchedule) return;
         const now = yield* Clock.currentTimeMillis;
-        if (mode === "ordinary" && now < nextAttemptAt) {
+        if (honorSchedule && now < nextAttemptAt) {
           const facts = yield* adapter.advance({
             kind: "acquisition-deferred",
             nowMs: now,
@@ -537,21 +555,30 @@ export function makeProviderMonitor<
         accountChangeRefreshesInFlight = 0;
         currentIdentity = undefined;
         acceptPassiveObservation = false;
+        forcedRefreshDeferred = false;
         yield* adapter.advance({ kind: "session-ended" });
         yield* adapter.finalize;
       }),
     );
 
-    yield* Effect.forkIn(
-      Stream.tick(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS).pipe(
-        Stream.drop(1),
-        Stream.runForEach(() =>
-          Effect.suspend(() => triggerRefresh("ordinary")).pipe(Effect.asVoid),
+    if (dependencies.polling?.kind !== "disabled") {
+      const pollIntervalMs =
+        dependencies.polling?.kind === "periodic"
+          ? dependencies.polling.intervalMs
+          : DEFAULT_POLL_INTERVAL_MS;
+      yield* Effect.forkIn(
+        Stream.tick(pollIntervalMs).pipe(
+          Stream.drop(1),
+          Stream.runForEach(() =>
+            Effect.suspend(() => triggerRefresh("ordinary")).pipe(
+              Effect.asVoid,
+            ),
+          ),
+          Effect.asVoid,
         ),
-        Effect.asVoid,
-      ),
-      scope,
-    );
+        scope,
+      );
+    }
 
     return {
       start: dependencies
