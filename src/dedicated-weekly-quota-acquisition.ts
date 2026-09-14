@@ -1,13 +1,8 @@
-import { Clock, Data, Effect, Schema } from "effect";
-import {
-  readBoundedResponseBody,
-  withFinalizedResponseBody,
-} from "./bounded-response-body.ts";
-import { retryAfterDeadlineMs } from "./retry-after.ts";
+import { Data, Effect, Schema } from "effect";
+import { exchangeProviderJson } from "./provider-json-exchange.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 5_000;
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
 const WINDOW_POSITIONS = ["primary", "secondary"] as const;
 
@@ -110,74 +105,48 @@ function interpretProviderBody(
   return undefined;
 }
 
+function interpretUsage(
+  body: unknown,
+): Effect.Effect<AcquiredWeeklyQuotaUsage, MalformedAcquisition> {
+  return Schema.decodeUnknown(ProviderBody)(body).pipe(
+    Effect.mapError(() => new MalformedAcquisition()),
+    Effect.flatMap((providerBody) => {
+      const usage = interpretProviderBody(providerBody);
+      return usage === undefined
+        ? Effect.fail(new MalformedAcquisition())
+        : Effect.succeed(usage);
+    }),
+  );
+}
+
 export function createAcquireDedicatedWeeklyQuotaUsage(
   dependencies: DedicatedWeeklyQuotaAcquisitionDependencies,
 ): AcquireDedicatedWeeklyQuotaUsage {
   return (credential) =>
-    Effect.gen(function* () {
-      const response = yield* Effect.tryPromise({
-        try: (signal) =>
-          dependencies.fetch(CODEX_USAGE_URL, {
-            method: "GET",
-            headers: {
-              Authorization: `Bearer ${credential.accessToken}`,
-              "ChatGPT-Account-Id": credential.accountId,
-            },
-            redirect: "manual",
-            signal,
+    exchangeProviderJson(
+      dependencies.fetch,
+      {
+        target: CODEX_USAGE_URL,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${credential.accessToken}`,
+          "ChatGPT-Account-Id": credential.accountId,
+        },
+        maximumResponseBytes: MAX_RESPONSE_BYTES,
+      },
+      interpretUsage,
+    ).pipe(
+      Effect.catchTags({
+        // Codex honors a retry instruction only while rate limited.
+        TemporaryProviderJsonExchangeFailure: ({ status, retryAtMs }) =>
+          new TemporaryAcquisitionFailure({
+            retryAtMs: status === 429 ? retryAtMs : undefined,
           }),
-        catch: () => new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
-      });
-
-      return yield* withFinalizedResponseBody(response, (response) =>
-        Effect.gen(function* () {
-          if (!response.ok) {
-            if (response.status === 401 || response.status === 403) {
-              return yield* new AuthenticationRejected();
-            }
-            if (
-              response.status === 408 ||
-              response.status === 425 ||
-              response.status === 429 ||
-              response.status >= 500
-            ) {
-              const now = yield* Clock.currentTimeMillis;
-              return yield* new TemporaryAcquisitionFailure({
-                retryAtMs:
-                  response.status === 429
-                    ? retryAfterDeadlineMs(response, now)
-                    : undefined,
-              });
-            }
-            return yield* new PermanentAcquisitionFailure();
-          }
-
-          const text = yield* readBoundedResponseBody(
-            response,
-            MAX_RESPONSE_BYTES,
-            () => new MalformedAcquisition(),
-            () => new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
-          );
-          let unknownBody: unknown;
-          try {
-            unknownBody = JSON.parse(text) as unknown;
-          } catch {
-            return yield* new MalformedAcquisition();
-          }
-          const body = yield* Schema.decodeUnknown(ProviderBody)(
-            unknownBody,
-          ).pipe(Effect.mapError(() => new MalformedAcquisition()));
-          const usage = interpretProviderBody(body);
-          return usage === undefined
-            ? yield* new MalformedAcquisition()
-            : usage;
-        }),
-      );
-    }).pipe(
-      Effect.timeoutFail({
-        duration: REQUEST_TIMEOUT_MS,
-        onTimeout: () =>
-          new TemporaryAcquisitionFailure({ retryAtMs: undefined }),
+        ProviderJsonExchangeAuthenticationRejected: () =>
+          new AuthenticationRejected(),
+        PermanentProviderJsonExchangeFailure: () =>
+          new PermanentAcquisitionFailure(),
+        MalformedProviderJsonExchange: () => new MalformedAcquisition(),
       }),
     );
 }

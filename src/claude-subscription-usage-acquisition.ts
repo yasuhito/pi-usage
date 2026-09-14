@@ -1,19 +1,14 @@
 import { Cause, Clock, Data, Effect, Schema } from "effect";
-import {
-  readBoundedResponseBody,
-  withFinalizedResponseBody,
-} from "./bounded-response-body.ts";
 import { IsoInstant } from "./iso-instant.ts";
 import type {
   CoordinatedAcquisitionAttempt,
   CoordinatedAcquisitionOutcome,
   ProviderAcquisitionCoordinator,
 } from "./provider-acquisition-coordinator.ts";
-import { retryAfterDeadlineMs } from "./retry-after.ts";
+import { exchangeProviderJson } from "./provider-json-exchange.ts";
 
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RESPONSE_BYTES = 64 * 1024;
-const REQUEST_TIMEOUT_MS = 5_000;
 const RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
 // Compatibility identifier for the verified Claude Code OAuth request shape.
 // Update only after re-verifying the contract documented in the prototype.
@@ -120,105 +115,77 @@ const ClaudeUsageBody = Schema.Struct({
   }),
 });
 
-function requestUsage(
-  fetchImplementation: typeof fetch,
-  key: string,
-): Effect.Effect<Response, ClaudeSubscriptionUsageExchangeError> {
-  return Effect.tryPromise({
-    try: (signal) =>
-      fetchImplementation(CLAUDE_USAGE_URL, {
-        method: "GET",
-        headers: {
-          ...CLAUDE_USAGE_HEADERS,
-          Authorization: `Bearer ${key}`,
-        },
-        redirect: "manual",
-        signal,
-      }),
-    catch: () =>
-      new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs: undefined }),
+function interpretUsage(
+  body: unknown,
+): Effect.Effect<
+  AcquiredClaudeSubscriptionUsage,
+  MalformedClaudeSubscriptionUsage
+> {
+  return Effect.gen(function* () {
+    const usage = yield* Schema.decodeUnknown(ClaudeUsageBody)(body).pipe(
+      Effect.mapError(() => new MalformedClaudeSubscriptionUsage()),
+    );
+    const resetsAtMs = usage.seven_day.resets_at.getTime();
+    const now = yield* Clock.currentTimeMillis;
+    if (resetsAtMs <= now) {
+      return yield* new MalformedClaudeSubscriptionUsage();
+    }
+    return {
+      usedPercent: usage.seven_day.utilization,
+      resetsAtMs,
+    };
   });
 }
 
-function classifyResponse(
-  response: Response,
-): Effect.Effect<Response, ClaudeSubscriptionUsageExchangeError> {
-  if (response.ok) return Effect.succeed(response);
-  if (response.status === 401 || response.status === 403) {
-    return Effect.fail(new ClaudeAuthenticationRejected());
+/** Rate limiting waits at least fifteen minutes, whatever the provider asked. */
+function temporaryFailure(
+  status: number | undefined,
+  retryAtMs: number | undefined,
+): Effect.Effect<never, TemporaryClaudeSubscriptionUsageFailure> {
+  if (status !== 429) {
+    return new TemporaryClaudeSubscriptionUsageFailure({ retryAtMs });
   }
-  if (
-    response.status === 408 ||
-    response.status === 425 ||
-    response.status === 429 ||
-    response.status >= 500
-  ) {
-    return Clock.currentTimeMillis.pipe(
-      Effect.flatMap((now) =>
-        Effect.fail(
-          new TemporaryClaudeSubscriptionUsageFailure({
-            retryAtMs:
-              response.status === 429
-                ? Math.max(
-                    now + RATE_LIMIT_COOLDOWN_MS,
-                    retryAfterDeadlineMs(response, now) ?? 0,
-                  )
-                : retryAfterDeadlineMs(response, now),
-          }),
-        ),
-      ),
-    );
-  }
-  return Effect.fail(new PermanentClaudeSubscriptionUsageFailure());
+  return Clock.currentTimeMillis.pipe(
+    Effect.flatMap(
+      (now) =>
+        new TemporaryClaudeSubscriptionUsageFailure({
+          retryAtMs: Math.max(now + RATE_LIMIT_COOLDOWN_MS, retryAtMs ?? 0),
+        }),
+    ),
+  );
 }
 
 export function createAcquireClaudeSubscriptionUsage(
   dependencies: ClaudeSubscriptionUsageAcquisitionDependencies,
 ): AcquireClaudeSubscriptionUsage {
-  const decodeUsage = (response: Response) =>
-    Effect.gen(function* () {
-      const text = yield* readBoundedResponseBody(
-        response,
-        MAX_RESPONSE_BYTES,
-        () => new MalformedClaudeSubscriptionUsage(),
-        () =>
-          new TemporaryClaudeSubscriptionUsageFailure({
-            retryAtMs: undefined,
-          }),
-      );
-      let unknownBody: unknown;
-      try {
-        unknownBody = JSON.parse(text) as unknown;
-      } catch {
-        return yield* new MalformedClaudeSubscriptionUsage();
-      }
-      const body = yield* Schema.decodeUnknown(ClaudeUsageBody)(
-        unknownBody,
-      ).pipe(Effect.mapError(() => new MalformedClaudeSubscriptionUsage()));
-      const resetsAtMs = body.seven_day.resets_at.getTime();
-      const now = yield* Clock.currentTimeMillis;
-      if (resetsAtMs <= now) {
-        return yield* new MalformedClaudeSubscriptionUsage();
-      }
-      return {
-        usedPercent: body.seven_day.utilization,
-        resetsAtMs,
-      };
-    });
-
-  const exchange = (key: string) =>
-    requestUsage(dependencies.fetch, key).pipe(
-      Effect.flatMap((response) =>
-        withFinalizedResponseBody(response, (response) =>
-          classifyResponse(response).pipe(Effect.flatMap(decodeUsage)),
-        ),
-      ),
-      Effect.timeoutFail({
-        duration: REQUEST_TIMEOUT_MS,
-        onTimeout: () =>
-          new TemporaryClaudeSubscriptionUsageFailure({
-            retryAtMs: undefined,
-          }),
+  const exchange = (
+    key: string,
+  ): Effect.Effect<
+    AcquiredClaudeSubscriptionUsage,
+    ClaudeSubscriptionUsageExchangeError
+  > =>
+    exchangeProviderJson(
+      dependencies.fetch,
+      {
+        target: CLAUDE_USAGE_URL,
+        method: "GET",
+        headers: {
+          ...CLAUDE_USAGE_HEADERS,
+          Authorization: `Bearer ${key}`,
+        },
+        maximumResponseBytes: MAX_RESPONSE_BYTES,
+      },
+      interpretUsage,
+    ).pipe(
+      Effect.catchTags({
+        TemporaryProviderJsonExchangeFailure: ({ status, retryAtMs }) =>
+          temporaryFailure(status, retryAtMs),
+        ProviderJsonExchangeAuthenticationRejected: () =>
+          new ClaudeAuthenticationRejected(),
+        PermanentProviderJsonExchangeFailure: () =>
+          new PermanentClaudeSubscriptionUsageFailure(),
+        MalformedProviderJsonExchange: () =>
+          new MalformedClaudeSubscriptionUsage(),
       }),
     );
 

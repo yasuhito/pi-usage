@@ -1,17 +1,12 @@
-import { Clock, Data, Effect, Schema } from "effect";
+import { Data, Effect, Schema } from "effect";
 
-import {
-  readBoundedResponseBody,
-  withFinalizedResponseBody,
-} from "./bounded-response-body.ts";
 import type { OpenRouterManagementKey } from "./openrouter-management-key-resolution.ts";
-import { retryAfterDeadlineMs } from "./retry-after.ts";
+import { exchangeProviderJson } from "./provider-json-exchange.ts";
 
 export type { OpenRouterManagementKey } from "./openrouter-management-key-resolution.ts";
 
 const OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits";
 const MAX_RESPONSE_BYTES = 64 * 1024;
-const REQUEST_TIMEOUT_MS = 5_000;
 
 export interface AcquiredOpenRouterAccountCreditBalance {
   readonly totalCreditsUsd: number;
@@ -60,101 +55,62 @@ const OpenRouterCreditsBody = Schema.Struct({
   }),
 });
 
-function requestBalance(
-  fetchImplementation: typeof fetch,
-  key: string,
-): Effect.Effect<Response, TemporaryOpenRouterAccountCreditBalanceFailure> {
-  return Effect.tryPromise({
-    try: (signal) =>
-      fetchImplementation(OPENROUTER_CREDITS_URL, {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${key}`,
-        },
-        redirect: "manual",
-        signal,
-      }),
-    catch: () => new TemporaryOpenRouterAccountCreditBalanceFailure(),
-  });
-}
-
-function classifyResponse(
-  response: Response,
-): Effect.Effect<Response, OpenRouterAccountCreditBalanceAcquisitionError> {
-  if (response.ok) return Effect.succeed(response);
-  if (response.status === 401 || response.status === 403) {
-    return Effect.fail(new OpenRouterManagementAuthenticationRejected());
-  }
-  if (
-    response.status === 408 ||
-    response.status === 425 ||
-    response.status === 429 ||
-    response.status >= 500
-  ) {
-    return Clock.currentTimeMillis.pipe(
-      Effect.flatMap((nowMs) => {
-        const retryDeadline = retryAfterDeadlineMs(response, nowMs);
-        return Effect.fail(
-          new TemporaryOpenRouterAccountCreditBalanceFailure(
-            retryDeadline === undefined ? {} : { retryAtMs: retryDeadline },
-          ),
-        );
-      }),
-    );
-  }
-  return Effect.fail(new PermanentOpenRouterAccountCreditBalanceFailure());
-}
-
-export function createAcquireOpenRouterAccountCreditBalance(
-  dependencies: OpenRouterAccountCreditBalanceAcquisitionDependencies,
-): AcquireOpenRouterAccountCreditBalance {
-  const decodeBalance = (response: Response) =>
-    Effect.gen(function* () {
-      const text = yield* readBoundedResponseBody(
-        response,
-        MAX_RESPONSE_BYTES,
-        () => new MalformedOpenRouterAccountCreditBalance(),
-        () => new TemporaryOpenRouterAccountCreditBalanceFailure(),
-      );
-      let unknownBody: unknown;
-      try {
-        unknownBody = JSON.parse(text) as unknown;
-      } catch {
-        return yield* new MalformedOpenRouterAccountCreditBalance();
-      }
-      const body = yield* Schema.decodeUnknown(OpenRouterCreditsBody)(
-        unknownBody,
-      ).pipe(
-        Effect.mapError(() => new MalformedOpenRouterAccountCreditBalance()),
-      );
-      const totalCreditsUsd = body.data.total_credits;
-      const totalUsageUsd = body.data.total_usage;
+function interpretBalance(
+  body: unknown,
+): Effect.Effect<
+  AcquiredOpenRouterAccountCreditBalance,
+  MalformedOpenRouterAccountCreditBalance
+> {
+  return Schema.decodeUnknown(OpenRouterCreditsBody)(body).pipe(
+    Effect.mapError(() => new MalformedOpenRouterAccountCreditBalance()),
+    Effect.flatMap(({ data }) => {
+      const totalCreditsUsd = data.total_credits;
+      const totalUsageUsd = data.total_usage;
       if (
         !Number.isFinite(totalCreditsUsd) ||
         !Number.isFinite(totalUsageUsd) ||
         totalCreditsUsd < 0 ||
         totalUsageUsd < 0
       ) {
-        return yield* new MalformedOpenRouterAccountCreditBalance();
+        return Effect.fail(new MalformedOpenRouterAccountCreditBalance());
       }
-      return {
+      return Effect.succeed({
         totalCreditsUsd,
         totalUsageUsd,
         balanceUsd: totalCreditsUsd - totalUsageUsd,
-      };
-    });
+      });
+    }),
+  );
+}
 
+export function createAcquireOpenRouterAccountCreditBalance(
+  dependencies: OpenRouterAccountCreditBalanceAcquisitionDependencies,
+): AcquireOpenRouterAccountCreditBalance {
   return (managementKey) =>
-    requestBalance(dependencies.fetch, managementKey).pipe(
-      Effect.flatMap((response) =>
-        withFinalizedResponseBody(response, (response) =>
-          classifyResponse(response).pipe(Effect.flatMap(decodeBalance)),
-        ),
-      ),
-      Effect.timeoutFail({
-        duration: REQUEST_TIMEOUT_MS,
-        onTimeout: () => new TemporaryOpenRouterAccountCreditBalanceFailure(),
+    exchangeProviderJson(
+      dependencies.fetch,
+      {
+        target: OPENROUTER_CREDITS_URL,
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${managementKey}`,
+        },
+        maximumResponseBytes: MAX_RESPONSE_BYTES,
+      },
+      interpretBalance,
+    ).pipe(
+      Effect.catchTags({
+        TemporaryProviderJsonExchangeFailure: ({ retryAtMs }) =>
+          new TemporaryOpenRouterAccountCreditBalanceFailure(
+            retryAtMs === undefined ? {} : { retryAtMs },
+          ),
+        ProviderJsonExchangeAuthenticationRejected: () =>
+          new OpenRouterManagementAuthenticationRejected(),
+        PermanentProviderJsonExchangeFailure: () =>
+          new PermanentOpenRouterAccountCreditBalanceFailure(),
+        MalformedProviderJsonExchange: () =>
+          new MalformedOpenRouterAccountCreditBalance(),
       }),
     );
 }
