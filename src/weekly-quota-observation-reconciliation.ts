@@ -245,20 +245,7 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
     if (result.observation.kind === "none") lastObservedAtMs = undefined;
     return reaction(result);
   };
-  const assertPositiveSafeInteger = (value: number, name: string): void => {
-    if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new RangeError(`${name} must be a positive safe integer`);
-    }
-  };
   const acceptEvidence = (provenance: ProviderEvidenceProvenance): boolean => {
-    assertPositiveSafeInteger(
-      provenance.credentialEpoch,
-      "provider credential epoch",
-    );
-    assertPositiveSafeInteger(
-      provenance.sequence,
-      "provider evidence sequence",
-    );
     if (credentialEpoch === undefined) {
       credentialEpoch = provenance.credentialEpoch;
     }
@@ -273,7 +260,6 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
     return true;
   };
   const selectCredentialEpoch = (nextCredentialEpoch: number) => {
-    assertPositiveSafeInteger(nextCredentialEpoch, "provider credential epoch");
     credentialEpoch = nextCredentialEpoch;
     latestEvidenceSequence = undefined;
   };

@@ -184,9 +184,12 @@ interface ProviderMonitorDependencies<Status extends ProviderCapacityStatus> {
 
 const continuityOf = <Credential>(
   previousIdentity: ProviderCredentialIdentity | undefined,
+  previousUnavailable: boolean,
   resolution: ResolvedProviderCredential<Credential>,
 ): ProviderCredentialContinuity => {
-  if (resolution.kind === "unavailable") return "unavailable";
+  if (resolution.kind === "unavailable") {
+    return previousUnavailable ? "unchanged" : "unavailable";
+  }
   return previousIdentity === resolution.identity ? "unchanged" : "changed";
 };
 
@@ -220,6 +223,7 @@ export function makeProviderMonitor<
     let observationSuppressionsInFlight = 0;
     let accountChangeRefreshesInFlight = 0;
     let currentIdentity: ProviderCredentialIdentity | undefined;
+    let credentialUnavailable = false;
     let acceptPassiveObservation = false;
     let credentialEpoch = 0;
     let evidenceSequence = 0;
@@ -347,10 +351,15 @@ export function makeProviderMonitor<
               new TypeError("provider credential identity must not be empty"),
             );
           }
-          const continuity = continuityOf(currentIdentity, resolution);
+          const continuity = continuityOf(
+            currentIdentity,
+            credentialUnavailable,
+            resolution,
+          );
           if (continuity !== "unchanged") credentialEpoch += 1;
           currentIdentity =
             resolution.kind === "available" ? resolution.identity : undefined;
+          credentialUnavailable = resolution.kind === "unavailable";
           acceptPassiveObservation = resolution.acceptPassiveObservation;
           const now = yield* Clock.currentTimeMillis;
           const facts = yield* adapter.advance({
@@ -602,6 +611,7 @@ export function makeProviderMonitor<
         observationSuppressionsInFlight = 0;
         accountChangeRefreshesInFlight = 0;
         currentIdentity = undefined;
+        credentialUnavailable = false;
         acceptPassiveObservation = false;
         forcedRefreshDeferred = false;
         yield* adapter.advance({ kind: "session-ended" });

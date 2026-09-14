@@ -209,6 +209,33 @@ it.scoped(
     }),
 );
 
+it.scoped(
+  "accumulates passive evidence while the credential stays invalid",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.setResolution({ kind: "invalid" });
+      yield* f.monitor.start;
+      yield* f.monitor.observeResponse({
+        "x-codex-secondary-used-percent": "82",
+        "x-codex-secondary-window-minutes": "10080",
+        "x-codex-secondary-reset-at": "2000",
+      });
+
+      yield* f.monitor.observeResponse({
+        "x-codex-secondary-used-percent": "85",
+      });
+
+      assert.deepEqual(f.statuses.at(-1), {
+        kind: "available",
+        usedPercent: 85,
+        stale: false,
+        weeklyWindowResetsAtMs: 2_000_000,
+      });
+      assert.equal(f.reads(), 0);
+    }),
+);
+
 it.scoped("isolates passive evidence from a silently changed account", () =>
   Effect.gen(function* () {
     const f = yield* fixture();
