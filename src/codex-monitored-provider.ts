@@ -11,8 +11,8 @@ import type {
 } from "./dedicated-weekly-quota-acquisition.ts";
 import {
   defineMonitoredProvider,
-  type MonitoredProviderRegistration,
-} from "./monitored-provider-capacity-session.ts";
+  type MonitoredProvider,
+} from "./monitored-provider.ts";
 import {
   presentProviderSubscriptionUsage,
   type WeeklySubscriptionUsageStatus,
@@ -83,13 +83,14 @@ function credentialResolution(ctx: ExtensionContext) {
   );
 }
 
-export function makeCodexMonitoredProviderRegistration(
+export function makeCodexMonitoredProvider(
   ctx: ExtensionContext,
   dependencies: CodexMonitoredProviderDependencies,
-): MonitoredProviderRegistration {
+): MonitoredProvider {
   return defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
     piProviderId: "openai-codex",
-    makeLayer: (publish) =>
+    initialStatus: { kind: "loading" },
+    makeMonitor: (publish) =>
       codexProviderMonitorLayer({
         resolveCredential: credentialResolution(ctx),
         acquireDedicatedWeeklyQuotaUsage:

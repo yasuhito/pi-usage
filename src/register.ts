@@ -4,19 +4,17 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
 
-import {
-  type MonitoredProviderRegistration,
-  makeMonitoredProviderCapacitySession,
-} from "./monitored-provider-capacity-session.ts";
+import type { MonitoredProvider } from "./monitored-provider.ts";
+import { makeMonitoredProviderCapacitySession } from "./monitored-provider-capacity-session.ts";
 
 const STATUS_KEY = "pi-usage";
 
-export type MonitoredProviderRegistrationFactory = (
+export type MonitoredProviderFactory = (
   ctx: ExtensionContext,
-) => MonitoredProviderRegistration;
+) => MonitoredProvider;
 
 export interface MonitoredProviderCapacityDependencies {
-  readonly providers: ReadonlyArray<MonitoredProviderRegistrationFactory>;
+  readonly providers: ReadonlyArray<MonitoredProviderFactory>;
   readonly now?: Effect.Effect<number>;
 }
 
@@ -41,7 +39,7 @@ export function registerMonitoredProviderCapacity(
           Effect.sync(() => {
             const rendered = presentations
               .map(
-                ({ presentation }) =>
+                (presentation) =>
                   `${ctx.ui.theme.fg("accent", presentation.providerName)} ${ctx.ui.theme.fg(presentation.color, presentation.detail)}`,
               )
               .join(" ");

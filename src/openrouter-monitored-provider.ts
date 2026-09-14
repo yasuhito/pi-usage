@@ -2,8 +2,8 @@ import type { Effect } from "effect";
 
 import {
   defineMonitoredProvider,
-  type MonitoredProviderRegistration,
-} from "./monitored-provider-capacity-session.ts";
+  type MonitoredProvider,
+} from "./monitored-provider.ts";
 import type { AcquireOpenRouterAccountCreditBalance } from "./openrouter-account-credit-balance-acquisition.ts";
 import type { ResolveOpenRouterManagementKey } from "./openrouter-management-key-resolution.ts";
 import { openRouterProviderMonitorLayer } from "./openrouter-provider-monitor.ts";
@@ -18,12 +18,13 @@ export interface OpenRouterMonitoredProviderDependencies {
   readonly random?: Effect.Effect<number>;
 }
 
-export function makeOpenRouterMonitoredProviderRegistration(
+export function makeOpenRouterMonitoredProvider(
   dependencies: OpenRouterMonitoredProviderDependencies,
-): MonitoredProviderRegistration {
+): MonitoredProvider {
   return defineMonitoredProvider<OpenRouterAccountCreditBalanceStatus>({
     piProviderId: "openrouter",
-    makeLayer: (publish) =>
+    initialStatus: { kind: "loading" },
+    makeMonitor: (publish) =>
       openRouterProviderMonitorLayer({
         resolveManagementKey: dependencies.resolveOpenRouterManagementKey,
         acquireOpenRouterAccountCreditBalance:

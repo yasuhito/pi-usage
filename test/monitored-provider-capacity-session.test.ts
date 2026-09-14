@@ -17,13 +17,14 @@ import {
   type DedicatedWeeklyQuotaAcquisitionError,
   TemporaryAcquisitionFailure,
 } from "../src/dedicated-weekly-quota-acquisition.ts";
+import { defineMonitoredProvider } from "../src/monitored-provider.ts";
 import {
-  defineMonitoredProvider,
   type MonitoredProviderCapacitySessionDependencies,
   makeMonitoredProviderCapacitySession,
 } from "../src/monitored-provider-capacity-session.ts";
 import {
   type OpenRouterAccountCreditBalanceStatus,
+  type ProviderCapacityPresentation,
   presentProviderSubscriptionUsage,
   type WeeklySubscriptionProviderName,
   type WeeklySubscriptionUsageStatus,
@@ -41,7 +42,7 @@ const claudeUsage: AcquiredClaudeSubscriptionUsage = {
 };
 
 type CapacityRecord = Readonly<
-  Record<WeeklySubscriptionProviderName, WeeklySubscriptionUsageStatus>
+  Record<WeeklySubscriptionProviderName, ProviderCapacityPresentation>
 >;
 
 function sessionDependencies(
@@ -57,28 +58,29 @@ function sessionDependencies(
     >;
     readonly onMakeClaudeLayer?: () => void;
     readonly now?: Effect.Effect<number>;
-    readonly present?: (statuses: CapacityRecord) => void;
+    readonly present?: (presentations: CapacityRecord) => void;
   } = {},
 ): MonitoredProviderCapacitySessionDependencies {
   return {
     now: options.now ?? Effect.succeed(1_000_000),
     present: (capacities) =>
       Effect.sync(() => {
-        const statuses = Object.fromEntries(
-          capacities.map(({ presentation, status }) => [
+        const presentationByProvider = Object.fromEntries(
+          capacities.map((presentation) => [
             presentation.providerName,
-            status,
+            presentation,
           ]),
         ) as Record<
           WeeklySubscriptionProviderName,
-          WeeklySubscriptionUsageStatus
+          ProviderCapacityPresentation
         >;
-        options.present?.(structuredClone(statuses));
+        options.present?.(structuredClone(presentationByProvider));
       }),
     providers: [
       defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
         piProviderId: "openai-codex",
-        makeLayer: (publish) =>
+        initialStatus: { kind: "loading" },
+        makeMonitor: (publish) =>
           codexProviderMonitorLayer({
             resolveCredential:
               options.resolveCodex ??
@@ -99,7 +101,8 @@ function sessionDependencies(
       }),
       defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
         piProviderId: "anthropic",
-        makeLayer: (publish) => {
+        initialStatus: { kind: "loading" },
+        makeMonitor: (publish) => {
           options.onMakeClaudeLayer?.();
           return claudeProviderMonitorLayer({
             resolveAuthentication: () =>
@@ -120,6 +123,97 @@ function sessionDependencies(
   };
 }
 
+test("presents the whole loading roster with one session-owned time before monitors start", async () => {
+  const session = await Effect.runPromise(
+    makeMonitoredProviderCapacitySession(),
+  );
+  let nowReads = 0;
+  const presentations: CapacityRecord[] = [];
+  const readsAtPresentation: number[] = [];
+
+  await Effect.runPromise(
+    session.start(
+      sessionDependencies({
+        now: Effect.sync(() => {
+          nowReads += 1;
+          return 1_000_000;
+        }),
+        present: (presentationByProvider) => {
+          presentations.push(presentationByProvider);
+          readsAtPresentation.push(nowReads);
+        },
+      }),
+    ),
+  );
+
+  assert.deepEqual(presentations[0], {
+    Codex: {
+      providerName: "Codex",
+      detail: "wk loading…",
+      color: "dim",
+    },
+    Claude: {
+      providerName: "Claude",
+      detail: "wk loading…",
+      color: "dim",
+    },
+  });
+  assert.equal(readsAtPresentation[0], 1);
+  await Effect.runPromise(session.shutdown);
+});
+
+test("ignores Layer-construction publications until after the loading roster", async () => {
+  const session = await Effect.runPromise(
+    makeMonitoredProviderCapacitySession(),
+  );
+  const presentations: ReadonlyArray<ProviderCapacityPresentation>[] = [];
+
+  await Effect.runPromise(
+    session.start({
+      now: Effect.succeed(1_000_000),
+      providers: [
+        defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
+          piProviderId: "openai-codex",
+          initialStatus: { kind: "loading" },
+          makeMonitor: (publish) =>
+            Layer.effect(
+              ProviderMonitorService,
+              publish({
+                kind: "available",
+                usedPercent: 99,
+                stale: false,
+              }).pipe(
+                Effect.as({
+                  start: Effect.void,
+                  observeResponse: () => Effect.void,
+                  refreshAfterActivity: Effect.void,
+                  refreshForAccountChange: Effect.void,
+                }),
+              ),
+            ),
+          present: (status, nowMs) =>
+            presentProviderSubscriptionUsage("Codex", status, nowMs),
+        }),
+      ],
+      present: (roster) =>
+        Effect.sync(() => {
+          presentations.push(roster);
+        }),
+    }),
+  );
+
+  assert.deepEqual(presentations, [
+    [
+      {
+        providerName: "Codex",
+        detail: "wk loading…",
+        color: "dim",
+      },
+    ],
+  ]);
+  await Effect.runPromise(session.shutdown);
+});
+
 test("shutdown interrupts active session work", async () => {
   const session = await Effect.runPromise(
     makeMonitoredProviderCapacitySession(),
@@ -129,7 +223,8 @@ test("shutdown interrupts active session work", async () => {
   const start = Effect.runPromise(
     session.start(
       sessionDependencies({
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
         acquireClaude: Effect.never.pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -143,9 +238,9 @@ test("shutdown interrupts active session work", async () => {
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(
     presentations.some(
-      (statuses) =>
-        statuses.Codex.kind === "available" &&
-        statuses.Claude.kind === "loading",
+      (presentationByProvider) =>
+        presentationByProvider.Codex.detail === "wk ━━──────── 20% 16m" &&
+        presentationByProvider.Claude.detail === "wk loading…",
     ),
     true,
   );
@@ -166,7 +261,8 @@ test("shutdown suppresses a publication suspended before presentation", async ()
     session.start(
       sessionDependencies({
         now: Effect.suspend(() => now),
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
       }),
     ),
   );
@@ -205,7 +301,8 @@ test("shutdown interrupts credential resolution and ignores late completion", as
   const start = Effect.runPromise(
     session.start(
       sessionDependencies({
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
         resolveCodex: Effect.promise(() => credentialGate).pipe(
           Effect.as({
             kind: "available" as const,
@@ -246,7 +343,8 @@ test("shutdown cancels retry and stale-expiration work", async () => {
   await Effect.runPromise(
     session.start(
       sessionDependencies({
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
         acquireCodex: () => {
           codexReads += 1;
           return acquisition;
@@ -295,7 +393,8 @@ test("a replacement waits for the previous Scope and suppresses its late publica
           Effect.as({ ...claudeUsage, usedPercent: 99 }),
           Effect.ensuring(countFinalization),
         ),
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
       }),
     ),
   );
@@ -304,7 +403,8 @@ test("a replacement waits for the previous Scope and suppresses its late publica
   const replacement = Effect.runPromise(
     session.start(
       sessionDependencies({
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
       }),
     ),
   );
@@ -317,22 +417,20 @@ test("a replacement waits for the previous Scope and suppresses its late publica
   assert.equal(finalized, 2);
   assert.deepEqual(presentations.at(-1), {
     Codex: {
-      kind: "available",
-      usedPercent: 20,
-      stale: false,
-      weeklyWindowResetsAtMs: 2_000_000,
+      providerName: "Codex",
+      detail: "wk ━━──────── 20% 16m",
+      color: "dim",
     },
     Claude: {
-      kind: "available",
-      usedPercent: 80,
-      stale: false,
-      weeklyWindowResetsAtMs: 2_000_000,
+      providerName: "Claude",
+      detail: "wk ━━━━━━━━── 80% 16m",
+      color: "warning",
     },
   });
   assert.equal(
-    presentations.some((statuses) =>
-      Object.values(statuses).some(
-        (status) => status.kind === "available" && status.usedPercent === 99,
+    presentations.some((presentationByProvider) =>
+      Object.values(presentationByProvider).some((presentation) =>
+        presentation.detail.includes("99%"),
       ),
     ),
     false,
@@ -359,7 +457,8 @@ test("only the latest queued start creates monitors and publishes", async () => 
         acquireClaude: Effect.uninterruptible(
           Effect.promise(() => firstGate),
         ).pipe(Effect.as({ ...claudeUsage, usedPercent: 99 })),
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
       }),
     ),
   );
@@ -370,7 +469,8 @@ test("only the latest queued start creates monitors and publishes", async () => 
   const middle = Effect.runPromise(
     session.start(
       sessionDependencies({
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
         acquireCodex: () => {
           middleCodexReads += 1;
           return Effect.succeed({ ...codexUsage, usedPercent: 50 });
@@ -388,7 +488,8 @@ test("only the latest queued start creates monitors and publishes", async () => 
       sessionDependencies({
         acquireCodex: () => Effect.succeed({ ...codexUsage, usedPercent: 30 }),
         acquireClaude: Effect.succeed({ ...claudeUsage, usedPercent: 40 }),
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
       }),
     ),
   );
@@ -399,25 +500,23 @@ test("only the latest queued start creates monitors and publishes", async () => 
   assert.equal(middleClaudeLayerCreated, 0);
   assert.equal(middleCodexReads, 0);
   assert.equal(
-    presentations.some((statuses) =>
-      Object.values(statuses).some(
-        (status) => status.kind === "available" && status.usedPercent === 50,
+    presentations.some((presentationByProvider) =>
+      Object.values(presentationByProvider).some((presentation) =>
+        presentation.detail.includes("50%"),
       ),
     ),
     false,
   );
   assert.deepEqual(presentations.at(-1), {
     Codex: {
-      kind: "available",
-      usedPercent: 30,
-      stale: false,
-      weeklyWindowResetsAtMs: 2_000_000,
+      providerName: "Codex",
+      detail: "wk ━━━─────── 30% 16m",
+      color: "dim",
     },
     Claude: {
-      kind: "available",
-      usedPercent: 40,
-      stale: false,
-      weeklyWindowResetsAtMs: 2_000_000,
+      providerName: "Claude",
+      detail: "wk ━━━━────── 40% 16m",
+      color: "dim",
     },
   });
   await Effect.runPromise(session.shutdown);
@@ -435,7 +534,8 @@ test("accepts non-weekly capacity through the provider roster", async () => {
       providers: [
         defineMonitoredProvider<OpenRouterAccountCreditBalanceStatus>({
           piProviderId: "openrouter",
-          makeLayer: (publish) =>
+          initialStatus: { kind: "loading" },
+          makeMonitor: (publish) =>
             Layer.succeed(ProviderMonitorService, {
               start: publish({
                 kind: "openrouter-account-credit-balance",
@@ -461,21 +561,12 @@ test("accepts non-weekly capacity through the provider roster", async () => {
     }),
   );
 
-  assert.deepEqual(presentations, [
-    [
-      {
-        status: {
-          kind: "openrouter-account-credit-balance",
-          balanceUsd: 12.34,
-          stale: false,
-        },
-        presentation: {
-          providerName: "OpenRouter",
-          detail: "$12.34",
-          color: "dim",
-        },
-      },
-    ],
+  assert.deepEqual(presentations.at(-1), [
+    {
+      providerName: "OpenRouter",
+      detail: "$12.34",
+      color: "dim",
+    },
   ]);
   await Effect.runPromise(session.shutdown);
 });
@@ -500,17 +591,9 @@ test("starts from a one-provider roster without fixed provider knowledge", async
 
   assert.deepEqual(presentations.at(-1), [
     {
-      status: {
-        kind: "available",
-        usedPercent: 80,
-        stale: false,
-        weeklyWindowResetsAtMs: 2_000_000,
-      },
-      presentation: {
-        providerName: "Claude",
-        detail: "wk ━━━━━━━━── 80% 16m",
-        color: "warning",
-      },
+      providerName: "Claude",
+      detail: "wk ━━━━━━━━── 80% 16m",
+      color: "warning",
     },
   ]);
   await Effect.runPromise(session.shutdown);
@@ -538,7 +621,8 @@ test("routes activity and responses through the provider roster", async () => {
           claudeReads += 1;
           return claudeAcquisition;
         }),
-        present: (statuses) => presentations.push(statuses),
+        present: (presentationByProvider) =>
+          presentations.push(presentationByProvider),
       }),
     ),
   );
@@ -546,7 +630,7 @@ test("routes activity and responses through the provider roster", async () => {
   claudeAcquisition = Effect.succeed(claudeUsage);
   await Effect.runPromise(session.refreshAfterActivity("anthropic"));
   assert.deepEqual([codexReads, claudeReads], [1, 2]);
-  assert.equal(presentations.at(-1)?.Claude.kind, "available");
+  assert.equal(presentations.at(-1)?.Claude.detail, "wk ━━━━━━━━── 80% 16m");
 
   await Effect.runPromise(
     session.observeResponse("openai-codex", {
@@ -556,10 +640,9 @@ test("routes activity and responses through the provider roster", async () => {
     }),
   );
   assert.deepEqual(presentations.at(-1)?.Codex, {
-    kind: "available",
-    usedPercent: 70,
-    stale: false,
-    weeklyWindowResetsAtMs: 2_000_000,
+    providerName: "Codex",
+    detail: "wk ━━━━━━━─── 70% 16m",
+    color: "dim",
   });
 
   await Effect.runPromise(session.refreshAfterActivity("unknown"));

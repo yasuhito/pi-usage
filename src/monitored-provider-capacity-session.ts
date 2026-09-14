@@ -1,54 +1,18 @@
-import { Context, Effect, Exit, Fiber, Layer, Scope } from "effect";
+import { Effect, Exit, Fiber, Scope } from "effect";
 
-import type {
-  ProviderCapacityPresentation,
-  ProviderCapacityStatus,
-} from "./presentation.ts";
 import {
-  type ProviderMonitor,
-  ProviderMonitorService,
-} from "./provider-monitor.ts";
-
-export interface MonitoredProviderRegistration {
-  readonly piProviderId: string;
-  readonly makeLayer: (
-    publish: (status: ProviderCapacityStatus) => Effect.Effect<void>,
-  ) => Layer.Layer<ProviderMonitorService>;
-  readonly present: (
-    status: ProviderCapacityStatus,
-    nowMs: number,
-  ) => ProviderCapacityPresentation;
-}
-
-export function defineMonitoredProvider<
-  Status extends ProviderCapacityStatus,
->(registration: {
-  readonly piProviderId: string;
-  readonly makeLayer: (
-    publish: (status: Status) => Effect.Effect<void>,
-  ) => Layer.Layer<ProviderMonitorService>;
-  readonly present: (
-    status: Status,
-    nowMs: number,
-  ) => ProviderCapacityPresentation;
-}): MonitoredProviderRegistration {
-  return {
-    piProviderId: registration.piProviderId,
-    makeLayer: (publish) => registration.makeLayer((status) => publish(status)),
-    present: (status, nowMs) => registration.present(status as Status, nowMs),
-  };
-}
-
-export interface PresentedProviderCapacity {
-  readonly status: ProviderCapacityStatus;
-  readonly presentation: ProviderCapacityPresentation;
-}
+  type MonitoredProvider,
+  type MountedMonitoredProvider,
+  mountMonitoredProvider,
+} from "./monitored-provider.ts";
+import type { ProviderCapacityPresentation } from "./presentation.ts";
+import type { ProviderMonitor } from "./provider-monitor.ts";
 
 export interface MonitoredProviderCapacitySessionDependencies {
-  readonly providers: ReadonlyArray<MonitoredProviderRegistration>;
+  readonly providers: ReadonlyArray<MonitoredProvider>;
   readonly now: Effect.Effect<number>;
   readonly present: (
-    capacities: ReadonlyArray<PresentedProviderCapacity>,
+    capacities: ReadonlyArray<ProviderCapacityPresentation>,
   ) => Effect.Effect<void>;
 }
 
@@ -68,12 +32,13 @@ export interface MonitoredProviderCapacitySession {
 interface Session {
   readonly id: number;
   readonly scope: Scope.CloseableScope;
+  readonly mountedProviders: ReadonlyArray<MountedMonitoredProvider>;
   readonly monitors: ReadonlyArray<ProviderMonitor>;
   readonly monitorsByPiProviderId: ReadonlyMap<string, ProviderMonitor>;
 }
 
 function ensureUniqueProviderIds(
-  providers: ReadonlyArray<MonitoredProviderRegistration>,
+  providers: ReadonlyArray<MonitoredProvider>,
 ): Effect.Effect<void> {
   return Effect.sync(() => {
     const ids = new Set<string>();
@@ -97,6 +62,22 @@ export function makeMonitoredProviderCapacitySession(): Effect.Effect<MonitoredP
     const transitionGate = yield* Effect.makeSemaphore(1);
     let session: Session | undefined;
     let nextSessionId = 0;
+
+    const presentRoster = (
+      sessionId: number,
+      dependencies: MonitoredProviderCapacitySessionDependencies,
+      mountedProviders: ReadonlyArray<MountedMonitoredProvider>,
+      beforePresent: Effect.Effect<void> = Effect.void,
+    ) =>
+      Effect.gen(function* () {
+        if (session?.id !== sessionId) return;
+        const now = yield* dependencies.now;
+        if (session?.id !== sessionId) return;
+        yield* beforePresent;
+        yield* dependencies.present(
+          mountedProviders.map((provider) => provider.present(now)),
+        );
+      });
 
     const closeSession = (candidate: Session | undefined) =>
       Effect.gen(function* () {
@@ -132,53 +113,29 @@ export function makeMonitoredProviderCapacitySession(): Effect.Effect<MonitoredP
             let installed = false;
             return yield* Effect.gen(function* () {
               if (id !== nextSessionId) return undefined;
-              const capacities: ProviderCapacityStatus[] =
-                dependencies.providers.map(() => ({ kind: "loading" }));
-              const publish =
-                (providerIndex: number) => (status: ProviderCapacityStatus) =>
-                  Effect.gen(function* () {
-                    if (session?.id !== id) return;
-                    const now = yield* dependencies.now;
-                    if (session?.id !== id) return;
-                    if (capacities[providerIndex] === undefined) return;
-                    capacities[providerIndex] = status;
-                    yield* dependencies.present(
-                      capacities.map((status, index) => {
-                        const provider = dependencies.providers[index];
-                        if (provider === undefined) {
-                          throw new TypeError(
-                            "provider roster changed during session",
-                          );
-                        }
-                        return {
-                          status,
-                          presentation: provider.present(status, now),
-                        };
-                      }),
-                    );
-                  });
-              const monitors = yield* Effect.forEach(
+              let mountedProviders: ReadonlyArray<MountedMonitoredProvider> =
+                [];
+              mountedProviders = yield* Effect.forEach(
                 dependencies.providers,
-                (provider, index) =>
-                  Layer.buildWithScope(
-                    provider.makeLayer(publish(index)),
-                    scope,
-                  ).pipe(
-                    Effect.map((services) =>
-                      Context.get(services, ProviderMonitorService),
-                    ),
-                  ),
+                (provider) =>
+                  mountMonitoredProvider(provider, (commit) =>
+                    presentRoster(id, dependencies, mountedProviders, commit),
+                  ).pipe(Effect.provideService(Scope.Scope, scope)),
                 { concurrency: "unbounded" },
+              );
+              const monitors = mountedProviders.map(
+                (provider) => provider.monitor,
               );
               if (id !== nextSessionId) return undefined;
               const created: Session = {
                 id,
                 scope,
+                mountedProviders,
                 monitors,
                 monitorsByPiProviderId: new Map(
-                  dependencies.providers.map((provider, index) => [
+                  mountedProviders.map((provider) => [
                     provider.piProviderId,
-                    monitors[index] as ProviderMonitor,
+                    provider.monitor,
                   ]),
                 ),
               };
@@ -197,12 +154,24 @@ export function makeMonitoredProviderCapacitySession(): Effect.Effect<MonitoredP
         if (candidate === undefined) return;
         yield* runInSessionScope(
           candidate,
-          Effect.all(
-            candidate.monitors.map((monitor) =>
-              monitor.start.pipe(Effect.catchAllCause(() => Effect.void)),
-            ),
-            { concurrency: "unbounded" },
-          ).pipe(Effect.asVoid),
+          Effect.gen(function* () {
+            yield* presentRoster(
+              candidate.id,
+              dependencies,
+              candidate.mountedProviders,
+            );
+            if (session !== candidate) return;
+            yield* Effect.all(
+              candidate.mountedProviders.map((provider) => provider.activate),
+              { concurrency: "unbounded" },
+            );
+            yield* Effect.all(
+              candidate.monitors.map((monitor) =>
+                monitor.start.pipe(Effect.catchAllCause(() => Effect.void)),
+              ),
+              { concurrency: "unbounded" },
+            );
+          }),
         );
       });
 

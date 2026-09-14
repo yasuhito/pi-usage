@@ -1,11 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { makeClaudeMonitoredProviderRegistration } from "./src/claude-monitored-provider.ts";
+import { makeClaudeMonitoredProvider } from "./src/claude-monitored-provider.ts";
 import { createAcquireClaudeSubscriptionUsage } from "./src/claude-subscription-usage-acquisition.ts";
-import { makeCodexMonitoredProviderRegistration } from "./src/codex-monitored-provider.ts";
+import { makeCodexMonitoredProvider } from "./src/codex-monitored-provider.ts";
 import { createAcquireDedicatedWeeklyQuotaUsage } from "./src/dedicated-weekly-quota-acquisition.ts";
 import { createAcquireOpenRouterAccountCreditBalance } from "./src/openrouter-account-credit-balance-acquisition.ts";
 import { createResolveOpenRouterManagementKey } from "./src/openrouter-management-key-resolution.ts";
-import { makeOpenRouterMonitoredProviderRegistration } from "./src/openrouter-monitored-provider.ts";
+import { makeOpenRouterMonitoredProvider } from "./src/openrouter-monitored-provider.ts";
 import { createFileProviderAcquisitionCoordinator } from "./src/provider-acquisition-coordinator.ts";
 import { registerMonitoredProviderCapacity } from "./src/register.ts";
 
@@ -33,11 +33,11 @@ export default function piUsage(pi: ExtensionAPI): void {
   registerMonitoredProviderCapacity(pi, {
     providers: [
       (ctx) =>
-        makeCodexMonitoredProviderRegistration(ctx, {
+        makeCodexMonitoredProvider(ctx, {
           acquireDedicatedWeeklyQuotaUsage,
         }),
       (ctx) =>
-        makeClaudeMonitoredProviderRegistration(ctx, {
+        makeClaudeMonitoredProvider(ctx, {
           acquireClaudeSubscriptionUsage: createAcquireClaudeSubscriptionUsage({
             fetch,
             acquisitionCoordinator,
@@ -51,7 +51,7 @@ export default function piUsage(pi: ExtensionAPI): void {
           }),
         }),
       () =>
-        makeOpenRouterMonitoredProviderRegistration({
+        makeOpenRouterMonitoredProvider({
           resolveOpenRouterManagementKey,
           acquireOpenRouterAccountCreditBalance,
         }),

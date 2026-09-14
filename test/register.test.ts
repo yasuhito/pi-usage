@@ -6,7 +6,7 @@ import type {
 import { Effect, Layer } from "effect";
 import { test } from "vitest";
 
-import { defineMonitoredProvider } from "../src/monitored-provider-capacity-session.ts";
+import { defineMonitoredProvider } from "../src/monitored-provider.ts";
 import type {
   ProviderCapacityPresentation,
   WeeklySubscriptionProviderName,
@@ -14,7 +14,7 @@ import type {
 } from "../src/presentation.ts";
 import { ProviderMonitorService } from "../src/provider-monitor.ts";
 import {
-  type MonitoredProviderRegistrationFactory,
+  type MonitoredProviderFactory,
   registerMonitoredProviderCapacity,
 } from "../src/register.ts";
 
@@ -36,7 +36,7 @@ function providerFactory(
   providerName: WeeklySubscriptionProviderName,
   usedPercent: number,
   probes: Map<string, ProviderProbe>,
-): MonitoredProviderRegistrationFactory {
+): MonitoredProviderFactory {
   return () => {
     const providerProbeState = {
       starts: 0,
@@ -48,7 +48,8 @@ function providerFactory(
     probes.set(piProviderId, providerProbeState);
     return defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
       piProviderId,
-      makeLayer: (publish) =>
+      initialStatus: { kind: "loading" },
+      makeMonitor: (publish) =>
         Layer.scoped(
           ProviderMonitorService,
           Effect.acquireRelease(

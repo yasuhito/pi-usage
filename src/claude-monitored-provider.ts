@@ -5,8 +5,8 @@ import { claudeProviderMonitorLayer } from "./claude-provider-monitor.ts";
 import type { AcquireClaudeSubscriptionUsage } from "./claude-subscription-usage-acquisition.ts";
 import {
   defineMonitoredProvider,
-  type MonitoredProviderRegistration,
-} from "./monitored-provider-capacity-session.ts";
+  type MonitoredProvider,
+} from "./monitored-provider.ts";
 import {
   presentProviderSubscriptionUsage,
   type WeeklySubscriptionUsageStatus,
@@ -29,13 +29,14 @@ function authenticationResolution(
     Effect.tryPromise(() => ctx.modelRegistry.getProviderAuth("anthropic"));
 }
 
-export function makeClaudeMonitoredProviderRegistration(
+export function makeClaudeMonitoredProvider(
   ctx: ExtensionContext,
   dependencies: ClaudeMonitoredProviderDependencies,
-): MonitoredProviderRegistration {
+): MonitoredProvider {
   return defineMonitoredProvider<WeeklySubscriptionUsageStatus>({
     piProviderId: "anthropic",
-    makeLayer: (publish) =>
+    initialStatus: { kind: "loading" },
+    makeMonitor: (publish) =>
       claudeProviderMonitorLayer({
         resolveAuthentication: authenticationResolution(ctx),
         acquireClaudeSubscriptionUsage:
