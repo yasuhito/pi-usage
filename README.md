@@ -98,7 +98,7 @@ This release does not implement provider settings, OpenRouter inference-key spen
 
 The Codex ChatGPT usage endpoint and the Claude OAuth usage endpoint are undocumented first-party interfaces. The `x-codex-*` headers are undocumented as well. None has a public compatibility guarantee, and any may change without notice. The extension isolates and parses them defensively and displays `unavailable` when a response no longer matches the expected contract.
 
-See [`docs/research/codex-weekly-usage.md`](docs/research/codex-weekly-usage.md), [`docs/research/codex-limit-reset-credits.md`](docs/research/codex-limit-reset-credits.md), [`docs/research/claude-oauth-usage-prototype.md`](docs/research/claude-oauth-usage-prototype.md), and [`docs/research/claude-openrouter-usage.md`](docs/research/claude-openrouter-usage.md) for source comparisons and rationale.
+See [`codex-weekly-usage.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/codex-weekly-usage.md), [`codex-limit-reset-credits.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/codex-limit-reset-credits.md), [`claude-oauth-usage-prototype.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/claude-oauth-usage-prototype.md), and [`claude-openrouter-usage.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/claude-openrouter-usage.md) for source comparisons and rationale.
 
 ## Development
 

@@ -40,6 +40,9 @@
     "url": "https://github.com/yasuhito/pi-usage/issues"
   },
   "homepage": "https://github.com/yasuhito/pi-usage#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "vitest run",
     "lint": "biome check .",
