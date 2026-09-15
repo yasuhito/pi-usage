@@ -96,6 +96,7 @@ function makeCodexProviderMonitorAdapter(
 > {
   const reconciliation = createWeeklyQuotaObservationReconciliation();
   let staleExpiration: StaleCapacityDeadline | undefined;
+  let credentialEpoch: number | undefined;
 
   const factsFromReconciliation = (
     reaction: WeeklyQuotaObservationReaction,
@@ -148,12 +149,14 @@ function makeCodexProviderMonitorAdapter(
       Effect.sync(() => {
         switch (event.kind) {
           case "credential-observed": {
+            credentialEpoch = event.credentialEpoch;
             if (event.continuity === "unchanged") return preservedFacts();
             const reaction = reconciliation.advance(
               {
                 kind: event.credentialAvailable
                   ? "account-selection-invalidated"
                   : "account-selection-unavailable",
+                credentialEpoch: event.credentialEpoch,
               },
               event.nowMs,
             );
@@ -164,20 +167,31 @@ function makeCodexProviderMonitorAdapter(
               event.exit.kind === "acquired"
                 ? { kind: "acquired" as const, usage: event.exit.value }
                 : acquisitionResultFromError(event.exit.error);
+            const currentCredential =
+              event.provenance.credentialEpoch === credentialEpoch;
             if (
+              currentCredential &&
               result.kind === "authentication-rejected" &&
               !event.authenticationRefreshUsed
             ) {
               return preservedFacts({ kind: "credential-rejected" });
             }
             const reaction = reconciliation.advance(
-              { kind: "dedicated-weekly-quota-acquisition", result },
+              {
+                kind: "dedicated-weekly-quota-acquisition",
+                result,
+                provenance: event.provenance,
+              },
               event.nowMs,
             );
             return factsFromReconciliation(
               reaction,
-              result.kind === "acquired" ? "adequate" : undefined,
-              healthFromResult(result),
+              reaction.acquireDedicated
+                ? "inadequate"
+                : result.kind === "acquired"
+                  ? "adequate"
+                  : undefined,
+              currentCredential ? healthFromResult(result) : undefined,
             );
           }
           case "passive-observation": {
@@ -185,6 +199,7 @@ function makeCodexProviderMonitorAdapter(
               {
                 kind: "passive-weekly-quota-observation",
                 fields: event.fields,
+                provenance: event.provenance,
               },
               event.nowMs,
             );

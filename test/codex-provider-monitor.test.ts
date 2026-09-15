@@ -179,6 +179,144 @@ it.scoped(
 );
 
 it.scoped(
+  "keeps newer passive usage when an older ordinary acquisition completes later",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.monitor.start;
+      yield* TestClock.adjust("31 seconds");
+      const acquisitionGate = yield* Deferred.make<void>();
+      f.setAcquisition(
+        Deferred.await(acquisitionGate).pipe(
+          Effect.as({ ...goodUsage, usedPercent: 70 }),
+        ),
+      );
+      const olderAcquisition = yield* Effect.fork(
+        f.monitor.refreshAfterActivity,
+      );
+      while (f.reads() < 2) yield* Effect.yieldNow();
+
+      yield* f.monitor.observeResponse({
+        "x-codex-secondary-used-percent": "82",
+        "x-codex-secondary-window-minutes": "10080",
+        "x-codex-secondary-reset-at": "2000",
+      });
+      yield* Deferred.succeed(acquisitionGate, undefined);
+      yield* Fiber.join(olderAcquisition);
+
+      const latest = f.statuses.at(-1);
+      assert.equal(latest?.kind === "available" && latest.usedPercent, 82);
+    }),
+);
+
+it.scoped(
+  "accumulates passive evidence while the credential stays invalid",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.setResolution({ kind: "invalid" });
+      yield* f.monitor.start;
+      yield* f.monitor.observeResponse({
+        "x-codex-secondary-used-percent": "82",
+        "x-codex-secondary-window-minutes": "10080",
+        "x-codex-secondary-reset-at": "2000",
+      });
+
+      yield* f.monitor.observeResponse({
+        "x-codex-secondary-used-percent": "85",
+      });
+
+      assert.deepEqual(f.statuses.at(-1), {
+        kind: "available",
+        usedPercent: 85,
+        stale: false,
+        weeklyWindowResetsAtMs: 2_000_000,
+      });
+      assert.equal(f.reads(), 0);
+    }),
+);
+
+it.scoped(
+  "reacquires once when passive evidence outranks the initial acquisition",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const acquisitionGate = yield* Deferred.make<void>();
+      f.setAcquisition(
+        Deferred.await(acquisitionGate).pipe(Effect.as(goodUsage)),
+      );
+      const started = yield* Effect.fork(f.monitor.start);
+      while (f.reads() < 1) yield* Effect.yieldNow();
+
+      yield* f.monitor.observeResponse({
+        "x-codex-primary-used-percent": "50",
+      });
+      yield* Deferred.succeed(acquisitionGate, undefined);
+      yield* Fiber.join(started);
+
+      assert.equal(f.reads(), 2);
+      assert.equal(f.statuses.at(-1)?.kind, "available");
+      yield* TestClock.adjust("59 seconds");
+      assert.equal(f.reads(), 2);
+    }),
+);
+
+it.scoped(
+  "ignores acquisition health from an account superseded during acquisition",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const acquisitionGate = yield* Deferred.make<void>();
+      f.setAcquisition(
+        Deferred.await(acquisitionGate).pipe(
+          Effect.andThen(Effect.fail(new PermanentAcquisitionFailure())),
+        ),
+      );
+      const started = yield* Effect.fork(f.monitor.start);
+      while (f.reads() < 1) yield* Effect.yieldNow();
+
+      f.setResolution({
+        kind: "available",
+        credential: credential("account-2"),
+      });
+      yield* f.monitor.observeResponse({
+        "x-codex-primary-used-percent": "50",
+      });
+      f.setAcquisition(Effect.succeed(goodUsage));
+      yield* Deferred.succeed(acquisitionGate, undefined);
+      yield* Fiber.join(started);
+
+      assert.deepEqual(f.credentials.at(-1), credential("account-2"));
+      assert.equal(f.statuses.at(-1)?.kind, "available");
+    }),
+);
+
+it.scoped("isolates passive evidence from a silently changed account", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setAcquisition(
+      Effect.succeed({ ...goodUsage, availableLimitResetCredits: 2 }),
+    );
+    yield* f.monitor.start;
+    yield* f.monitor.observeResponse({
+      "x-codex-primary-window-minutes": "10080",
+    });
+    f.setResolution({
+      kind: "available",
+      credential: credential("account-2"),
+    });
+
+    yield* f.monitor.observeResponse({
+      "x-codex-primary-used-percent": "82",
+      "x-codex-primary-reset-at": "2000",
+      "x-codex-secondary-used-percent": "91",
+    });
+
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+  }),
+);
+
+it.scoped(
   "forced account changes supersede old work and isolate publication",
   () =>
     Effect.gen(function* () {

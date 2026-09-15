@@ -69,11 +69,21 @@ export type ProviderAcquisitionExit<Acquired, Failure> =
   | { readonly kind: "acquired"; readonly value: Acquired }
   | { readonly kind: "failed"; readonly error: Failure };
 
+/**
+ * Non-secret, session-local provenance. Sequence is reserved when evidence work
+ * starts; credentialEpoch changes whenever account continuity is not proven.
+ */
+export interface ProviderEvidenceProvenance {
+  readonly sequence: number;
+  readonly credentialEpoch: number;
+}
+
 export type ProviderCapacityEvent<Acquired, Failure> =
   | {
       readonly kind: "credential-observed";
       readonly continuity: ProviderCredentialContinuity;
       readonly credentialAvailable: boolean;
+      readonly credentialEpoch: number;
       readonly nowMs: number;
     }
   | {
@@ -82,11 +92,13 @@ export type ProviderCapacityEvent<Acquired, Failure> =
       readonly startedIdentity: ProviderCredentialIdentity;
       readonly currentIdentity: ProviderCredentialIdentity | undefined;
       readonly authenticationRefreshUsed: boolean;
+      readonly provenance: ProviderEvidenceProvenance;
       readonly nowMs: number;
     }
   | {
       readonly kind: "passive-observation";
       readonly fields: Readonly<Record<string, unknown>>;
+      readonly provenance: ProviderEvidenceProvenance;
       readonly nowMs: number;
     }
   | { readonly kind: "activity-observed"; readonly nowMs: number }
@@ -172,9 +184,12 @@ interface ProviderMonitorDependencies<Status extends ProviderCapacityStatus> {
 
 const continuityOf = <Credential>(
   previousIdentity: ProviderCredentialIdentity | undefined,
+  previousUnavailable: boolean,
   resolution: ResolvedProviderCredential<Credential>,
 ): ProviderCredentialContinuity => {
-  if (resolution.kind === "unavailable") return "unavailable";
+  if (resolution.kind === "unavailable") {
+    return previousUnavailable ? "unchanged" : "unavailable";
+  }
   return previousIdentity === resolution.identity ? "unchanged" : "changed";
 };
 
@@ -194,6 +209,7 @@ export function makeProviderMonitor<
   return Effect.gen(function* () {
     const scope = yield* Effect.scope;
     const gate = yield* Effect.makeSemaphore(1);
+    const credentialResolutionGate = yield* Effect.makeSemaphore(1);
     let refreshGeneration = 0;
     let activeRefreshFiber: Fiber.RuntimeFiber<void> | undefined;
     let retryFiber: Fiber.RuntimeFiber<void> | undefined;
@@ -207,8 +223,20 @@ export function makeProviderMonitor<
     let observationSuppressionsInFlight = 0;
     let accountChangeRefreshesInFlight = 0;
     let currentIdentity: ProviderCredentialIdentity | undefined;
+    let credentialUnavailable = false;
     let acceptPassiveObservation = false;
+    let credentialEpoch = 0;
+    let evidenceSequence = 0;
     type RefreshMode = "ordinary" | "account-change";
+
+    const nextEvidenceSequence = (): number => ++evidenceSequence;
+    const evidenceProvenance = (
+      sequence: number,
+      startedCredentialEpoch: number,
+    ): ProviderEvidenceProvenance => ({
+      sequence,
+      credentialEpoch: startedCredentialEpoch,
+    });
 
     let triggerRefresh: (
       mode: RefreshMode,
@@ -304,39 +332,48 @@ export function makeProviderMonitor<
       });
 
     const resolveCredential = (generationSnapshot: number) =>
-      Effect.gen(function* () {
-        observationSuppressionsInFlight += 1;
-        const resolution = yield* adapter.resolveCredential.pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              observationSuppressionsInFlight -= 1;
-            }),
-          ),
-        );
-        if (!isCurrent(generationSnapshot)) return yield* Effect.interrupt;
-        if (
-          resolution.kind === "available" &&
-          resolution.identity.trim() === ""
-        ) {
-          return yield* Effect.die(
-            new TypeError("provider credential identity must not be empty"),
+      credentialResolutionGate.withPermits(1)(
+        Effect.gen(function* () {
+          observationSuppressionsInFlight += 1;
+          const resolution = yield* adapter.resolveCredential.pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                observationSuppressionsInFlight -= 1;
+              }),
+            ),
           );
-        }
-        const continuity = continuityOf(currentIdentity, resolution);
-        currentIdentity =
-          resolution.kind === "available" ? resolution.identity : undefined;
-        acceptPassiveObservation = resolution.acceptPassiveObservation;
-        const now = yield* Clock.currentTimeMillis;
-        const facts = yield* adapter.advance({
-          kind: "credential-observed",
-          continuity,
-          credentialAvailable: resolution.kind === "available",
-          nowMs: now,
-        });
-        yield* applyContinuity(continuity);
-        yield* applyFacts(facts, generationSnapshot);
-        return { resolution, continuity };
-      });
+          if (!isCurrent(generationSnapshot)) return yield* Effect.interrupt;
+          if (
+            resolution.kind === "available" &&
+            resolution.identity.trim() === ""
+          ) {
+            return yield* Effect.die(
+              new TypeError("provider credential identity must not be empty"),
+            );
+          }
+          const continuity = continuityOf(
+            currentIdentity,
+            credentialUnavailable,
+            resolution,
+          );
+          if (continuity !== "unchanged") credentialEpoch += 1;
+          currentIdentity =
+            resolution.kind === "available" ? resolution.identity : undefined;
+          credentialUnavailable = resolution.kind === "unavailable";
+          acceptPassiveObservation = resolution.acceptPassiveObservation;
+          const now = yield* Clock.currentTimeMillis;
+          const facts = yield* adapter.advance({
+            kind: "credential-observed",
+            continuity,
+            credentialAvailable: resolution.kind === "available",
+            credentialEpoch,
+            nowMs: now,
+          });
+          yield* applyContinuity(continuity);
+          yield* applyFacts(facts, generationSnapshot);
+          return { resolution, continuity, credentialEpoch };
+        }),
+      );
 
     const scheduleRetry = (generationSnapshot: number, now: number) =>
       Effect.gen(function* () {
@@ -405,8 +442,13 @@ export function makeProviderMonitor<
       >,
       generationSnapshot: number,
       authenticationRefreshUsed: boolean,
+      startedCredentialEpoch: number,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
+        const provenance = evidenceProvenance(
+          nextEvidenceSequence(),
+          startedCredentialEpoch,
+        );
         const acquisitionExit = yield* Effect.exit(
           adapter.acquire(started.credential),
         );
@@ -464,6 +506,7 @@ export function makeProviderMonitor<
           startedIdentity: started.identity,
           currentIdentity,
           authenticationRefreshUsed,
+          provenance,
           nowMs: now,
         });
         yield* applyFacts(facts, generationSnapshot, true);
@@ -475,7 +518,12 @@ export function makeProviderMonitor<
           }
           const refreshed = yield* resolveCredential(generationSnapshot);
           if (refreshed.resolution.kind === "available") {
-            yield* acquire(refreshed.resolution, generationSnapshot, true);
+            yield* acquire(
+              refreshed.resolution,
+              generationSnapshot,
+              true,
+              refreshed.credentialEpoch,
+            );
           }
           return;
         }
@@ -498,7 +546,12 @@ export function makeProviderMonitor<
           yield* applyFacts(facts, generationSnapshot);
           return;
         }
-        yield* acquire(inspected.resolution, generationSnapshot, false);
+        yield* acquire(
+          inspected.resolution,
+          generationSnapshot,
+          false,
+          inspected.credentialEpoch,
+        );
       });
 
     triggerRefresh = (mode: RefreshMode) =>
@@ -558,6 +611,7 @@ export function makeProviderMonitor<
         observationSuppressionsInFlight = 0;
         accountChangeRefreshesInFlight = 0;
         currentIdentity = undefined;
+        credentialUnavailable = false;
         acceptPassiveObservation = false;
         forcedRefreshDeferred = false;
         yield* adapter.advance({ kind: "session-ended" });
@@ -598,11 +652,18 @@ export function makeProviderMonitor<
             return Effect.void;
           }
           const generationSnapshot = refreshGeneration;
+          const sequence = nextEvidenceSequence();
           return Effect.gen(function* () {
+            const inspected = yield* resolveCredential(generationSnapshot);
+            if (!inspected.resolution.acceptPassiveObservation) return;
             const now = yield* Clock.currentTimeMillis;
             const facts = yield* adapter.advance({
               kind: "passive-observation",
               fields,
+              provenance: {
+                sequence,
+                credentialEpoch: inspected.credentialEpoch,
+              },
               nowMs: now,
             });
             yield* applyFacts(facts, generationSnapshot);

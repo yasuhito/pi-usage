@@ -2,6 +2,7 @@ import type {
   AcquiredWeeklyQuotaUsage,
   DedicatedWeeklyQuotaAcquisitionResult,
 } from "./dedicated-weekly-quota-acquisition.ts";
+import type { ProviderEvidenceProvenance } from "./provider-monitor.ts";
 import {
   createStaleCapacityLifecycle,
   type StaleCapacityDeadline,
@@ -29,15 +30,23 @@ export type WeeklyQuotaObservationEvent =
   | {
       readonly kind: "passive-weekly-quota-observation";
       readonly fields: Readonly<Record<string, unknown>>;
+      readonly provenance: ProviderEvidenceProvenance;
     }
   | {
       readonly kind: "dedicated-weekly-quota-acquisition";
       readonly result: DedicatedWeeklyQuotaAcquisitionResult;
+      readonly provenance: ProviderEvidenceProvenance;
     }
   | { readonly kind: "dedicated-weekly-quota-acquisition-deferred" }
   | { readonly kind: "activity" }
-  | { readonly kind: "account-selection-invalidated" }
-  | { readonly kind: "account-selection-unavailable" }
+  | {
+      readonly kind: "account-selection-invalidated";
+      readonly credentialEpoch: number;
+    }
+  | {
+      readonly kind: "account-selection-unavailable";
+      readonly credentialEpoch: number;
+    }
   | {
       readonly kind: "stale-capacity-expiration-reached";
       readonly deadline: StaleCapacityDeadline;
@@ -54,7 +63,8 @@ export interface WeeklyQuotaObservationReaction
 
 export interface WeeklyQuotaObservationReconciliation {
   /**
-   * Applies events synchronously in call order. Time must be a finite epoch
+   * Applies events synchronously while accepting evidence by its session-local
+   * provenance rather than completion order. Time must be a finite epoch
    * millisecond value. Provider data failures are represented by the returned
    * reaction and never throw.
    */
@@ -184,6 +194,8 @@ function usageForPosition(
 export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObservationReconciliation {
   let accumulatedFields: Record<string, string> = {};
   let lastObservedAtMs: number | undefined;
+  let credentialEpoch: number | undefined;
+  let latestEvidenceSequence: number | undefined;
   const capacityLifecycle = createStaleCapacityLifecycle<WeeklyQuotaUsage>({
     staleExpiresAtMs: ({ capacity, observedAtMs }) =>
       Math.min(capacity.resetsAtMs, observedAtMs + STALE_AFTER_MS),
@@ -233,6 +245,22 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
     if (result.observation.kind === "none") lastObservedAtMs = undefined;
     return reaction(result);
   };
+  const acceptEvidence = (provenance: ProviderEvidenceProvenance): boolean => {
+    if (
+      credentialEpoch === undefined ||
+      provenance.credentialEpoch !== credentialEpoch ||
+      (latestEvidenceSequence !== undefined &&
+        provenance.sequence <= latestEvidenceSequence)
+    ) {
+      return false;
+    }
+    latestEvidenceSequence = provenance.sequence;
+    return true;
+  };
+  const selectCredentialEpoch = (nextCredentialEpoch: number) => {
+    credentialEpoch = nextCredentialEpoch;
+    latestEvidenceSequence = undefined;
+  };
 
   return {
     advance: (event, nowMs) => {
@@ -244,21 +272,28 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         case "passive-weekly-quota-observation": {
           const entries = entriesFromProviderFields(event.fields);
           if (entries === undefined) {
-            return reaction(discardAll("unavailable"));
+            return acceptEvidence(event.provenance)
+              ? reaction(discardAll("unavailable"))
+              : reaction();
           }
 
-          let contributed = false;
+          const recognizedEntries: Array<[string, string]> = [];
           for (const [name, value] of entries) {
             const normalizedName = name.toLowerCase();
             if (!RATE_LIMIT_FIELD_NAMES.has(normalizedName)) continue;
             if (typeof value !== "string") {
-              return reaction(discardAll("unavailable"));
+              return acceptEvidence(event.provenance)
+                ? reaction(discardAll("unavailable"))
+                : reaction();
             }
-            accumulatedFields[normalizedName] = value;
-            contributed = true;
+            recognizedEntries.push([normalizedName, value]);
           }
-          if (!contributed) {
+          if (recognizedEntries.length === 0) {
             return reaction(undefined, shouldAcquireDedicated(nowMs));
+          }
+          if (!acceptEvidence(event.provenance)) return reaction();
+          for (const [name, value] of recognizedEntries) {
+            accumulatedFields[name] = value;
           }
 
           for (const position of WINDOW_POSITIONS) {
@@ -278,6 +313,9 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         }
 
         case "dedicated-weekly-quota-acquisition": {
+          if (!acceptEvidence(event.provenance)) {
+            return reaction(undefined, shouldAcquireDedicated(nowMs));
+          }
           const { result } = event;
           if (result.kind === "acquired") {
             return reaction(recordUsage(result.usage, nowMs));
@@ -299,9 +337,11 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
           return reaction(undefined, shouldAcquireDedicated(nowMs));
 
         case "account-selection-invalidated":
+          selectCredentialEpoch(event.credentialEpoch);
           return reaction(discardAll("invalidated"));
 
         case "account-selection-unavailable":
+          selectCredentialEpoch(event.credentialEpoch);
           return reaction(discardAll("unavailable"));
 
         case "stale-capacity-expiration-reached": {
@@ -317,6 +357,8 @@ export function createWeeklyQuotaObservationReconciliation(): WeeklyQuotaObserva
         case "session-ended":
           accumulatedFields = {};
           lastObservedAtMs = undefined;
+          credentialEpoch = undefined;
+          latestEvidenceSequence = undefined;
           return reaction(capacityLifecycle.advance({ kind: "session-ended" }));
       }
     },

@@ -38,7 +38,7 @@ Display the status whenever Codex OAuth is configured, even if another model is 
 - Resolve current credentials through `ctx.modelRegistry.getProviderAuth("openai-codex")`.
 - Fetch `GET https://chatgpt.com/backend-api/wham/usage` with the bearer token and matching `ChatGPT-Account-Id`.
 - Isolate this undocumented first-party endpoint behind an exchangeable adapter.
-- Opportunistically merge recognized `x-codex-*` fields received through `after_provider_response`; headers are not the authoritative startup source.
+- Opportunistically merge recognized `x-codex-*` fields received through `after_provider_response`; headers are not the authoritative startup source. Merge passive and dedicated evidence only within one account-continuity interval, and never let an older acquisition replace newer evidence (see weekly quota observation provenance in `CONTEXT.md`).
 - Do not use the Codex CLI, `~/.codex/auth.json`, artificial model requests, local token accounting, redirects, or project-configured endpoints.
 
 ## Lifecycle and resilience
