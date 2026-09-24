@@ -38,10 +38,27 @@ export function registerMonitoredProviderCapacity(
         present: (presentations) =>
           Effect.sync(() => {
             const rendered = presentations
-              .map(
-                (presentation) =>
-                  `${ctx.ui.theme.fg("accent", presentation.providerName)} ${ctx.ui.theme.fg(presentation.color, presentation.detail)}`,
-              )
+              .map((presentation) => {
+                const { detail, highlight } = presentation;
+                const coloredDetail = highlight
+                  ? ctx.ui.theme.fg(
+                      presentation.color,
+                      detail.slice(0, highlight.start),
+                    ) +
+                    ctx.ui.theme.fg(
+                      highlight.color,
+                      detail.slice(
+                        highlight.start,
+                        highlight.start + highlight.length,
+                      ),
+                    ) +
+                    ctx.ui.theme.fg(
+                      presentation.color,
+                      detail.slice(highlight.start + highlight.length),
+                    )
+                  : ctx.ui.theme.fg(presentation.color, detail);
+                return `${ctx.ui.theme.fg("accent", presentation.providerName)} ${coloredDetail}`;
+              })
               .join(" ");
             if (rendered === lastRendered) return;
             lastRendered = rendered;

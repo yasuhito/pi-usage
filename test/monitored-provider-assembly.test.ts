@@ -86,6 +86,7 @@ test("Codex assembly adapts Pi authentication, monitor acquisition, and presenta
     providerName: "Codex",
     detail: "wk ━━━━━━──── 63% 16m ↻2",
     color: "dim",
+    highlight: { start: 3, length: 6, color: "success" },
   });
 });
 

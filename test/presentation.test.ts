@@ -38,7 +38,15 @@ test("quota presentation rounds, clamps, colors, and marks freshness", () => {
     },
     {
       status: { kind: "available", usedPercent: 75, stale: true } as const,
-      expected: { text: "Codex wk ━━━━━━━━── 75% ~", color: "warning" },
+      expected: { text: "Codex wk ━━━━━━━━── 75% ~", color: "dim" },
+    },
+    {
+      status: { kind: "available", usedPercent: 79, stale: false } as const,
+      expected: { text: "Codex wk ━━━━━━━━── 79%", color: "dim" },
+    },
+    {
+      status: { kind: "available", usedPercent: 80, stale: false } as const,
+      expected: { text: "Codex wk ━━━━━━━━── 80%", color: "warning" },
     },
     {
       status: { kind: "available", usedPercent: 90, stale: false } as const,

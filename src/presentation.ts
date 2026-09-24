@@ -30,6 +30,11 @@ export interface ProviderCapacityPresentation {
   readonly providerName: ProviderName;
   readonly detail: string;
   readonly color: "dim" | "warning" | "error";
+  readonly highlight?: {
+    readonly start: number;
+    readonly length: number;
+    readonly color: "success";
+  };
 }
 
 export interface SubscriptionUsagePresentation {
@@ -82,7 +87,16 @@ export function presentProviderSubscriptionUsage(
   return {
     providerName,
     detail: `wk ${bar} ${usedPercent}%${resetCountdownSuffix}${limitResetCreditsSuffix}${status.stale ? " ~" : ""}`,
-    color: usedPercent >= 90 ? "error" : usedPercent >= 75 ? "warning" : "dim",
+    color: usedPercent >= 90 ? "error" : usedPercent >= 80 ? "warning" : "dim",
+    ...(usedPercent < 80 && filledCells > 0
+      ? {
+          highlight: {
+            start: 3,
+            length: filledCells,
+            color: "success" as const,
+          },
+        }
+      : {}),
   };
 }
 

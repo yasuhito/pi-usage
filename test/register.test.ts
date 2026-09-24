@@ -12,6 +12,7 @@ import type {
   WeeklySubscriptionProviderName,
   WeeklySubscriptionUsageStatus,
 } from "../src/presentation.ts";
+import { presentProviderSubscriptionUsage } from "../src/presentation.ts";
 import { ProviderMonitorService } from "../src/provider-monitor.ts";
 import {
   type MonitoredProviderFactory,
@@ -78,17 +79,20 @@ function providerFactory(
               }),
           ),
         ),
-      present: (status): ProviderCapacityPresentation => ({
-        providerName,
-        detail:
-          status.kind === "available"
-            ? `${Math.round(status.usedPercent)}%`
-            : status.kind,
-        color:
-          status.kind === "available" && status.usedPercent >= 75
-            ? "warning"
-            : "dim",
-      }),
+      present: (status): ProviderCapacityPresentation =>
+        providerName === "Codex"
+          ? presentProviderSubscriptionUsage(providerName, status)
+          : {
+              providerName,
+              detail:
+                status.kind === "available"
+                  ? `${Math.round(status.usedPercent)}%`
+                  : status.kind,
+              color:
+                status.kind === "available" && status.usedPercent >= 80
+                  ? "warning"
+                  : "dim",
+            },
     });
   };
 }
@@ -162,7 +166,7 @@ test("renders provider-independent registrations in roster order", async () => {
 
   assert.equal(
     f.statuses.at(-1)?.text,
-    "[accent:Codex] [dim:63%] [accent:Claude] [warning:80%]",
+    "[accent:Codex] [dim:wk ][success:━━━━━━][dim:──── 63%] [accent:Claude] [warning:80%]",
   );
   assert.equal(f.probes.get("provider-a")?.starts, 1);
   assert.equal(f.probes.get("provider-b")?.starts, 1);

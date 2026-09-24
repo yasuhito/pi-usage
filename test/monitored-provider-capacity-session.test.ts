@@ -420,6 +420,7 @@ test("a replacement waits for the previous Scope and suppresses its late publica
       providerName: "Codex",
       detail: "wk ━━──────── 20% 16m",
       color: "dim",
+      highlight: { start: 3, length: 2, color: "success" },
     },
     Claude: {
       providerName: "Claude",
@@ -512,11 +513,13 @@ test("only the latest queued start creates monitors and publishes", async () => 
       providerName: "Codex",
       detail: "wk ━━━─────── 30% 16m",
       color: "dim",
+      highlight: { start: 3, length: 3, color: "success" },
     },
     Claude: {
       providerName: "Claude",
       detail: "wk ━━━━────── 40% 16m",
       color: "dim",
+      highlight: { start: 3, length: 4, color: "success" },
     },
   });
   await Effect.runPromise(session.shutdown);
@@ -643,6 +646,7 @@ test("routes activity and responses through the provider roster", async () => {
     providerName: "Codex",
     detail: "wk ━━━━━━━─── 70% 16m",
     color: "dim",
+    highlight: { start: 3, length: 7, color: "success" },
   });
 
   await Effect.runPromise(session.refreshAfterActivity("unknown"));

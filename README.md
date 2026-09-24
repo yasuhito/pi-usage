@@ -63,7 +63,7 @@ Each percentage is provider-reported **weekly subscription usage**. The two prov
 - **Anthropic API-key rate limits** are request and token capacity for API use. They are not Claude subscription usage and are not shown.
 - **OpenRouter account credit balance** is the account’s total purchased credits minus its total usage. It is account-scoped and differs from an individual inference key’s configured spending limit.
 
-Each bar has ten cells. A provider's presentation independently becomes a warning at 75% and an error at 90%.
+Each bar has ten cells. Used cells are green below 80%; at 80% a provider's presentation changes to a warning, and at 90% to an error, independently of the other providers.
 
 The weekly reset countdown after the percentage is the remaining time until the provider-reported weekly window reset. It uses compact day/hour, hour/minute, or minute units without spaces between units.
 
