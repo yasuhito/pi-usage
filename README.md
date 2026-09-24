@@ -56,7 +56,7 @@ Claude usage currently requires Linux and a private, user-owned `XDG_RUNTIME_DIR
 | Temporarily stale | `Codex wk ━━━━━━──── 63% 3d2h ↻2 ~ Claude wk ━━━━━━━━── 80% 4d1h ~ OpenRouter $12.34 left ~` |
 | Unavailable | `Codex wk unavailable Claude wk unavailable OpenRouter unavailable` |
 
-`wk` means weekly. A trailing `~` means the last observed value is temporarily stale: Codex and OpenRouter keep it for at most ten minutes, while Claude keeps it until its reported reset. A reset can shorten Codex's retention.
+`wk` means weekly. A trailing `~` means the value is from the last successful refresh and may be out of date. Codex and OpenRouter show it for up to ten minutes, and Codex stops sooner if its reported reset comes first. Claude shows it until its reported reset.
 
 Each percentage is provider-reported **weekly subscription usage**, but Codex and Claude measure it differently. The terms used here mean:
 
