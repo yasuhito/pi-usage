@@ -10,7 +10,7 @@ It uses `ctx.ui.setStatus()`, so it coexists with other status extensions such a
 
 ## Install
 
-From npm, once the package is published:
+From npm:
 
 ```bash
 pi install npm:@yasuhito/pi-usage
@@ -43,9 +43,9 @@ secret-tool store \
 
 Pi Usage looks up that key automatically. If `secret-tool` is missing, the keychain has no matching entry, or the platform is not Linux, it falls back to the `OPENROUTER_MANAGEMENT_KEY` environment variable. Never commit the key to any repository.
 
-Claude subscription usage requires the OAuth authentication that Pi resolves after a Claude Pro or Max login. An ordinary Anthropic API key is not suitable and is never sent to the subscription usage endpoint. The extension asks Pi to resolve authentication at request time; it does not read Pi or Claude Code credential files.
+Claude subscription usage requires the OAuth authentication that Pi resolves after a Claude Pro or Max login. An ordinary Anthropic API key is not suitable and is never sent to the Claude OAuth usage endpoint. Pi Usage asks Pi to resolve authentication at request time; it does not read Pi or Claude Code credential files.
 
-Cross-process Claude acquisition currently requires Linux and a private, user-owned `XDG_RUNTIME_DIR` (normally `/run/user/<uid>` with mode `0700`). Without that secure runtime location, Claude remains `unavailable` and the TUI warns once per Pi process. macOS and Windows coordination are not yet supported.
+Claude usage currently requires Linux and a private, user-owned `XDG_RUNTIME_DIR` (normally `/run/user/<uid>` with mode `0700`) for cross-process coordination. Without that secure runtime location, Claude remains `unavailable` and the TUI warns once per Pi process. Claude usage is not yet supported on macOS or Windows.
 
 ## Display
 
@@ -55,6 +55,8 @@ Cross-process Claude acquisition currently requires Linux and a private, user-ow
 | Available | `Codex wk ━━━━━━──── 63% 3d2h ↻2 Claude wk ━━━━━━━━── 80% 4d1h OpenRouter $12.34 left` |
 | Temporarily stale | `Codex wk ━━━━━━──── 63% 3d2h ↻2 ~ Claude wk ━━━━━━━━── 80% 4d1h ~ OpenRouter $12.34 left ~` |
 | Unavailable | `Codex wk unavailable Claude wk unavailable OpenRouter unavailable` |
+
+`wk` means weekly. A trailing `~` means the last observed value is temporarily stale: Codex and OpenRouter keep it for at most ten minutes, while Claude keeps it until its reported reset. A reset can shorten Codex's retention.
 
 Each percentage is provider-reported **weekly subscription usage**, but Codex and Claude measure it differently. The terms used here mean:
 
@@ -71,13 +73,13 @@ The `↻N` suffix shows the provider-reported number of available **limit reset 
 
 ## How it works
 
-The extension runs a separate monitor for each of Codex, Claude, and OpenRouter. Codex usage comes from the ChatGPT usage endpoint and opportunistic `x-codex-*` response headers. Claude usage comes from the experimental first-party OAuth usage endpoint and is requested only with Pi-resolved OAuth authentication. The OpenRouter balance comes from its documented credits endpoint using a separately configured Management Key.
+Pi Usage runs a separate monitor for each of Codex, Claude, and OpenRouter. Codex usage comes from the Codex ChatGPT usage endpoint and from `x-codex-*` response headers when they appear. Claude usage comes from the experimental, undocumented Claude OAuth usage endpoint and is requested only with Pi-resolved OAuth authentication. The OpenRouter balance comes from its documented credits endpoint using a separately configured Management Key.
 
 Each monitor refreshes at startup and after relevant activity. Codex polls every minute. Claude refreshes after activity at most once every three minutes, and polls every fifteen minutes. OpenRouter does not poll periodically; it refreshes after OpenRouter activity and provider/account changes. If an OpenRouter refresh fails, the last successful value stays in the footer, marked `~`, for up to ten minutes.
 
 Claude requests are coordinated across `/reload`, `/new`, and concurrent Pi processes. A successful result is reused for three minutes. After a temporary failure, every instance waits for the same retry time; a `429` response waits for `Retry-After`, but never less than fifteen minutes. This stops each loaded instance from repeating the same request.
 
-Internally, session-scoped Effect monitors independently own acquisition, polling, backoff, stale expiration, and interruption. Provider-specific decoding stays behind small Effect interfaces; Pi event handlers are the only runtime boundary.
+Internally, session-scoped Effect monitors independently own acquisition, polling, backoff, stale expiration, and interruption. Provider-specific decoding stays behind small Effect interfaces; Pi event handlers connect the monitors to Pi's runtime.
 
 ### Security posture
 
@@ -85,15 +87,15 @@ Authenticated requests are restricted to fixed HTTPS origins: `https://chatgpt.c
 
 To coordinate Claude requests, Pi Usage stores sanitized usage percentages, reset timestamps, and retry scheduling metadata only in `XDG_RUNTIME_DIR`, the per-user runtime directory the OS manages. It never writes them to durable package or project storage. Entries are partitioned by an HMAC of the OAuth credential using an ephemeral runtime secret, so neither the credential nor its plain fingerprint is stored. Entries unused for twenty-four hours are removed on a best-effort basis.
 
-The extension does not spawn provider CLIs or estimate quota from local token history.
+Pi Usage does not spawn provider CLIs or estimate quota from local token history.
 
 ## Current scope
 
-This release does not implement provider settings, OpenRouter inference-key spending limits, non-Linux keychain integrations, Claude's five-hour window, detail commands, or manual refresh. Refreshes follow the built-in schedule.
+This release does not implement provider settings, OpenRouter inference-key spending limits, non-Linux keychain integrations, Claude usage on macOS or Windows, Claude's five-hour window, detail commands, or manual refresh. Refreshes follow the built-in schedule.
 
 ## Compatibility warning
 
-The Codex ChatGPT usage endpoint and the Claude OAuth usage endpoint are undocumented first-party interfaces. The `x-codex-*` headers are undocumented as well. None of them has a public compatibility guarantee, and any of them may change without notice. The extension isolates and parses them defensively and displays `unavailable` when a response no longer matches the expected contract.
+The Codex ChatGPT usage endpoint and the experimental Claude OAuth usage endpoint are undocumented first-party interfaces. The `x-codex-*` headers are undocumented as well. None of them has a public compatibility guarantee, and any of them may change without notice. Pi Usage isolates and parses them defensively and displays `unavailable` when a response no longer matches the expected contract.
 
 See [`codex-weekly-usage.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/codex-weekly-usage.md), [`codex-limit-reset-credits.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/codex-limit-reset-credits.md), [`claude-oauth-usage-prototype.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/claude-oauth-usage-prototype.md), and [`claude-openrouter-usage.md`](https://github.com/yasuhito/pi-usage/blob/main/docs/research/claude-openrouter-usage.md) for source comparisons and rationale.
 
