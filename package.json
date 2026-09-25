@@ -1,6 +1,6 @@
 {
   "name": "@yasuhito/pi-usage",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Pi extension that displays Codex and Claude subscription usage plus OpenRouter account credit balance",
   "keywords": [
     "pi-package",
@@ -49,7 +49,8 @@
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit",
     "check:package": "npm pack --dry-run",
-    "check": "npm run lint && npm run typecheck && npm test && npm run check:package"
+    "check": "npm run lint && npm run typecheck && npm test && npm run check:package",
+    "release:prepare": "npm run check && node scripts/prepare-release.mjs"
   },
   "files": [
     "index.ts",
