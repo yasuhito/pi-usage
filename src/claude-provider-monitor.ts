@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Effect, Layer, type Scope } from "effect";
+import { Cause, Data, Effect, Layer, Option, type Scope } from "effect";
 
 import type {
   AcquireClaudeSubscriptionUsage,
@@ -24,6 +24,11 @@ import {
 
 const ACTIVITY_REFRESH_INTERVAL_MS = 3 * 60_000;
 const POLL_INTERVAL_MS = 15 * 60_000;
+
+/** Pi holds a Claude sign-in that it can no longer refresh. */
+export class ClaudeSignInExpired extends Data.TaggedError(
+  "ClaudeSignInExpired",
+) {}
 
 export interface ClaudeAuthentication {
   readonly source?: string;
@@ -54,6 +59,10 @@ function makeClaudeProviderMonitorAdapter(
   WeeklySubscriptionUsageStatus
 > {
   let lastObservedAtMs: number | undefined;
+  // Why the most recent resolution yielded no credential, and why the
+  // presented status says so; they differ until the change is published.
+  let signInExpired = false;
+  let presentedSignInExpired = false;
   const capacityLifecycle =
     createStaleCapacityLifecycle<AcquiredClaudeSubscriptionUsage>({
       staleExpiresAtMs: ({ capacity }) => capacity.resetsAtMs,
@@ -73,7 +82,7 @@ function makeClaudeProviderMonitorAdapter(
     const observation = reaction.observation;
     const status: WeeklySubscriptionUsageStatus =
       observation.kind === "none"
-        ? { kind: "unavailable" }
+        ? { kind: signInExpired ? "sign-in-expired" : "unavailable" }
         : {
             kind: "available",
             usedPercent: observation.capacity.usedPercent,
@@ -93,6 +102,7 @@ function makeClaudeProviderMonitorAdapter(
 
   const clearUsage = (kind: "unavailable" | "invalidated") => {
     lastObservedAtMs = undefined;
+    presentedSignInExpired = signInExpired;
     return weeklySubscriptionUsageFacts(capacityLifecycle.advance({ kind }));
   };
 
@@ -140,7 +150,18 @@ function makeClaudeProviderMonitorAdapter(
   return {
     credentialVerification: "before-and-after",
     resolveCredential: Effect.suspend(dependencies.resolveAuthentication).pipe(
-      Effect.catchAllCause(() => Effect.succeed(undefined)),
+      Effect.tap(() => {
+        signInExpired = false;
+      }),
+      Effect.catchAllCause((cause) =>
+        Effect.sync(() => {
+          signInExpired = Option.exists(
+            Cause.failureOption(cause),
+            (error) => error instanceof ClaudeSignInExpired,
+          );
+          return undefined;
+        }),
+      ),
       Effect.map((authentication) => {
         const key =
           authentication?.source === "OAuth"
@@ -167,7 +188,11 @@ function makeClaudeProviderMonitorAdapter(
       Effect.sync(() => {
         switch (event.kind) {
           case "credential-observed": {
-            if (event.continuity === "unchanged")
+            if (
+              event.continuity === "unchanged" &&
+              (event.credentialAvailable ||
+                signInExpired === presentedSignInExpired)
+            )
               return weeklySubscriptionUsageFacts(currentReaction());
             return clearUsage(
               event.credentialAvailable ? "invalidated" : "unavailable",

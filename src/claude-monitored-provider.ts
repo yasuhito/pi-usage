@@ -1,7 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 
-import { claudeProviderMonitorLayer } from "./claude-provider-monitor.ts";
+import {
+  ClaudeSignInExpired,
+  claudeProviderMonitorLayer,
+} from "./claude-provider-monitor.ts";
 import type { AcquireClaudeSubscriptionUsage } from "./claude-subscription-usage-acquisition.ts";
 import {
   defineMonitoredProvider,
@@ -22,11 +25,29 @@ interface PiApiKeyAuthentication {
   readonly auth: { readonly apiKey?: string };
 }
 
+/**
+ * Pi reports a failed OAuth refresh as ModelsError code "oauth" carrying the
+ * token endpoint's reason. RFC 6749 `invalid_grant` means the stored refresh
+ * token is expired or revoked, so only signing in again can recover.
+ */
+function isRejectedOAuthRefresh(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.name === "ModelsError" &&
+    Reflect.get(error, "code") === "oauth" &&
+    /\binvalid_grant\b/.test(error.message)
+  );
+}
+
 function authenticationResolution(
   ctx: ExtensionContext,
 ): () => Effect.Effect<PiApiKeyAuthentication | undefined, unknown> {
   return () =>
-    Effect.tryPromise(() => ctx.modelRegistry.getProviderAuth("anthropic"));
+    Effect.tryPromise({
+      try: () => ctx.modelRegistry.getProviderAuth("anthropic"),
+      catch: (error) =>
+        isRejectedOAuthRefresh(error) ? new ClaudeSignInExpired() : error,
+    });
 }
 
 export function makeClaudeMonitoredProvider(

@@ -28,6 +28,10 @@ _Avoid_: Usage cache lifecycle, weekly usage lifecycle
 The provider-reported utilization of a Claude Pro or Max account's rolling usage windows, including five-hour and seven-day windows when available. It is distinct from Anthropic API-key rate limits and organization billing usage.
 _Avoid_: Anthropic API usage, Claude API rate limit
 
+**Expired Claude sign-in**:
+A Pi-held Claude OAuth sign-in whose refresh the provider rejected as expired or revoked, so only signing in again can restore Claude subscription usage. It is distinct from a missing credential and from a temporary failure to refresh or acquire.
+_Avoid_: Unavailable Claude usage, Claude authentication rejected
+
 **Monitored provider**:
 A provider the user expects Pi Usage to observe and present. A monitored provider remains presentable as unavailable when its credential is missing or its usage cannot be acquired; a provider that is not monitored is omitted entirely.
 _Avoid_: Configured provider, enabled provider

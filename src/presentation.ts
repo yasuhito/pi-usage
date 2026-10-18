@@ -4,6 +4,7 @@ export type CapacityAcquisitionStatus =
 
 export type WeeklySubscriptionUsageStatus =
   | CapacityAcquisitionStatus
+  | { readonly kind: "sign-in-expired" }
   | {
       readonly kind: "available";
       readonly usedPercent: number;
@@ -60,6 +61,9 @@ export function presentProviderSubscriptionUsage(
   status: WeeklySubscriptionUsageStatus,
   nowMs = Date.now(),
 ): ProviderCapacityPresentation {
+  if (status.kind === "sign-in-expired") {
+    return { providerName, detail: "wk login expired", color: "warning" };
+  }
   if (status.kind !== "available") {
     return {
       providerName,

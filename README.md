@@ -43,7 +43,7 @@ secret-tool store \
 
 Pi Usage looks up that key automatically. If `secret-tool` is missing, the keychain has no matching entry, or the platform is not Linux, it falls back to the `OPENROUTER_MANAGEMENT_KEY` environment variable. Never commit the key to any repository.
 
-Claude subscription usage requires the OAuth authentication that Pi resolves after a Claude Pro or Max login. An ordinary Anthropic API key is not suitable and is never sent to the Claude OAuth usage endpoint. Pi Usage asks Pi to resolve authentication at request time; it does not read Pi or Claude Code credential files.
+Claude subscription usage requires the OAuth authentication that Pi resolves after a Claude Pro or Max login. An ordinary Anthropic API key is not suitable and is never sent to the Claude OAuth usage endpoint. Pi Usage asks Pi to resolve authentication at request time; it does not read Pi or Claude Code credential files. When Anthropic rejects Pi's stored refresh token as expired or revoked, the footer shows `Claude wk login expired` in the warning color; run `/login anthropic` in Pi to sign in again, and the meter returns at the next refresh.
 
 Claude usage currently requires Linux and a private, user-owned `XDG_RUNTIME_DIR` (normally `/run/user/<uid>` with mode `0700`) for cross-process coordination. Without that secure runtime location, Claude remains `unavailable` and the TUI warns once per Pi process. Claude usage is not yet supported on macOS or Windows.
 
@@ -55,6 +55,7 @@ Claude usage currently requires Linux and a private, user-owned `XDG_RUNTIME_DIR
 | Available | `Codex wk ━━━━━━──── 63% 3d2h ↻2 Claude wk ━━━━━━━━── 80% 4d1h OpenRouter $12.34 left` |
 | Temporarily stale | `Codex wk ━━━━━━──── 63% 3d2h ↻2 ~ Claude wk ━━━━━━━━── 80% 4d1h ~ OpenRouter $12.34 left ~` |
 | Unavailable | `Codex wk unavailable Claude wk unavailable OpenRouter unavailable` |
+| Claude sign-in expired | `Claude wk login expired` |
 
 `wk` means weekly. A trailing `~` means the value is from the last successful refresh and may be out of date. Codex and OpenRouter show it for up to ten minutes, and Codex stops sooner if its reported reset comes first. Claude shows it until its reported reset, then shows `unavailable` until a refresh succeeds.
 
