@@ -119,6 +119,62 @@ test("Claude assembly adapts OAuth authentication, monitor acquisition, and pres
   });
 });
 
+/** Redacted shape of the error Pi 1.3.0 throws when an OAuth refresh fails. */
+function piOAuthRefreshFailure(detail: string): Error {
+  const error = new Error(`OAuth refresh failed for anthropic: ${detail}`);
+  error.name = "ModelsError";
+  return Object.assign(error, { code: "oauth" });
+}
+
+async function presentClaudeAuthenticationFailure(error: Error) {
+  let reads = 0;
+  const ctx = {
+    modelRegistry: {
+      getProviderAuth: async () => {
+        throw error;
+      },
+    },
+  } as unknown as ExtensionContext;
+  const presentation = await runMonitoredProvider(
+    makeClaudeMonitoredProvider(ctx, {
+      acquireClaudeSubscriptionUsage: () => {
+        reads += 1;
+        return Effect.succeed({ usedPercent: 80, resetsAtMs: 2_000_000 });
+      },
+      random: Effect.succeed(0.5),
+    }),
+  );
+  assert.equal(reads, 0);
+  return presentation;
+}
+
+test("Claude assembly asks for a new sign-in when Pi cannot refresh it", async () => {
+  const presentation = await presentClaudeAuthenticationFailure(
+    piOAuthRefreshFailure(
+      'status=400; body={"error": "invalid_grant", "error_description": "Refresh token expired"}',
+    ),
+  );
+
+  assert.deepEqual(presentation, {
+    providerName: "Claude",
+    detail: "wk login expired",
+    color: "warning",
+  });
+});
+
+test("Claude assembly keeps other authentication failures unavailable", async () => {
+  for (const error of [
+    piOAuthRefreshFailure("fetch failed"),
+    Object.assign(new Error("invalid_grant"), { code: "auth" }),
+  ]) {
+    assert.deepEqual(await presentClaudeAuthenticationFailure(error), {
+      providerName: "Claude",
+      detail: "wk unavailable",
+      color: "dim",
+    });
+  }
+});
+
 test("OpenRouter assembly connects Management Key resolution, acquisition, and presentation", async () => {
   const credentials: OpenRouterManagementKey[] = [];
   const provider = makeOpenRouterMonitoredProvider({

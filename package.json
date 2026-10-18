@@ -1,6 +1,6 @@
 {
   "name": "@yasuhito/pi-usage",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A Pi extension that displays Codex and Claude subscription usage plus OpenRouter account credit balance",
   "keywords": [
     "pi-package",

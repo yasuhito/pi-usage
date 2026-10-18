@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import { Deferred, Effect, Exit, Fiber, TestClock } from "effect";
 
-import { makeClaudeProviderMonitor } from "../src/claude-provider-monitor.ts";
+import {
+  ClaudeSignInExpired,
+  makeClaudeProviderMonitor,
+} from "../src/claude-provider-monitor.ts";
 import {
   type AcquiredClaudeSubscriptionUsage,
   ClaudeAuthenticationRejected,
@@ -24,15 +27,19 @@ function fixture() {
       usedPercent: 63.4,
       resetsAtMs: 2_000_000,
     });
-    let credential: string | undefined = "secret-1";
+    let credential: string | undefined | ClaudeSignInExpired = "secret-1";
     let reads = 0;
     const statuses: WeeklySubscriptionUsageStatus[] = [];
     const monitor = yield* makeClaudeProviderMonitor({
       resolveAuthentication: () =>
-        Effect.sync(() =>
-          credential === undefined
-            ? undefined
-            : { source: "OAuth", auth: { apiKey: credential } },
+        Effect.suspend(() =>
+          credential instanceof ClaudeSignInExpired
+            ? Effect.fail(credential)
+            : Effect.succeed(
+                credential === undefined
+                  ? undefined
+                  : { source: "OAuth", auth: { apiKey: credential } },
+              ),
         ),
       acquireClaudeSubscriptionUsage: () => {
         reads += 1;
@@ -48,7 +55,7 @@ function fixture() {
       monitor,
       statuses,
       reads: () => reads,
-      setCredential: (value: string | undefined) => {
+      setCredential: (value: typeof credential) => {
         credential = value;
       },
       setAcquisition: (value: typeof acquisition) => {
@@ -288,6 +295,43 @@ it.scoped("keeps checking for credentials while unavailable", () =>
     yield* TestClock.adjust("15 minutes");
     assert.equal(f.reads(), 1);
     assert.equal(f.statuses.at(-1)?.kind, "available");
+  }),
+);
+
+it.scoped("asks for a new sign-in until Pi can refresh Claude again", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* f.monitor.start;
+    f.setCredential(new ClaudeSignInExpired());
+    yield* TestClock.adjust("15 minutes");
+    assert.equal(f.reads(), 1);
+    assert.deepEqual(f.statuses.at(-1), { kind: "sign-in-expired" });
+
+    f.setCredential("secret-2");
+    yield* TestClock.adjust("15 minutes");
+    assert.equal(f.reads(), 2);
+    assert.equal(f.statuses.at(-1)?.kind, "available");
+  }),
+);
+
+it.scoped("updates the reason while no credential is available", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setCredential(undefined);
+    yield* f.monitor.start;
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+
+    f.setCredential(new ClaudeSignInExpired());
+    yield* TestClock.adjust("15 minutes");
+    assert.deepEqual(f.statuses.at(-1), { kind: "sign-in-expired" });
+    const published = f.statuses.length;
+    yield* TestClock.adjust("15 minutes");
+    assert.equal(f.statuses.length, published);
+
+    f.setCredential(undefined);
+    yield* TestClock.adjust("15 minutes");
+    assert.deepEqual(f.statuses.at(-1), { kind: "unavailable" });
+    assert.equal(f.reads(), 0);
   }),
 );
 

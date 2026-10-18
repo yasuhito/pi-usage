@@ -135,6 +135,13 @@ test("Claude retains its weekly label and shares Codex thresholds", () => {
   );
 });
 
+test("an expired sign-in asks for a new login with a warning", () => {
+  assert.deepEqual(
+    presentProviderSubscriptionUsage("Claude", { kind: "sign-in-expired" }),
+    { providerName: "Claude", detail: "wk login expired", color: "warning" },
+  );
+});
+
 test("loading and unavailable statuses have compact neutral presentations", () => {
   assert.deepEqual(presentCodexQuotaStatus({ kind: "loading" }), {
     text: "Codex wk loading…",
